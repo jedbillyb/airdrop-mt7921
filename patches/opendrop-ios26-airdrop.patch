@@ -1,0 +1,148 @@
+--- a/opendrop/server.py	2026-07-31 11:35:58.422608274 +1200
++++ b/opendrop/server.py	2026-07-31 11:24:06.073716192 +1200
+@@ -19,10 +19,13 @@
+ import io
+ import json
+ import logging
++import os
+ import platform
+ import plistlib
+ import socket
++import struct
+ import time
++import zlib
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ 
+ import libarchive
+@@ -162,9 +165,29 @@
+         self._set_response(len(body))
+         self.wfile.write(body)
+ 
++    def _read_request_body(self):
++        """
++        Read a request body sent either with Content-Length or chunked.
++
++        iOS 26 sends Discover and Ask with `Transfer-Encoding: chunked` and no
++        Content-Length, which made `int(self.headers["Content-Length"])` raise
++        TypeError on None and kill the connection before any reply was written.
++        handle_upload already coped with chunked; these two paths did not.
++        """
++        if self.headers.get("transfer-encoding", "").lower() == "chunked":
++            body = b""
++            while True:
++                length = int(self.rfile.readline().rstrip() or b"0", 16)
++                if length == 0:
++                    self.rfile.readline()  # trailing CRLF of the final chunk
++                    break
++                body += self.rfile.read(length)
++                self.rfile.readline()  # CRLF after each chunk
++            return body
++        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
++
+     def handle_discover(self):
+-        content_length = int(self.headers["Content-Length"])
+-        post_data = self.rfile.read(content_length)
++        post_data = self._read_request_body()
+ 
+         AirDropUtil.write_debug(
+             self.config, post_data, "receive_discover_request.plist"
+@@ -222,8 +245,7 @@
+         self.wfile.write(discover_answer_binary)
+ 
+     def handle_ask(self):
+-        content_length = int(self.headers["Content-Length"])
+-        post_data = self.rfile.read(content_length)
++        post_data = self._read_request_body()
+ 
+         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
+ 
+@@ -242,8 +264,15 @@
+         self._set_response(len(ask_resp_binary))
+         self.wfile.write(ask_resp_binary)
+ 
++    # iOS 26 sends photos as application/x-dvzip, not the application/x-cpio
++    # OpenDrop 0.13.0 hardcodes. Everything else about the transfer is identical,
++    # and libarchive detects the container from the stream anyway, so the only
++    # thing the old check accomplished was a 406 after the user had already
++    # tapped send - which is exactly what the phone reported as "Failed".
++    UPLOAD_CONTENT_TYPES = ("application/x-cpio", "application/x-dvzip")
++
+     def handle_upload(self):
+-        if self.headers.get("content-type", "").lower() != "application/x-cpio":
++        if self.headers.get("content-type", "").lower() not in self.UPLOAD_CONTENT_TYPES:
+             logger.warning(
+                 f"Unsupported content-type: {self.headers.get('content-type')}"
+             )
+@@ -298,10 +327,71 @@
+             with libarchive.read.stream_reader(stream) as archive:
+                 libarchive.extract.extract_entries(archive, flags)
+ 
++        def dvzip_to_cpio(path):
++            """
++            Decode Apple's dvzip container into the cpio archive inside it.
++
++            iOS 26 wraps the cpio in a sequence of length-prefixed blocks, which
++            libarchive does not recognise ("Unrecognized archive format"):
++
++                [4-byte big-endian header][block payload] ...
++
++            Bit 31 of the header means the payload is STORED; otherwise it is a
++            zlib stream. The low 31 bits are the payload length. Blocks
++            decompress to 128 KiB each except the last. Verified against a
++            2.06 MB photo transfer: 17 blocks, whole file consumed exactly,
++            yielding an ODC cpio ("070707") holding IMG_8276.JPG.
++            """
++            out = bytearray()
++            with open(path, "rb") as f:
++                while True:
++                    header = f.read(4)
++                    if len(header) < 4:
++                        break
++                    (raw,) = struct.unpack(">I", header)
++                    stored = raw >> 31
++                    length = raw & 0x7FFFFFFF
++                    if length == 0:
++                        break
++                    payload = f.read(length)
++                    if len(payload) < length:
++                        raise ValueError(
++                            f"dvzip block truncated: wanted {length}, got {len(payload)}"
++                        )
++                    out += payload if stored else zlib.decompress(payload)
++            return bytes(out)
++
+         logger.info("Receiving file(s) ...")
+         start = time.time()
+         reader = HTTPChunkedReader(self.rfile)
+-        extract_stream(reader)
++
++        # Buffer to disk first, then extract. Extracting straight off the socket
++        # means a container libarchive cannot parse leaves us with a half-read
++        # stream and nothing to show for it - and x-dvzip is new enough here that
++        # it is worth keeping the bytes regardless. The raw archive is only
++        # removed once extraction has actually succeeded.
++        raw_path = os.path.join(
++            os.getcwd(), f"airdrop-received-{int(start)}.{'dvzip' if 'dvzip' in self.headers.get('content-type', '') else 'cpio'}"
++        )
++        with open(raw_path, "wb") as raw:
++            while True:
++                buf = reader.read(65536)
++                if not buf:
++                    break
++                raw.write(buf)
++
++        try:
++            if raw_path.endswith(".dvzip"):
++                libarchive.extract_memory(dvzip_to_cpio(raw_path))
++            else:
++                with open(raw_path, "rb") as raw:
++                    extract_stream(raw)
++        except Exception as e:  # noqa: BLE001 - any failure here must not lose the bytes
++            logger.warning(f"Could not extract the archive ({e}).")
++            logger.warning(f"The raw transfer is kept at {raw_path}")
++        else:
++            logger.info(f"Extracted into {os.getcwd()}")
++            os.remove(raw_path)
+ 
+         transferred = reader.total / 1024.0 / 1024.0
+         speed = transferred / (time.time() - start)
