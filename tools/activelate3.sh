@@ -20,13 +20,13 @@
 # SAFETY: bash trap + setsid-detached watchdog.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 MON=mon0
 MON2=mon1
 DWELL=15
 WATCHDOG_TIMEOUT=420
 MT76=/sys/kernel/debug/ieee80211/phy0/mt76
-OUT=/mnt/shared/owl-activelate3-$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_DIR:-$PWD/runs}/activelate3-$(date +%Y%m%d-%H%M%S)"
 
 mkdir -p "$OUT" || exit 1
 sudo -v || exit 1

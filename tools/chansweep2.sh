@@ -16,12 +16,12 @@
 # SAFETY: bash trap + setsid-detached watchdog; PM knobs restored on exit.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 CHANS="36 44 149 6 2"
 DWELL=8
 WATCHDOG_TIMEOUT=260
 MT76=/sys/kernel/debug/ieee80211/phy0/mt76
-OUT=/mnt/shared/owl-chansweep2-$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_DIR:-$PWD/runs}/chansweep2-$(date +%Y%m%d-%H%M%S)"
 
 KREL=$(uname -r)
 case "$KREL" in

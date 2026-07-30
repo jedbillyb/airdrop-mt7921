@@ -25,7 +25,7 @@
 # the PM knobs, returns wlp2s0 to managed and brings NetworkManager back.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 MON=mon0
 CHAN=149
 CHAN_MHZ=5745
@@ -33,7 +33,7 @@ DUR=60
 WATCHDOG_TIMEOUT=$((DUR + 90))
 MT76=/sys/kernel/debug/ieee80211/phy0/mt76
 OWL=/home/jed/owl/build/daemon/owl
-OUT=/mnt/shared/owl-hoptest2-$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_DIR:-$PWD/runs}/hoptest2-$(date +%Y%m%d-%H%M%S)"
 
 # The "6.12.97 is required" rule is RELAXED as of 2026-07-30. That belief came
 # from a 6.18-vs-6.12.97 comparison that we now know was confounded by the

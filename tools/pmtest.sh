@@ -18,11 +18,11 @@
 # kill -9 or hang. PM knobs are restored to their original values on exit.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 DWELL=10
 WATCHDOG_TIMEOUT=200
 MT76=/sys/kernel/debug/ieee80211/phy0/mt76
-OUT=/mnt/shared/owl-pmtest-$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_DIR:-$PWD/runs}/pmtest-$(date +%Y%m%d-%H%M%S)"
 
 KREL=$(uname -r)
 case "$KREL" in

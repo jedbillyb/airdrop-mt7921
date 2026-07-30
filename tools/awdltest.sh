@@ -25,14 +25,14 @@
 # SAFETY: bash trap + setsid-detached watchdog.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 MON=mon0
 MHZ=5180
 DWELL=20              # AWDL action frames are sparser than beacons - dwell longer
 WATCHDOG_TIMEOUT=300
 MT76=/sys/kernel/debug/ieee80211/phy0/mt76
 AWDL_BSSID="00:25:00:ff:94:73"
-OUT=/mnt/shared/owl-awdltest-$(date +%Y%m%d-%H%M%S)
+OUT="${OUT_DIR:-$PWD/runs}/awdltest-$(date +%Y%m%d-%H%M%S)"
 
 mkdir -p "$OUT" || exit 1
 sudo -v || exit 1

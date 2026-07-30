@@ -13,7 +13,7 @@
 # SAFETY: bash trap + detached watchdog restoring even on kill -9 or hang.
 set -u
 
-IFACE=wlp2s0
+IFACE="${IFACE:-wlp2s0}"        # override for your machine
 DWELL=10
 WATCHDOG_TIMEOUT=150
 DBG=/sys/kernel/debug/ieee80211/phy0
