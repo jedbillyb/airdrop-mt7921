@@ -376,7 +376,14 @@ else
     echo "  ==> NOTHING traverses awdl0. AWDL syncs but carries no data."
     echo "      That is a data-path problem, not an AirDrop auth problem."
   elif [ "${FROMPEER:-0}" = "0" ]; then
-    echo "  ==> we transmit but the phone never answers. One-way path."
+    # NOT evidence of a one-way path, whatever it looks like. iOS ignores ICMP6
+    # echo requests from devices it has no association with, so 100%% loss reads
+    # identically whether we fail to ACK or the phone simply declines to answer.
+    # FINDINGS §10 took this as proof that active monitor does not work on this
+    # chip and was wrong; §15 settled it the other way by letting the phone
+    # initiate, at which point it sent us 481 packets including TCP.
+    echo "  ==> no ping replies. This is INCONCLUSIVE, not a failure: iOS does"
+    echo "      not answer pings from strangers. See docs/FINDINGS.md §15."
   else
     echo "  ==> bidirectional IP works. Any failure past here is service/auth level."
   fi
@@ -444,9 +451,28 @@ if [ "$MODE" = "receive" ]; then
   fi
 elif [ "$MODE" = "send" ]; then
   echo ""
+  # Sending needs a discovery report, and `opendrop send` reports a missing one
+  # as "please run 'opendrop find' first" - which is confusing when find DID run
+  # and simply found nobody. Say what actually happened instead.
+  if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
+    echo "### cannot send: no AirDrop receiver was discovered."
+    echo ""
+    echo "  AWDL sync worked, so the radio is fine - the phone just is not"
+    echo "  advertising itself as a RECEIVER. This is the usual mistake, and it"
+    echo "  is the opposite of what receive mode wants:"
+    echo ""
+    echo "    to RECEIVE from the phone -> open the SHARE SHEET (phone = sender)"
+    echo "    to SEND to the phone      -> open CONTROL CENTRE (phone = receiver)"
+    echo ""
+    echo "  With the share sheet open, iOS browses for receivers and does not"
+    echo "  advertise _airdrop._tcp at all, so there is nothing here to find."
+    echo ""
+    echo "  On the phone: unlock it, AirDrop > Everyone for 10 Minutes, then open"
+    echo "  Control Centre and long-press the connectivity tile so the AirDrop"
+    echo "  panel is showing. Leave it there and re-run."
+    exit 1
+  fi
   echo "### layer 4: attempting to send $SENDFILE to receiver index 0"
-  echo "    This is the step that is expected to fail on modern iOS - see the"
-  echo "    header of this script and FINDINGS.md section 7."
   "$OPENDROP" -i $AWDL send -r 0 -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
 else
   echo ""
