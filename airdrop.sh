@@ -65,6 +65,13 @@ AWDL=awdl0
 # 36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36 - six slots on 36 against two on
 # 149, so 149 is its MINORITY channel and sitting there misses most of its
 # availability windows. Override with e.g. CHAN=149 ./airdrop.sh
+# CHAN_PINNED records whether the operator named a channel. If they did, the
+# sweep is skipped entirely rather than being allowed to overrule them: the
+# sweep ranks channels by raw frame count, which is NOT the same as where the
+# peer spends its slots, and it has picked the phone's worst channel more than
+# once (ch6 at 1 slot of 16 over ch36 at 6 -- see FINDINGS §22).
+CHAN_PINNED=0
+[ -n "${CHAN:-}" ] && CHAN_PINNED=1
 CHAN="${CHAN:-36}"
 case "$CHAN" in
   6)   CHAN_MHZ=2437 ;;
@@ -91,7 +98,7 @@ FIND_TIME="${FIND_TIME:-45}"
 # Throughput over AWDL measured at ~0.05 MB/s, so a single photo needs ~40-60s
 # AFTER the user finds and taps this machine. 120s cut a 2 MB transfer off 370
 # bytes from the end - the archive is then genuinely truncated, not mis-decoded.
-RECV_TIME="${RECV_TIME:-300}"    # how long to advertise in receive mode
+RECV_TIME="${RECV_TIME:-90}"    # how long to advertise in receive mode
 RECV_DIR="${RECV_DIR:-$HOME/Downloads}"   # where received files are extracted
 # The watchdog has to outlast the whole run or it tears the card down mid-test.
 if [ "$MODE" = "receive" ]; then WATCHDOG_TIMEOUT=$((RECV_TIME + 420)); else WATCHDOG_TIMEOUT=420; fi
@@ -296,6 +303,17 @@ echo ""
 # steering mon0 steers the pair. Nothing has to be forced to ch36 any more.
 echo "### layer 0: locating the phone (AWDL BSSID 00:25:00:ff:94:73)"
 AWDL_BSSID="00:25:00:ff:94:73"
+
+if [ "$CHAN_PINNED" = "1" ]; then
+  echo "  CHAN=$CHAN was given explicitly - skipping the sweep."
+  echo "  (unset CHAN to let it search; with -S pin OWL will move to the peer's"
+  echo "   dominant channel by itself once it sees a sequence)"
+  SKIP_SWEEP=1
+else
+  SKIP_SWEEP=0
+fi
+
+if [ "$SKIP_SWEEP" = "0" ]; then
 BEST_CHAN=""; BEST_N=0; SAW_ANY=0
 # Try whichever channel won last time first, and stop the sweep early if it is
 # clearly busy. The phone is usually where it was a few minutes ago, and the full
@@ -361,6 +379,8 @@ fi
 echo "  --> strongest on channel $BEST_CHAN ($BEST_N frames); using it"
 mkdir -p "$(dirname "$CHAN_CACHE")" 2>/dev/null && echo "$BEST_CHAN" > "$CHAN_CACHE"
 CHAN=$BEST_CHAN
+fi   # SKIP_SWEEP
+
 case "$CHAN" in 6) CHAN_MHZ=2437 ;; 36) CHAN_MHZ=5180 ;; 44) CHAN_MHZ=5220 ;; 149) CHAN_MHZ=5745 ;; esac
 sudo iw dev $MON set freq $CHAN_MHZ 2>/dev/null
 sleep 1
@@ -380,8 +400,18 @@ sleep 1
 # phone in one session, which is the only way this gets settled:
 #   for s in verbatim pin rotate; do STRATEGY=$s ACTIVE=1 ./airdrop.sh receive; done
 #   tools/bursts.py runs/<pin-run>/receive.pcap --baseline runs/<verbatim-run>/receive.pcap
-STRATEGY="${STRATEGY:-pin}"
-sudo stdbuf -oL "$OWL" -i $OWL_IF -c $CHAN -N -S "$STRATEGY" -vv > "$OUT/owl.log" 2>&1 &
+STRATEGY="${STRATEGY-pin}"
+# Set STRATEGY= (empty) to omit the flag entirely, which is what an OWL build
+# from before -S existed needs -- the pre-change binary is the reference for
+# deciding whether a regression is ours or the environment's, and it aborts on
+# an unknown option.
+if [ -n "$STRATEGY" ]; then
+  set -- -S "$STRATEGY"
+else
+  set --
+  echo "  (no -S flag: assuming an OWL build that predates channel strategies)"
+fi
+sudo stdbuf -oL "$OWL" -i $OWL_IF -c $CHAN -N "$@" -vv > "$OUT/owl.log" 2>&1 &
 sleep 4
 
 if ! grep -q "Host device" "$OUT/owl.log"; then
