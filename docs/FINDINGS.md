@@ -1215,15 +1215,54 @@ The phone went from completely silent to answering. Also removed as a confound:
 `awdl0`, burning the scarce co-channel airtime and holding UDP 5353. It is now
 stopped for the run and restored on exit (`AVAHI=keep` to opt out).
 
-### Where it stands
+### Where it stands: the sender/receiver pincer
 
-Discovery still returns nothing, but the failure has moved and is now visible.
-The phone is demonstrably awake and chatty on AWDL - it advertises
-`_applicationServicePairing`, `_appSvcPrePair` and `_spotify-connect`, and answers
-queries for them - while never advertising or answering `_airdrop._tcp`. That is
-the signature of AirDrop not being armed to **Everyone**: in Contacts Only an
-iPhone stays silent to an unknown sender and relies on the BLE identity exchange
-we cannot do. "Everyone for 10 Minutes" expires, and these runs were well past it.
+Discovery still returns nothing, but the failure is now fully characterised, and
+the last capture reframed it. With the share sheet open the phone sends:
 
-The useful part is the positive control: we can now see the phone's *other*
-services on `awdl0`, so the moment `_airdrop._tcp` appears we will see that too.
+```
+17:08:10  phone -> ff02::fb  PTR (QM)? _applicationServicePairing._tcp
+                             PTR (QM)? _appSvcPrePair._tcp
+                             PTR (QM)? _airdrop._tcp.local.
+```
+
+It is **querying** `_airdrop._tcp`, not advertising it. An iPhone with the share
+sheet open is a *sender*, browsing for receivers - which is exactly why `receive`
+mode works, and why the share sheet is the right instruction there. It is the
+wrong instruction for sending.
+
+So the two states are a pincer:
+
+| phone state | AWDL | advertises `_airdrop._tcp`? |
+|---|---|---|
+| share sheet open | awake | **no** - it is a sender, and browses instead |
+| share sheet closed | asleep | would, but nothing wakes it |
+
+and the thing that would break the deadlock - the BLE advertisement that wakes a
+dormant receiver - is precisely what neither OWL nor OpenDrop implements.
+
+Runs with the sheet closed confirm the second row: the phone is visibly alive on
+AWDL (it queries `_spotify-connect._tcp`) and never mentions `_airdrop._tcp` at
+all, not even as a query.
+
+### The one untested gap
+
+AWDL does not drop the instant the share sheet closes. If the phone reverts to
+receiver mode while AWDL is still up, it should advertise in that window. That
+test needs a human to close the sheet mid-run and has not yet been performed
+cleanly - three attempts were lost to mistimed coordination. With the browse now
+exiting early it costs seconds rather than minutes, so it is cheap to retry.
+
+If that window turns out not to exist, the send direction needs the BLE
+bootstrap, which is a substantially larger piece of work than anything here: it
+means implementing Apple's Continuity BLE advertisement, not just an mDNS fix.
+
+### What was NOT the problem
+
+Worth recording, because each cost a real amount of time:
+
+- Not TCP, not the PHY, not the receive window (§18).
+- Not the channel - the sweep finds the peer reliably and ping6 round-trips.
+- Not `FIND_TIME`. Raising the ceiling has never once turned a failure into a
+  success; every failure has been categorical. The default is back down to 45 s
+  because the only thing a long ceiling buys is a slower failure.

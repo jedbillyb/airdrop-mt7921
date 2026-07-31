@@ -39,7 +39,7 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 | | |
 |---|---|
 | Receiving from an iPhone | **works** (iOS 26, proven end to end) |
-| Sending to an iPhone | discovery not yet achieved - see [FINDINGS §19](docs/FINDINGS.md) |
+| Sending to an iPhone | blocked on Apple's BLE bootstrap - see [FINDINGS §19](docs/FINDINGS.md) |
 | Throughput | ~40-45 kB/s - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)) |
 | Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.12.97 |
 

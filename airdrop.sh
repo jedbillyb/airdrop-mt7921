@@ -76,7 +76,14 @@ PEER_WAIT=45          # how long to wait for an AWDL peer before giving up
 # about 1.8 times a second, so a query and its response have few chances to line
 # up. 25 s was not enough - a send failed with "No AirDrop service discovered"
 # while AWDL sync itself was working fine.
-FIND_TIME="${FIND_TIME:-75}"
+#
+# This is a CEILING, not a duration: the browse stops the instant a receiver is
+# found. So the only thing this number buys is how long a FAILURE takes, and
+# every failure so far has been categorical - the phone either advertises
+# _airdrop._tcp or it does not, and no run has ever had one appear late. A long
+# ceiling has never once turned a failure into a success; it has only made
+# failures slow. 45 s is well past the point where anything new shows up.
+FIND_TIME="${FIND_TIME:-45}"
 # Throughput over AWDL measured at ~0.05 MB/s, so a single photo needs ~40-60s
 # AFTER the user finds and taps this machine. 120s cut a 2 MB transfer off 370
 # bytes from the end - the archive is then genuinely truncated, not mis-decoded.
@@ -581,7 +588,8 @@ elif [ "$MODE" = "send" ]; then
     echo "     it leaves AWDL completely asleep. Open the share sheet."
     echo ""
     echo "  2. Not enough time co-channel. mDNS is multicast and we only share a"
-    echo "     channel with the peer for ~68 ms at a time. Try FIND_TIME=150."
+    echo "     channel with the peer for ~68 ms at a time. FIND_TIME raises the
+     ceiling, but note it has never yet turned a failure into a success."
     echo ""
     echo "  On the phone: unlock it, AirDrop > Everyone for 10 Minutes (this"
     echo "  EXPIRES - re-arm it), then open a share sheet and leave it open."
