@@ -1732,3 +1732,85 @@ Two of tonight's three wrong diagnoses were about code that this table now shows
 was never involved. The bisect that settled it had already been run and sat
 unread while the reasoning continued. Read the control you built before building
 another one.
+
+## §25 - The phone refuses our advertised sequence. PIN is dead; verbatim is the default again
+
+`tools/txarms.sh`, one phone, one setup, one binary, four arms, 2026-07-31
+20:10 (`runs/txarms-20260731-201044/`). Predictions were written down in §24
+before the run.
+
+| arm | ping6 loss | channel switches | unicast frames sent | verdict |
+|---|---|---|---|---|
+| A `-S verbatim` | 60% | 11 | 5 | **PASS** |
+| B `-S pin` | 100% | 1 | 4 | FAIL |
+| C `-S pin -K 250` | 100% | 28 | 4 | FAIL |
+| D `-S pin` again | 100% | 1 | 4 | FAIL |
+
+D reproduced B, so the phone did not drift and the run stands. A passed, so the
+phone was reachable throughout. Both controls held.
+
+### The keepalive hypothesis is dead
+
+Arm C re-issued `set_channel()` 27 times for the channel it was already on,
+poking the radio at more than twice arm A's rate, and got nothing through. §24's
+first branch is therefore closed: **the driver does not need the re-tune.** The
+perfect correlation between channel switches and success in the §23 bisect was
+real and was a coincidence of PIN causing both.
+
+`-K` has been removed. It existed to answer this question, it answered it, and a
+knob whose hypothesis is disproven is only a trap for the next reader. The
+negative result is here and in the history.
+
+### What is left is the sequence we advertise
+
+Everything else is now eliminated by measurement rather than argument. Across A
+and B: the radio sat on 149 either way (§24 - `mon0` owns the channel context,
+so the switches never moved anything); the TX gate opened either way (4-5
+unicast frames left OWL in every arm); the encodings agreed; the peer was the
+same peer, seconds apart. The one remaining difference between an arm that works
+and an arm that does not is **what we put in the channel sequence TLV.**
+
+Under verbatim we advertise what the phone advertises - here
+`149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0`, five slots of sixteen. Under PIN we
+advertise 149 in all sixteen: no empty slots, no infra channel in slot 0, none
+of the structure every captured Apple sequence has. The phone appears to reject
+it outright. It still talks to us - RX was 68 action frames in arm B, identical
+to arm A - it just never sends us a unicast frame again.
+
+That is worth stating plainly because it inverts the §21 model. PIN was designed
+to maximise the windows we are present for, and it does, provably, in the unit
+tests. It just turns out the windows are worthless if the peer will not
+transmit in them. **Availability is not the constraint. Acceptability is.**
+
+### Changes
+
+- `verbatim` is the default again, in both `owl` and `airdrop.sh`.
+- `pin` stays selectable, documented as breaking AirDrop against iOS 26.
+- `-K` and the keepalive removed.
+- `pin_never_loses_windows_to_phase_error` keeps passing and keeps its
+  arithmetic; its comment now records that being right about the windows did not
+  help.
+
+### What this does and does not settle
+
+It settles the §23 regression: the cause is PIN's advertised sequence, the fix
+is not to send it, and unicast TX works again at the §16 baseline. 60% loss is
+not health - arm A's 2-of-5 replies are the same marginal path §16 measured at
+45 kB/s - but it is the number this project started from, and the regression is
+closed.
+
+It does **not** settle where Apple's line is. PIN is one extreme (16 of 16, no
+structure) and verbatim is the other (exactly the peer's own sequence). The
+duty-cycle work of §21 lives in between, and the next question is the narrow
+one: does the phone accept a sequence that is the peer's own with some empty
+slots filled in? That is a widening we can test one step at a time, and now
+there is a harness that tells us within a minute whether the phone has stopped
+answering.
+
+### Method note
+
+The §24 control was built and run and it worked exactly as designed, including
+the part that mattered most: arm D. Three of this project's wrong conclusions
+came from run-order confounds, and a re-test of the failing arm at the end costs
+90 seconds and converts "I think the phone was fine" into a row in the table.
+Keep doing that.

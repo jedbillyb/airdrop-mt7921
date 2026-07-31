@@ -389,18 +389,22 @@ sleep 1
 # would fail with EBUSY. We did that setup ourselves above. In ACTIVE mode
 # OWL_IF is the active vif, so OWL's frames go out on the vif that ACKs.
 # STRATEGY picks how OWL derives its channel sequence from the peer's; see
-# channel.h in the owl fork and FINDINGS §21.
+# channel.h in the owl fork and FINDINGS §21, §25.
 #
-#   pin       sit on the peer's dominant social channel in all 16 slots (default)
-#   verbatim  copy the sync master's sequence -- upstream behaviour, the 45 kB/s
-#             baseline. Use this to reproduce the old number for comparison.
+#   verbatim  copy the sync master's sequence -- upstream behaviour, and the
+#             DEFAULT, because it is the only strategy an iPhone has ever been
+#             observed to answer (§25).
+#   pin       sit on the peer's dominant social channel in all 16 slots. BREAKS
+#             AIRDROP against iOS 26: the phone stops replying entirely. Measured
+#             twice in one session against verbatim's 60% ping loss. Only useful
+#             now as the experiment for how much slot structure Apple requires.
 #   rotate    copy it but rotate into our own clock phase first
 #
 # The point of exposing it is that all three can be measured against the same
 # phone in one session, which is the only way this gets settled:
 #   for s in verbatim pin rotate; do STRATEGY=$s ACTIVE=1 ./airdrop.sh receive; done
-#   tools/bursts.py runs/<pin-run>/receive.pcap --baseline runs/<verbatim-run>/receive.pcap
-STRATEGY="${STRATEGY-pin}"
+#   tools/bursts.py runs/<a-run>/receive.pcap --baseline runs/<b-run>/receive.pcap
+STRATEGY="${STRATEGY-verbatim}"
 # Set STRATEGY= (empty) to omit the flag entirely, which is what an OWL build
 # from before -S existed needs -- the pre-change binary is the reference for
 # deciding whether a regression is ours or the environment's, and it aborts on
