@@ -63,3 +63,37 @@ Apply after `opendrop-ios26-airdrop.patch`.
    before the chunked-encoding check, before building the reader and before opening
    the output file - so the sender began transmitting while the server was still
    getting ready. That race is what overran the buffer in the first place.
+
+## opendrop-py314-send.patch
+
+Three unrelated breakages that all sit on the **send** path, none of them
+AirDrop-specific: OpenDrop 0.13.0 predates Python 3.12, Pillow 10 and current
+`libarchive-c`, and each dependency removed something it relies on. Together they
+meant `opendrop send` and `opendrop find` could not put a single packet on the
+wire. Found by exercising the send path offline; the network half is still
+untested.
+
+1. **`HTTPSConnection` no longer takes `key_file`, `cert_file` or
+   `check_hostname`** (deprecated in 3.6, removed in 3.12). `HTTPSConnectionAWDL`
+   forwarded all three, so every send *and* every `find` died at construction with
+   `TypeError: HTTPSConnection.__init__() got an unexpected keyword argument
+   'key_file'`. They belong on the `SSLContext` now, which
+   `AirDropConfig.get_ssl_context()` already builds via `load_cert_chain()` - so
+   in normal use there is nothing to carry over.
+
+2. **`libarchive-c` changed `ArchiveEntry.__init__`.** The second positional
+   argument is now `header_codec` (a str) and the entry allocates its own C
+   struct. `AbsArchiveWrite.add_abs_file()` called `ArchiveEntry(None, entry_p)`,
+   putting a pointer where the codec goes, and died on the first pathname
+   assignment with `TypeError: encode() argument 'encoding' must be str, not int`.
+   The rewrite lets `ArchiveEntry` own its struct; note it drops the surrounding
+   `new_archive_entry()` context manager on purpose, since that would free the
+   same struct `ArchiveEntry.__del__` frees.
+
+3. **`Image.ANTIALIAS` was removed in Pillow 10** (this box has 12.3.0). Sending
+   any image calls `generate_file_icon()`, which used it.
+   `Image.Resampling.LANCZOS` is the identical filter under its current name.
+
+Verified offline: the cpio archive builds and round-trips (`070707` ODC magic),
+the icon renders to JPEG2000, and `send_ask()` now runs all the way to the
+network call instead of failing at import-time API mismatches.
