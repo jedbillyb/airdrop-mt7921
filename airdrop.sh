@@ -763,7 +763,29 @@ elif [ "$MODE" = "send" ]; then
   esac
   echo ""
   echo "### layer 4: sending $SENDFILE"
-  "$OPENDROP" -i $AWDL send -r "$RECEIVER" -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
+  # CAPTURE THE SEND. The first run to get this far died with "Remote end closed
+  # connection without response" on /Upload, and there was nothing to look at:
+  # the layer-2.5 capture had already been stopped, so the only TCP in the pcap
+  # was the ping. A transfer that fails after "Receiver accepted" is a
+  # conversation, and a conversation has to be recorded to be read.
+  #
+  # SSLKEYLOGFILE makes it readable rather than just present - opendrop's
+  # get_ssl_context() is patched to honour it. Decrypt with:
+  #   tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
+  sudo tcpdump -i $AWDL -n -s 0 -U -w "$OUT/send.pcap" >/dev/null 2>&1 &
+  sleep 1
+  SSLKEYLOGFILE="$OUT/sslkeys.log" "$OPENDROP" -i $AWDL send -r "$RECEIVER" -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
+  sleep 1
+  sudo pkill -x tcpdump 2>/dev/null || true
+  if [ -s "$OUT/send.pcap" ]; then
+    echo ""
+    echo "  send captured: $OUT/send.pcap"
+    if [ -s "$OUT/sslkeys.log" ]; then
+      echo "  TLS keys logged - read the HTTP exchange with:"
+      echo "      tshark -r $OUT/send.pcap \\"
+      echo "        -o tls.keylog_file:$OUT/sslkeys.log -Y http"
+    fi
+  fi
 else
   echo ""
   echo "### discovery-only mode. Re-run with:"

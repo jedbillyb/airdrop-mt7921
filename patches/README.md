@@ -145,3 +145,22 @@ address and port. `Found ...` on stdout is not enough, and neither is passing
    destroy the previous one.
 
 Apply after `opendrop-mdns-repeat.patch`.
+
+## opendrop-tls-keylog.patch
+
+A diagnostic, not a fix, and inert unless `SSLKEYLOGFILE` is set.
+
+Every AirDrop failure after the TLS handshake looks the same from outside:
+`http.client.RemoteDisconnected: Remote end closed connection without response`.
+That one message covers "the phone rejected our headers", "the phone gave up
+waiting for the body", and "the link dropped mid-upload", and they need
+different fixes. CPython wires `SSLKEYLOGFILE` up only inside
+`ssl.create_default_context()`; `AirDropConfig.get_ssl_context()` builds its
+context by hand, so the variable was being ignored. Setting
+`ctx.keylog_filename` makes a capture of the send decryptable:
+
+```sh
+tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
+```
+
+`airdrop.sh send` now captures `send.pcap` and sets `SSLKEYLOGFILE` for the run.

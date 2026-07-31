@@ -1,0 +1,16 @@
+--- a/opendrop/config.py
++++ b/opendrop/config.py
+@@ -165,4 +165,13 @@
+         ctx.verify_mode = (
+             ssl.CERT_NONE
+         )  # we accept self-signed certificates as does Apple
++        # Honour SSLKEYLOGFILE. CPython only wires this up inside
++        # ssl.create_default_context(), and we build the context by hand, so
++        # without this there is no way to see what an iPhone actually said on an
++        # AirDrop connection - every failure past the TLS handshake looks
++        # identical from outside ("Remote end closed connection"). Inert unless
++        # the variable is set.
++        keylogfile = os.environ.get("SSLKEYLOGFILE")
++        if keylogfile:
++            ctx.keylog_filename = keylogfile
+         return ctx
