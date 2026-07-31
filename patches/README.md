@@ -194,17 +194,31 @@ Design flaw, recorded because it cost a run: arms 2-4 changed the connection
 interpretable. The capture does show the phone accepting all three fresh TCP
 connections, so it was not refusing to talk.
 
-### Round two (current default)
+### Round two (also uninterpretable past arm 1)
+
+Same failure of design, found in the capture rather than assumed: arms 2-4 went
+out on **new TCP streams**. A refused `/Upload` kills the connection, so
+`send_POST()` found `http_conn` at `None` and opened a fresh one - "reuse"
+silently became "new", and worse, that connection carried no `/Ask`, so the
+phone was asked to accept an upload for a session it had never agreed to on
+that socket. Only arm 1 was ever a real test, in both rounds.
+
+### Round three (current default)
 
 These hold the connection constant and copy what the phone **demonstrably does
 when it sends to us**, rather than inventing another theory:
 
-| arm | container | `Expect: 100-continue` |
-|-----|-----------|------------------------|
-| `reuse-chunked-gzip`         | cpio + gzip (upstream, control) | no  |
-| `reuse-chunked-gzip-expect`  | cpio + gzip | yes |
-| `reuse-chunked-dvzip-expect` | dvzip       | yes |
-| `reuse-chunked-dvzip`        | dvzip       | no  |
+| order | arm | container | `Expect: 100-continue` |
+|---|-----|-----------|------------------------|
+| 1 | `reuse-chunked-gzip`         | cpio + gzip (upstream, control) | no  |
+| 2 | `reuse-chunked-dvzip-expect` | dvzip       | yes |
+| 3 | `reuse-chunked-dvzip`        | dvzip       | no  |
+| 4 | `reuse-chunked-gzip-expect`  | cpio + gzip | yes |
+
+**Every arm after the first re-sends `/Ask`, so it prompts on the phone and
+costs an Accept tap.** That is the price of an arm that tests what its name
+says. The control is first and the strongest candidate second, so stopping
+after two taps still yields a usable result.
 
 Both differences are observed, not guessed. Our receiver had to be taught to
 answer `Expect: 100-continue` because the iPhone sends it, and to decode

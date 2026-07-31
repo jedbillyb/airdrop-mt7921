@@ -34,10 +34,11 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -241,6 +249,32 @@
+@@ -241,7 +249,33 @@
  
          return success
  
+-    def send_upload(self, file_path, is_url=False):
 +    @staticmethod
 +    def _cpio_to_dvzip(cpio, block=128 * 1024, stored=False):
 +        """
@@ -64,10 +65,11 @@
 +                out += struct.pack(">I", len(z)) + z
 +        return bytes(out)
 +
-     def send_upload(self, file_path, is_url=False):
++    def send_upload(self, file_path, is_url=False, reask=None):
          """
          Send a file to a receiver.
-@@ -249,29 +283,101 @@
+         """
+@@ -249,29 +283,136 @@
          if is_url:
              return
  
@@ -114,14 +116,49 @@
 +        # so could not attribute its failures. Only arm 1 was interpretable.
 +        arms = os.environ.get(
 +            "OPENDROP_UPLOAD_ARMS",
-+            "reuse-chunked-gzip,reuse-chunked-gzip-expect,"
-+            "reuse-chunked-dvzip-expect,reuse-chunked-dvzip",
++            # Control first, then the strongest candidate, so that abandoning
++            # the run after two taps still yields an interpretable result.
++            "reuse-chunked-gzip,reuse-chunked-dvzip-expect,"
++            "reuse-chunked-dvzip,reuse-chunked-gzip-expect",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):
 +            arm = arm.strip()
 +            if not arm:
 +                continue
++            # RE-ASK BEFORE EVERY ARM AFTER THE FIRST. Twice now an arms round
++            # has produced four failures of which only the first was
++            # interpretable, because a refused /Upload leaves the connection
++            # dead: send_POST then finds http_conn is None and opens a fresh one,
++            # so "reuse" silently becomes "new" and the arm is a different
++            # experiment from the one it claims to be. Worse, that fresh
++            # connection carries no /Ask, so the phone is being asked to accept
++            # an upload for a session it never agreed to on that socket.
++            #
++            # The only honest fix costs the user an Accept tap per arm. Taps are
++            # cheaper than another uninterpretable round.
++            if i > 0:
++                if reask is None:
++                    logger.warning(
++                        f"Skipping arm '{arm}': the connection is gone and there "
++                        "is no way to re-Ask, so the arm would not test what its "
++                        "name says."
++                    )
++                    continue
++                logger.info(f"Re-sending /Ask before arm '{arm}' - EXPECT A PROMPT")
++                if self.http_conn is not None:
++                    try:
++                        self.http_conn.close()
++                    except OSError:
++                        pass
++                    self.http_conn = None
++                try:
++                    if not reask():
++                        logger.warning(f"Re-Ask before '{arm}' was refused; stopping")
++                        return False
++                except (OSError, HTTPException) as e:
++                    logger.warning(f"Re-Ask before '{arm}' failed: {e}; stopping")
++                    return False
 +            new_conn = arm.startswith("new")
 +            use_length = "length" in arm
 +            compress = "plain" not in arm and "dvzip" not in arm
@@ -190,3 +227,21 @@
  
      def _get_headers(self):
          """
+--- a/opendrop/cli.py
++++ b/opendrop/cli.py
+@@ -222,7 +222,14 @@
+             return
+         logger.info("Receiver accepted")
+         logger.info("Uploading file ...")
+-        if not self.client.send_upload(self.file, is_url=self.is_url):
++        if not self.client.send_upload(
++            self.file,
++            is_url=self.is_url,
++            # Lets an upload arm re-establish an accepted session before it runs.
++            # Without this every arm after the first tests a fresh connection the
++            # phone never accepted anything on.
++            reask=lambda: self.client.send_ask(self.file, is_url=self.is_url),
++        ):
+             logger.warning("Uploading has failed")
+             return
+         logger.info("Uploading has been successful")

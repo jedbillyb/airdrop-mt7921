@@ -2117,3 +2117,56 @@ does not fully clear the hypothesis.
 Send is now: discovery reliable, `/Ask` accepted with a real user tap, `/Upload`
 refused. Everything except the payload container is proven working in the send
 direction.
+
+---
+
+## §30 Round two failed the same way round one did, and the capture said so
+
+2026-07-31, 21:44. The phone-side reset worked - `/Ask` was accepted with a real
+tap after the previous run's ten-minute silence - and all four upload arms
+failed.
+
+The result is again worth less than it appears, and this time the capture proves
+it rather than leaving it to suspicion:
+
+```
+stream 0   POST /Ask -> 200      then  POST /Upload  x-cpio    (arm 1)
+stream 1   POST /Upload  x-cpio               (arm 2, NEW connection)
+stream 2   POST /Upload  x-dvzip              (arm 3, NEW connection)
+stream 3   POST /Upload  x-dvzip              (arm 4, NEW connection)
+```
+
+Arms 2, 3 and 4 each opened a **fresh TCP connection**, despite all being named
+`reuse-`. The mechanism is simple and was sitting in the code the whole time: a
+refused `/Upload` kills the connection, `send_POST()` then finds `http_conn` at
+`None`, and opens a new one. "Reuse" silently became "new".
+
+That makes them worse than merely mislabelled. A fresh connection carries no
+`/Ask`, so the phone was being asked to accept an upload for a session it had
+never agreed to on that socket - which it should refuse, and did. Their failure
+says nothing about dvzip or `Expect: 100-continue`.
+
+**Only arm 1 has ever been a valid test, in either round.** What is actually
+established after two rounds is exactly one thing, the same thing §29 already
+knew: upstream's cpio+gzip chunked upload on the post-`/Ask` connection is
+refused with a close_notify.
+
+### The fix costs taps
+
+An arm that tests what its name says needs an accepted session, and an accepted
+session needs a prompt. So every arm after the first now re-sends `/Ask` and
+waits for the user to tap Accept again. Four arms, four taps.
+
+That is unattractive and it is the honest price. Two rounds of four-arm runs
+have now produced two interpretable data points between them; one round of
+four *real* arms will produce four. The control runs first and the strongest
+candidate (dvzip with `Expect`) second, so a user who abandons the run after two
+taps still gets a usable comparison.
+
+### Standing back
+
+Three separate times this project has built an experiment that varied more than
+it intended - `-K` in §24, the connection/framing confound in §29, and now the
+silent connection-reuse failure. The pattern is the same each time: the arm was
+described by what the code was *meant* to do rather than by what it would
+actually put on the wire. The capture is what caught it twice. Capture first.
