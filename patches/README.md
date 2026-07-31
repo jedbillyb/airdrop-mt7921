@@ -97,3 +97,23 @@ untested.
 Verified offline: the cpio archive builds and round-trips (`070707` ODC magic),
 the icon renders to JPEG2000, and `send_ask()` now runs all the way to the
 network call instead of failing at import-time API mismatches.
+
+## opendrop-mdns-repeat.patch
+
+**The fix that first got the iPhone to answer us at all.** See
+[../docs/FINDINGS.md](../docs/FINDINGS.md) §19.
+
+`ServiceBrowser` backs its queries off 1s, 2s, 4s, 8s, ... which assumes a link
+where a lost query is unusual. AWDL over a single radio is not that link: we are
+only on the peer's channel for a fraction of each 1.048 s sequence, an mDNS query
+is one unacknowledged multicast frame, and the answer has to survive the same
+gauntlet coming back. Measured over a 75 s browse, the backoff produced **7
+queries** - at t=0,1,3,7,15,31,63 - and by 30 s in it was asking once a minute.
+None was answered.
+
+`AirDropBrowser` now also runs a daemon thread that re-asks the `_airdrop._tcp`
+PTR question at a steady interval, default 1.5 s, overridable with
+`OPENDROP_QUERY_INTERVAL` (set it to 0 to disable). On the next run mDNS packets
+in the browse window went 7 -> 68 and replies from the peer went **0 -> 14**.
+
+Apply after `opendrop-py314-send.patch`.

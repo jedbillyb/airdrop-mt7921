@@ -1148,3 +1148,82 @@ that do not affect throughput**, which is exactly what they are.
 
 The `net.core.rmem_max` bump that was briefly in `airdrop.sh` has been removed:
 it changes global system state, and it buys nothing measurable.
+
+---
+
+## §19 - The send path: four blockers, and the mDNS backoff that hid the rest
+
+2026-07-31. Sending *to* an iPhone had never once reached discovery. Working
+backwards from "No AirDrop service discovered" turned up four separate faults
+stacked on top of each other, three of them nothing to do with AirDrop.
+
+### 1-3. Dependency rot (see `patches/opendrop-py314-send.patch`)
+
+OpenDrop 0.13.0 predates Python 3.12, Pillow 10 and current `libarchive-c`, and
+each removed something it relies on: `HTTPSConnection`'s `key_file`/`cert_file`/
+`check_hostname`, `ArchiveEntry`'s old constructor, and `Image.ANTIALIAS`. The
+first killed `find` *and* `send` at construction, so not a single packet went out.
+
+### 4. The discovery report was never written
+
+`opendrop find` blocks forever and writes its report from a `finally:` reached via
+`KeyboardInterrupt`. The harness used `timeout`, which sends SIGTERM, and Python
+does not turn SIGTERM into `KeyboardInterrupt` - so the report was never written.
+That surfaced much later, and very confusingly, as *"No discovery report exists,
+please run 'opendrop find' first"* during send. Fixed with `timeout -s INT`.
+
+### The retraction: Control Centre is not enough
+
+An earlier note here advised opening Control Centre to make the phone
+discoverable. That was wrong and the measurement says so flatly: with Control
+Centre open, **zero AWDL frames on all five social channels** (6, 36, 44, 132,
+149). Not "no service" - no AWDL at all.
+
+Apple bootstraps AirDrop over **Bluetooth LE**: the sender's BLE advertisement is
+what wakes a receiver's AWDL interface. Neither OWL nor OpenDrop implements it, so
+a dormant iPhone cannot be woken by us. **The share sheet is required in both
+directions**, because it is what brings AWDL up on the phone.
+
+### The real one: ServiceBrowser's backoff is wrong for AWDL
+
+With all of the above fixed, AWDL synced, the peer was found, ping6 worked - and
+a 75 s browse still found nothing. The browse window had never been captured; it
+was the one phase not on tape. Capturing it (`find.pcap`) showed:
+
+```
+mDNS during browse: total=7  from_peer=0  mentioning _airdrop=7
+```
+
+Seven queries in 75 seconds, at t = 0, 1, 3, 7, 15, 31, 63 - `ServiceBrowser`'s
+exponential backoff. That schedule assumes a link where a lost query is unusual.
+AWDL over a single radio is the opposite: we are co-channel with the peer only a
+fraction of each 1.048 s sequence (this phone's sequence put just 2 of 16 slots on
+our channel), an mDNS query is one unacknowledged multicast frame, and the answer
+runs the same gauntlet back. By 30 s in we were asking **once a minute**.
+
+`patches/opendrop-mdns-repeat.patch` re-asks the PTR question at a steady 1.5 s
+(`OPENDROP_QUERY_INTERVAL`). Effect on the very next run:
+
+| | before | after |
+|---|---|---|
+| mDNS packets in browse | 7 | 68 |
+| queries mentioning `_airdrop` | 7 | 54 |
+| **replies from the peer** | **0** | **14** |
+
+The phone went from completely silent to answering. Also removed as a confound:
+`avahi-daemon`, which was announcing `_sftp-ssh._tcp` and `void-btw.local` out of
+`awdl0`, burning the scarce co-channel airtime and holding UDP 5353. It is now
+stopped for the run and restored on exit (`AVAHI=keep` to opt out).
+
+### Where it stands
+
+Discovery still returns nothing, but the failure has moved and is now visible.
+The phone is demonstrably awake and chatty on AWDL - it advertises
+`_applicationServicePairing`, `_appSvcPrePair` and `_spotify-connect`, and answers
+queries for them - while never advertising or answering `_airdrop._tcp`. That is
+the signature of AirDrop not being armed to **Everyone**: in Contacts Only an
+iPhone stays silent to an unknown sender and relies on the BLE identity exchange
+we cannot do. "Everyone for 10 Minutes" expires, and these runs were well past it.
+
+The useful part is the positive control: we can now see the phone's *other*
+services on `awdl0`, so the moment `_airdrop._tcp` appears we will see that too.

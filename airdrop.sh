@@ -134,7 +134,36 @@ fi
 REG="${REG:-NZ}"
 
 
+# avahi-daemon competes for awdl0. Captured on 2026-07-31 it was announcing
+# _sftp-ssh._tcp and void-btw.local straight out of awdl0, which (a) burns the
+# very scarce co-channel airtime we need for the _airdrop._tcp query and its
+# reply and (b) holds UDP 5353, so any UNICAST mDNS answer from the phone can be
+# delivered to avahi's socket instead of python-zeroconf's. Stopped for the run
+# and restored afterwards. AVAHI=keep to leave it alone.
+AVAHI_WAS=""
+if [ "${AVAHI:-stop}" = "stop" ] && pgrep -x avahi-daemon >/dev/null 2>&1; then
+  AVAHI_WAS=1
+fi
+if [ -n "$AVAHI_WAS" ] && [ -d /etc/sv/avahi-daemon ]; then
+  AVAHI_RESTORE='sudo sv up avahi-daemon 2>/dev/null || true'
+  AVAHI_STOP='sudo sv down avahi-daemon 2>/dev/null || true'
+elif [ -n "$AVAHI_WAS" ] && command -v systemctl >/dev/null 2>&1; then
+  AVAHI_RESTORE='sudo systemctl start avahi-daemon 2>/dev/null || true'
+  AVAHI_STOP='sudo systemctl stop avahi-daemon 2>/dev/null || true'
+elif [ -n "$AVAHI_WAS" ]; then
+  # Killing it with no supervisor to bring it back would leave the user's
+  # machine changed after the script exits. Warn instead.
+  echo "note: avahi-daemon is running and shares awdl0 with us, but there is no"
+  echo "      service manager here to restart it, so it is being left alone."
+  AVAHI_RESTORE='true'
+  AVAHI_STOP='true'
+else
+  AVAHI_RESTORE='true'
+  AVAHI_STOP='true'
+fi
+
 RESTORE_CMDS='
+  '"$AVAHI_RESTORE"' 2>/dev/null || true
   sudo pkill -x owl 2>/dev/null || true
   sudo ip link set '"$MONA"' down 2>/dev/null || true
   sudo iw dev '"$MONA"' del 2>/dev/null || true
@@ -177,6 +206,8 @@ trap restore EXIT
 echo ""
 echo "### layer 1: AWDL link on $MON"
 $NM_DOWN
+eval "$AVAHI_STOP"
+[ -n "$AVAHI_WAS" ] && echo "  avahi-daemon stopped for this run (restored on exit)"
 sudo pkill -x wpa_supplicant 2>/dev/null; sudo pkill -x dhcpcd 2>/dev/null; sleep 1
 sudo iw reg set "$REG"
 sudo ip link set $IFACE down
@@ -419,7 +450,25 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   # it outright and the report was NEVER written - which surfaces much later, and
   # very confusingly, as "No discovery report exists, please run 'opendrop find'
   # first" during send. SIGINT lets the finally: block run.
+  # Capture the whole browse window. Until now awdl0 was only captured during
+  # layer 2.5's 14 s ping window, so the discovery phase - the part that keeps
+  # failing - was the one part never on tape. Without this you cannot tell
+  # "our query never went out" from "it went out and the phone ignored it".
+  sudo timeout $((FIND_TIME + 10)) tcpdump -i $AWDL -w "$OUT/find.pcap" >/dev/null 2>&1 &
+  sleep 1
   timeout -s INT $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
+  sudo pkill -x tcpdump 2>/dev/null || true
+  sleep 1
+
+  # Did our _airdrop._tcp query leave, and did anything answer?
+  F_Q=$(sudo tcpdump -r "$OUT/find.pcap" -nn 2>/dev/null | grep -c "_airdrop" || true)
+  if [ -n "${PEER6:-}" ]; then
+    F_IN=$(sudo tcpdump -r "$OUT/find.pcap" -nn "port 5353 and ip6 src $PEER6" 2>/dev/null | wc -l)
+  else
+    F_IN="?"
+  fi
+  F_OUT=$(sudo tcpdump -r "$OUT/find.pcap" -nn "port 5353" 2>/dev/null | wc -l)
+  echo "  mDNS during browse: total=$F_OUT  from_peer=$F_IN  mentioning _airdrop=$F_Q"
 
   if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
     echo ""
