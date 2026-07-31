@@ -2043,3 +2043,77 @@ yet: 13 frames, correctly scheduled, all lost. Note the stalled ACKs cluster at
 frames that got through earlier were spread across the window. That is one
 narrow, testable idea (the phone may not be listening at the very start of its
 AW) and it has **not** been tested. It is recorded here as a lead, not a cause.
+
+---
+
+## §29 /Upload is refused for what it contains, not how it is delivered
+
+2026-07-31, 21:14 and 21:20. `/Upload` is a **separate bug from §28**: the 21:14
+run pinged 0% loss and still failed, so transport is not the cause.
+
+### The exchange, decrypted
+
+```
+POST /Ask     333 B  ->  200 OK, chunked
+   ReceiverComputerName: Jed's iPhone   ReceiverModelName: iPhone
+   IDSSessionID: 445F301A-0DA0-43C7-AA92-0D609D9AB4EE
+   SupportsContactExchange: False
+POST /Upload  chunked, application/x-cpio, 168 B gzip, 0-length terminator
+   ->  TLS close_notify (alert level 1, desc 0). No HTTP status at all.
+```
+
+Every byte was ACKed. The phone parsed a complete, correctly framed request and
+deliberately hung up. **A server that dislikes a media type answers 406** - ours
+does exactly that - so a silent close is not a content-type complaint in the
+ordinary sense.
+
+### Round one of arms: four failures, three of them uninterpretable
+
+`reuse-chunked-gzip`, `new-chunked-gzip`, `new-length-gzip`,
+`new-length-plain`. All four refused identically.
+
+The result is weaker than it looks and the flaw is mine: arms 2-4 changed the
+**connection and the framing together**, so a failure cannot be attributed to
+either. Only arm 1 - upstream behaviour, reused connection - was a clean test.
+Recorded rather than quietly re-run, because designing an arm that varies two
+things at once is exactly the failure this project keeps repeating.
+
+What round one did establish: the phone accepted all three fresh TCP connections
+(SYN-ACK on streams 2, 3 and 4). It was not refusing to talk to us.
+
+### Round two: stop theorising, copy the phone
+
+We have watched this iPhone send `/Upload` to **us**, and our receiver had to be
+patched twice to cope with what it does:
+
+1. It sets `Expect: 100-continue` (the 100-continue ordering fix).
+2. It sends `application/x-dvzip`, not `x-cpio` (the dvzip decoder).
+
+We send neither. That is two concrete, *observed* differences between Apple's
+sender and ours, which beats a fifth invented theory. The new arms hold the
+connection constant and vary only those:
+
+| arm | container | `Expect` |
+|-----|-----------|----------|
+| `reuse-chunked-gzip`         | cpio + gzip (control) | no  |
+| `reuse-chunked-gzip-expect`  | cpio + gzip | yes |
+| `reuse-chunked-dvzip-expect` | dvzip       | yes |
+| `reuse-chunked-dvzip`        | dvzip       | no  |
+
+`_cpio_to_dvzip()` is the exact inverse of the `dvzip_to_cpio()` decoder that was
+verified against a real 2.06 MB iOS 26 transfer. It round-trips through that
+decoder for single-block and multi-block payloads in both STORED and zlib forms,
+producing `070707` ODC cpio back - so if a dvzip arm fails, it fails because the
+phone rejected a valid container, not because we built a broken one.
+
+**Caveat on the Expect arms:** `http.client` does not implement 100-continue
+properly. It sends the header and then the body without waiting for the interim
+response. The header is on the wire, which is what the arm tests, but a phone
+that requires a genuine wait would still refuse. If an Expect arm fails, that
+does not fully clear the hypothesis.
+
+### Where this sits
+
+Send is now: discovery reliable, `/Ask` accepted with a real user tap, `/Upload`
+refused. Everything except the payload container is proven working in the send
+direction.

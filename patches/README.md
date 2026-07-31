@@ -170,25 +170,51 @@ tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
 **An experiment, not a fix.** See [../docs/FINDINGS.md](../docs/FINDINGS.md) §29.
 
 An iPhone on iOS 26 accepts `/Ask`, returns a full 200 with its receiver plist,
-then takes a complete and well-formed chunked `/Upload` and answers with a TLS
+then takes a complete and well-formed `/Upload` and answers with a TLS
 **close_notify** instead of an HTTP status. Not transport loss: captured at 0%
 ping loss with every byte ACKed. A server that dislikes a media type answers
-406, so a silent close points at framing or connection handling - and a single
-capture cannot say which.
+406, so a silent close points elsewhere.
 
-Each candidate costs an Accept tap if tried in separate runs, so `send_upload()`
-now tries them in sequence inside one accepted session, controlled by
-`OPENDROP_UPLOAD_ARMS` (comma-separated, in order):
+`send_upload()` walks a list of arms inside one accepted session, controlled by
+`OPENDROP_UPLOAD_ARMS`, because each candidate otherwise costs the user an
+Accept tap. Read the result asymmetrically: **a success is conclusive, a failure
+of a later arm is not**, since the phone may abandon the session after the first
+rejection. Arm 1 reproduces upstream exactly and is the control.
 
-| arm | connection | framing | archive |
-|-----|-----------|---------|---------|
-| `reuse-chunked-gzip` | reused (upstream behaviour) | chunked | cpio + gzip |
-| `new-chunked-gzip`   | fresh                       | chunked | cpio + gzip |
-| `new-length-gzip`    | fresh                       | `Content-Length` | cpio + gzip |
-| `new-length-plain`   | fresh                       | `Content-Length` | bare ODC cpio |
+Arm names are parsed by substring: `new` = fresh connection (default reuse),
+`length` = `Content-Length` (default chunked), `dvzip` = Apple's container,
+`plain` = bare cpio, `expect` = send `Expect: 100-continue`.
 
-Read the result asymmetrically: **a success is conclusive, a failure of a later
-arm is not**, because the phone may abandon the session after the first
-rejection. Arm 1 reproduces upstream exactly, so it doubles as the control.
+### Round one (all four failed)
 
-`send_POST()` gains `new_conn=`; everything else is unchanged.
+`reuse-chunked-gzip`, `new-chunked-gzip`, `new-length-gzip`, `new-length-plain`.
+
+Design flaw, recorded because it cost a run: arms 2-4 changed the connection
+**and** the framing together, so none of them was attributable. Only arm 1 was
+interpretable. The capture does show the phone accepting all three fresh TCP
+connections, so it was not refusing to talk.
+
+### Round two (current default)
+
+These hold the connection constant and copy what the phone **demonstrably does
+when it sends to us**, rather than inventing another theory:
+
+| arm | container | `Expect: 100-continue` |
+|-----|-----------|------------------------|
+| `reuse-chunked-gzip`         | cpio + gzip (upstream, control) | no  |
+| `reuse-chunked-gzip-expect`  | cpio + gzip | yes |
+| `reuse-chunked-dvzip-expect` | dvzip       | yes |
+| `reuse-chunked-dvzip`        | dvzip       | no  |
+
+Both differences are observed, not guessed. Our receiver had to be taught to
+answer `Expect: 100-continue` because the iPhone sends it, and to decode
+`application/x-dvzip` because the iPhone sends that too.
+
+`_cpio_to_dvzip()` is the exact inverse of `dvzip_to_cpio()` in `server.py`, and
+round-trips through it for single- and multi-block payloads in both STORED and
+zlib forms.
+
+**Known limitation:** `http.client` does not implement `Expect: 100-continue`
+properly - it sends the header and then the body without waiting for the 100.
+The header is present on the wire, which is what the arm tests, but if the phone
+requires a real wait this arm understates the case.
