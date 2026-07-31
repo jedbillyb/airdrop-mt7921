@@ -496,14 +496,21 @@ else
     echo "  ==> NOTHING traverses awdl0. AWDL syncs but carries no data."
     echo "      That is a data-path problem, not an AirDrop auth problem."
   elif [ "${FROMPEER:-0}" = "0" ]; then
-    # NOT evidence of a one-way path, whatever it looks like. iOS ignores ICMP6
-    # echo requests from devices it has no association with, so 100%% loss reads
-    # identically whether we fail to ACK or the phone simply declines to answer.
-    # FINDINGS §10 took this as proof that active monitor does not work on this
-    # chip and was wrong; §15 settled it the other way by letting the phone
-    # initiate, at which point it sent us 481 packets including TCP.
-    echo "  ==> no ping replies. This is INCONCLUSIVE, not a failure: iOS does"
-    echo "      not answer pings from strangers. See docs/FINDINGS.md §15."
+    # This IS evidence of a one-way path. The long-standing reading here - that
+    # iOS ignores ICMP6 from strangers, so 100%% loss tells you nothing - is
+    # RETRACTED (§23). On 2026-07-31 the same iPhone answered 5/5 as soon as the
+    # TX path genuinely worked and 0/5 when it did not, with nothing else
+    # changed. So ping6 is a reliable 8-second test of whether our frames reach
+    # the phone, and a far better one than waiting two minutes for a file
+    # transfer that will fail for the same reason.
+    echo "  ==> NO PING REPLIES - treat this as a real failure of the TX path."
+    echo "      Our frames are not reaching the phone. Nothing past this point"
+    echo "      can work: the phone may still find us and open TCP, but the"
+    echo "      handshake will never complete (it SYNs, we SYN-ACK, it SYNs"
+    echo "      again forever) and no file will move."
+    echo "      Earlier advice here said this was INCONCLUSIVE because iOS"
+    echo "      ignores pings from strangers. That is RETRACTED (§23): on"
+    echo "      2026-07-31 the same phone answered 5/5 when the path worked."
   else
     echo "  ==> bidirectional IP works. Any failure past here is service/auth level."
   fi
@@ -659,10 +666,14 @@ if [ "$MODE" = "receive" ]; then
     echo "  not the radio."
   else
     echo "  ==> still nothing from the phone, even when IT initiates."
-    echo "  Combined with the ping6 result this is the no-ACK reading: mt76"
-    echo "  advertises NL80211_FEATURE_ACTIVE_MONITOR for every driver in its"
-    echo "  core (mac80211.c:442) and no mt76 driver reads the flag, so nothing"
-    echo "  ever tells the MT7921 to ACK. Next stop is patching mt76 or the AR9271."
+    echo "  Check the ping6 result above first. If that also failed, this is a"
+    echo "  TX problem and not an auth one - our frames are not reaching the"
+    echo "  phone at all, so nothing at the service layer can succeed."
+    echo "  The old reading here blamed mt76 not honouring"
+    echo "  NL80211_FEATURE_ACTIVE_MONITOR. That is not settled: ACKs were"
+    echo "  confirmed working in §15, and again on 2026-07-31 with ping6 at 5/5,"
+    echo "  so the chip CAN ACK in the pair configuration. Suspect the software"
+    echo "  before reaching for a driver patch or the AR9271."
   fi
 elif [ "$MODE" = "send" ]; then
   echo ""

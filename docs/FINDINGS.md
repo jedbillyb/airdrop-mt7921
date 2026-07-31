@@ -1533,3 +1533,104 @@ the real sequence as the test case.
 Worth noting the sweep and the sequence disagreed at all: frame count on a
 channel is not the same as slots-per-sequence, and the sequence is the better
 guide. `slotmap.py` reads it directly.
+
+---
+
+## §23 - ping6 is a real test, and the TX regression is ours
+
+2026-07-31, evening. Live testing against the phone, after a session of changes
+made without one. Two results: a diagnostic that has been misread since §10, and
+a regression introduced by those changes.
+
+### ping6 loss is a real signal, not an ambiguity
+
+§10 measured 100% ping6 loss and read it as a one-way path. §15 retracted that,
+reasoning that iOS ignores ICMP6 from devices it has no association with, so the
+result was **inconclusive** either way. Every run since has printed that
+disclaimer.
+
+It is wrong. Against the same phone, in the same state, on the same channel,
+differing only in which OWL binary was running:
+
+| build | ping6 |
+|---|---|
+| pre-change `0c48db8` | **5 / 5, 0% loss**, rtt 56-227 ms |
+| current `HEAD` | **0 / 5, 100% loss** |
+
+**iOS answers pings from strangers perfectly well when the path works.** So
+100% loss is a genuine TX failure, and ping6 is a reliable 8-second test of
+whether our frames reach the phone - far better than waiting two minutes for a
+file transfer that fails for the same reason. `airdrop.sh` no longer prints the
+disclaimer, and `tools/txbisect.sh` is built entirely on this.
+
+That also means the §15-era conclusion that "the chip IS ACKing" is untouched -
+ACKs were confirmed by the phone sending us 481 packets including TCP - but the
+*ping* evidence that was dismissed alongside it should not have been.
+
+### The failure mode, from the capture
+
+While the regression was live, the phone was doing everything right. It resolved
+`void-btw.local` (5 queries), asked for our `_airdrop._tcp` instance, and opened
+**seven TCP connections** to port 8771. Every one died identically:
+
+```
+phone -> us   SYN
+us -> phone   SYN-ACK
+phone -> us   SYN          (retransmission - it never heard the SYN-ACK)
+...
+```
+
+**Zero application bytes in either direction**, so the AirDrop `Discover`
+request never ran and the phone never displayed us. From the phone's side this
+looks like "the Linux box isn't advertising"; from ours, RX was flawless. Any
+diagnosis that stops at "it doesn't appear in the share sheet" will look in
+entirely the wrong place.
+
+### A latent encoding bug, found while looking for this one
+
+`awdl_same_channel_as_peer()` decoded the **peer's** raw sequence bytes using
+**our** `state->channel.enc` instead of `peer->sequence_enc`. Those are separate
+fields precisely because the TLV bytes are stored verbatim, and `peers.h`
+already carried a comment warning about it.
+
+Upstream never noticed because adopting a peer's sequence also adopted its
+encoding, so the two agreed by construction. `-S pin` sets our encoding
+independently and breaks that coupling. Modelled as pure logic in
+`tests/test_awdl_txgate.cpp`, stepping the sync state one window at a time with
+the sequence the phone was actually advertising:
+
+| configuration | co-channel slots per period |
+|---|---|
+| verbatim adoption | 4 of 16 |
+| pin, encodings agree | 2 of 16 |
+| **pin, encodings differ** | **0 of 16** |
+
+Zero co-channel slots means `awdl_can_send_unicast_in()` never returns 0 and no
+unicast is ever transmitted, while reception continues normally - exactly the
+observed symptom.
+
+**But this was NOT the cause of the failure above.** The phone advertised
+Opclass in all 165 captured frames and `pin` sets Opclass, so the encodings
+agreed and the gate should have opened on 2 slots in 16. Fixed as a real bug on
+its own terms; the regression remains open.
+
+### Where it stands
+
+The regression is confirmed ours and bounded to four commits between `0c48db8`
+and `HEAD`. `tools/txbisect.sh` sets the radio up once and ping-tests each build
+in turn, so naming the culprit costs one run rather than four. Prime suspect is
+the asynchronous `set_channel()`, on the grounds that it is the only change that
+touches the RF path - `src/tx.c` is untouched, and `channel.current` only gates
+MIF frames.
+
+### Method note, again
+
+This is the third time in this project that a confident diagnosis has been
+contradicted by its own logs - and tonight added two more: a kernel reboot
+recommended on a stale note the owner correctly overruled, and a `sync_offset`
+fix asserted as the cause and disproved by the next run. Both were plausible
+stories acted on **without a control**. The control - run the old binary,
+unchanged, against the same phone - took one run and settled in eight seconds
+what two hours of reasoning had not.
+
+Build the control first.
