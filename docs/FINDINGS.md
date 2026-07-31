@@ -1318,3 +1318,152 @@ When a phase is bounded by a timer, check what happens *after* the timer fires.
 Both bugs here were in the teardown, not the work: one made failure slow by
 configuration, the other made success slow by hanging on cleanup that had nothing
 left to clean up.
+
+---
+
+## §21 - The duty-cycle ceiling was a sequence we chose to copy
+
+2026-07-31. §16 measured the ~45 kB/s AirDrop ceiling as a duty-cycle problem
+and got the cause wrong. §17 retracted the fix and left a prescription: rotate
+the adopted sequence by `peer->sync_offset`, add hysteresis, measure. Following
+that prescription turned up why it could never have worked, and then the logs
+turned out to contain the actual answer all along.
+
+**Everything below except the last section comes from artefacts that already
+existed** - `owl.log` and the channel-locked `scan-*.pcap` files of runs already
+performed. No phone was present. The tools are committed as `tools/slotmap.py`
+and `tools/bursts.py` so none of it has to be re-derived by hand again.
+
+### `sync_offset` was never assigned
+
+`peers.c` initialised it to 0, `schedule.c` read it in
+`awdl_same_channel_as_peer()`, and nothing in the tree ever wrote to it. So:
+
+- §17's prescribed rotation would have computed `delta = 0` for every peer and
+  been a **silent no-op**.
+- Every phase correction already in the codebase - the one §17 held up as proof
+  that "the codebase already knew this" - had been doing nothing since it was
+  written.
+
+It is now filled in for every peer from the sync params TLV.
+`awdl_sync_error_tu()` is just "the peer's announced phase minus ours", which is
+exactly the wanted correction and is not master-specific. Made `int64_t`: a peer
+behind us needs a negative offset.
+
+### A zero slot means absent, not "repeat current"
+
+Each AWDL action frame carries the sender's own availability-window counter, so
+a channel-locked capture places every frame in the **sender's own** slot index
+with no clock of ours involved: `slot = (aw_seq_number / presence_mode) % 16`.
+
+On `scan-149.pcap`, against what each device advertised:
+
+```
+3a:dd:74:15:95:5c  seq 132,0,149,0,0,149,0,0,6,0,149,0,0,149,0,0   observed slots 2 5 10 13
+2e:38:e1:a9:db:2c  seq 124,0,149,0,0,  0,0,0,6,0,149,0,0,  0,0,0   observed slots 2 10
+```
+
+Devices transmit in exactly the slots their sequence names and in no others. So
+a `0` entry means the device is **not present** for that window, despite
+`fill_channel = 0xffff` ("Repeat Current") suggesting otherwise.
+
+Slot 0 consistently holds a non-social channel - seen as 3, 108, 124, 132 and
+134 across runs. This closes the §17-era loose end about channel 3 being a
+possible decoding bug: **it is not a bug.** tshark decodes those bytes
+identically, and the most likely reading is that slot 0 is where the device
+returns to its infra Wi-Fi channel.
+
+### The phone escalates its sequence during a transfer
+
+The important part, and it is visible in every receive log:
+
+| state | advertised sequence | slots on 149 |
+|---|---|---|
+| idle | `132,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0` | 2 (12.5%) |
+| transferring | `149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0` | 5 (31%) |
+| more | `149,149,149,149,149,0,0,0,6,149,149,149,149,0,0,0` | 9 (56%) |
+| peak | `149,149,149,149,149,149,6,6,6,149,149,149,149,149,6,6` | 11 (69%) |
+
+An iPhone widens its own availability from 2 slots of 16 to as many as 11 while
+a transfer is in flight, and oscillates between those states at about 1 Hz.
+
+### The baseline, re-read
+
+`bursts.py` on the §16 baseline capture reproduces its table (92 bursts vs 94,
+25.7 kB vs 25.2, 67 ms vs 68, max gap 1049 ms, 47 kB/s vs 45) and adds one
+figure §16 never computed: **duty cycle 12.3%, which is exactly 2.0 slots of
+16.**
+
+`slotmap.py` on the same run's log says who was offering what:
+
+```
+76:b9:83:a8:e5:c2  (the data peer)    offered 5 to 11 of 16 slots
+82:49:5e:10:cf:cc  (a bystander)      offered 2 to 7 of 16 slots
+3a:dd:74:15:95:5c  (the sync master)  offered 2 of 16 slots
+```
+
+We followed the sync master. We measured exactly its 2 slots. **The 45 kB/s
+ceiling is not a radio limit, a PHY limit or a TCP limit - it is the 2-slot
+sequence we chose to copy, while the device we were actually transferring with
+was offering up to 11.**
+
+This also explains §18's clean null result. That run's peer advertised only
+2 slots, so the receive-window fix had no room to help: we were already
+capturing essentially every window on offer. §18's conclusion that
+bytes-per-window is fixed at ~22-25 kB stands; what was wrong was assuming the
+*number* of windows was fixed too.
+
+### What §16 and §17 each got right
+
+- §16 was right that we follow the wrong device's sequence.
+- §17 was right that copying a non-master's sequence verbatim breaks the phase,
+  because the slot index is computed in the master's clock.
+
+Both are true, and the fix that satisfies both is not rotation.
+
+### PIN: stop hopping
+
+`-S pin` takes the peer's dominant social channel and sits on it in **all 16
+slots**. On a monitor vif we have no infra association to service, so there is
+nothing to gain by ever leaving:
+
+- Present for every window the peer offers, not a subset.
+- No 1 Hz adoption tick needed to notice an escalation from 2 slots to 11.
+- **Rotation-invariant by construction.** A constant sequence is unchanged by
+  any rotation, so the §17 failure - right channels, wrong times - cannot recur.
+  This is asserted as a unit test, not just claimed.
+- Zero channel switches, so the blocking `set_channel()` cost goes to zero too.
+
+On offline replay it settles to one channel switch for the whole run, against
+verbatim's four per 1.049 s period.
+
+All three strategies are selectable (`-S pin|rotate|verbatim`) so one session
+can A/B them against the same phone. `rotate` is §17's fix built properly,
+including the requested hysteresis: a delta must appear on two consecutive
+ticks before being applied, because a peer whose phase sits near a window
+boundary otherwise oscillates between neighbouring deltas.
+
+### The prediction, written down before the measurement
+
+Stated plainly so it can be scored honestly rather than rationalised afterwards:
+
+> Against the same phone in the same room, `-S pin` should raise **bursts per
+> second** from ~1.8 to somewhere between 4 and 10, tracking whatever the data
+> peer advertises at the time. Bytes per burst should stay at ~22-25 kB (§18
+> says it cannot move). Throughput should land between 110 and 250 kB/s.
+
+Falsification conditions, equally explicit:
+
+- If bursts/s does not rise, the model is wrong and this section joins §16 and
+  §17 on the retracted pile.
+- If bursts/s rises but throughput does not, something downstream is the limit
+  and §18's bytes-per-window figure needs revisiting.
+- If `slotmap.py --log` shows the data peer never offering more than 2 slots,
+  the run is **void** - there was nothing to win, and it proves nothing either
+  way. Check this first.
+
+**Nothing here has been measured against a phone. On this hardware that means
+nothing here counts yet.** This is the third confident diagnosis in this
+project; the previous two were both contradicted by their own logs. The
+difference this time is that the prediction is quantified and its failure
+conditions are written down in advance.

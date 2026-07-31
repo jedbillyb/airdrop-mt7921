@@ -25,6 +25,15 @@ default to `./runs`. They still assume `phy0` and Void's `sv`, unlike
 | `awdltest.sh` | Can active monitor hear AWDL at all? |
 | `activelate2.sh` | **Can an active vif inherit a channel set before it existed?** Phase F is the discovery. |
 | `activelate3.sh` | **Does the pair hop together?** Yes - one shared channel context. |
+| `bursts.py` | How fast was a transfer, and *why*? Splits the stream into availability windows. |
+| `slotmap.py` | Which slots does each peer actually transmit in, and how many does it offer us? |
+| `blewake.sh` | Emits the Apple Continuity BLE advertisement that wakes a receiver's AWDL. |
+
+The last three need no radio setup and do not touch networking: `bursts.py` and
+`slotmap.py` read artefacts a run already produced, and `blewake.sh` only uses
+the Bluetooth controller. `slotmap.py --log` is the first thing to run on any
+disappointing transfer - if it says the peer never offered more than 2 of 16
+slots, there was nothing to win and the run proves nothing (FINDINGS §21).
 
 The last two are the important ones. `activelate2.sh` phase F found that an
 active vif created *alongside* an already-tuned plain vif comes up on that

@@ -40,7 +40,7 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 |---|---|
 | Receiving from an iPhone | **works** (iOS 26, proven end to end) |
 | Sending to an iPhone | blocked on Apple's BLE bootstrap - see [FINDINGS §19](docs/FINDINGS.md) |
-| Throughput | ~40-45 kB/s - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)) |
+| Throughput | ~40-45 kB/s with `-S verbatim` - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)). `-S pin` (default) should raise the window count several-fold; **not yet measured against a phone** ([§21](docs/FINDINGS.md)) |
 | Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.12.97 |
 
 The auth wall that everyone warns about was never reached. In **Everyone** mode
@@ -129,6 +129,35 @@ All optional, all environment variables:
 | `RECV_DIR` | `~/Downloads` | where received files are extracted |
 | `RECV_TIME` | `300` | seconds to stay advertising |
 | `OUT_DIR` | `./runs` | where logs and captures go |
+| `STRATEGY` | `pin` | how OWL derives its channel sequence: `pin`, `rotate`, `verbatim` |
+
+## The open experiment: does `pin` beat `verbatim`?
+
+Untested against a phone as of 2026-07-31. [§21](docs/FINDINGS.md) argues the
+~45 kB/s ceiling is simply the 2-of-16-slot channel sequence we chose to copy,
+while the transferring device was offering up to 11 of 16. `-S pin` sits on the
+peer's channel in all 16 slots instead. To settle it, with the phone in the room:
+
+```sh
+# Send a photo from the phone to this machine, twice, changing only the strategy.
+STRATEGY=verbatim ACTIVE=1 ./airdrop.sh receive     # reproduce the old baseline
+STRATEGY=pin      ACTIVE=1 ./airdrop.sh receive     # the change under test
+
+tools/bursts.py runs/<pin-run>/receive.pcap \
+   --baseline runs/<verbatim-run>/receive.pcap
+```
+
+Read **bursts per second**, not throughput. §18 established that bytes per
+availability window is fixed at ~22-25 kB and cannot be moved from this side, so
+window count is the only real lever.
+
+**Check first whether the run was winnable.** If `tools/slotmap.py --log
+runs/<run>/owl.log` shows the data peer never offered more than 2 of 16 slots,
+there was nothing to gain and the run proves nothing either way.
+
+The prediction and its falsification conditions are written down in §21 in
+advance, because the previous two confident diagnoses in this project were both
+contradicted by their own logs.
 
 ## Safety
 

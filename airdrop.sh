@@ -41,6 +41,10 @@ set -u
 MODE="${1:-find}"
 SENDFILE="${2:-}"
 
+# Where this script lives, so the analysis tools can be found regardless of the
+# working directory it was invoked from.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Wi-Fi interface. Autodetected as the first mt7921-driven interface; override
 # with IFACE=... if you have more than one Wi-Fi card.
 if [ -z "${IFACE:-}" ]; then
@@ -364,7 +368,20 @@ sleep 1
 # -N because the vif is already a monitor and up; OWL's own set-monitor-mode
 # would fail with EBUSY. We did that setup ourselves above. In ACTIVE mode
 # OWL_IF is the active vif, so OWL's frames go out on the vif that ACKs.
-sudo stdbuf -oL "$OWL" -i $OWL_IF -c $CHAN -N -vv > "$OUT/owl.log" 2>&1 &
+# STRATEGY picks how OWL derives its channel sequence from the peer's; see
+# channel.h in the owl fork and FINDINGS §21.
+#
+#   pin       sit on the peer's dominant social channel in all 16 slots (default)
+#   verbatim  copy the sync master's sequence -- upstream behaviour, the 45 kB/s
+#             baseline. Use this to reproduce the old number for comparison.
+#   rotate    copy it but rotate into our own clock phase first
+#
+# The point of exposing it is that all three can be measured against the same
+# phone in one session, which is the only way this gets settled:
+#   for s in verbatim pin rotate; do STRATEGY=$s ACTIVE=1 ./airdrop.sh receive; done
+#   tools/bursts.py runs/<pin-run>/receive.pcap --baseline runs/<verbatim-run>/receive.pcap
+STRATEGY="${STRATEGY:-pin}"
+sudo stdbuf -oL "$OWL" -i $OWL_IF -c $CHAN -N -S "$STRATEGY" -vv > "$OUT/owl.log" 2>&1 &
 sleep 4
 
 if ! grep -q "Host device" "$OUT/owl.log"; then
@@ -577,6 +594,23 @@ if [ "$MODE" = "receive" ]; then
   fi
   echo ""
   echo "  during the receive window: total=$R_TOT from_peer=$R_FROM"
+
+  # Score the run while the artefacts are in front of us. The numbers that
+  # matter are bursts/s and the slot offering, not raw throughput: FINDINGS §18
+  # showed bytes-per-burst is fixed at ~22-25 kB and cannot be moved from this
+  # side, so only more availability windows per second is a real win.
+  if [ -s "$OUT/receive.pcap" ] && command -v python3 >/dev/null 2>&1; then
+    echo ""
+    echo "### burst structure (strategy: $STRATEGY)"
+    python3 "$HERE/tools/bursts.py" "$OUT/receive.pcap" 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+    echo "### what the peers were offering"
+    python3 "$HERE/tools/slotmap.py" --log "$OUT/owl.log" --chan "$CHAN" 2>/dev/null |
+      sed 's/^/  /' || true
+    echo ""
+    echo "  Compare against another strategy with:"
+    echo "    tools/bursts.py $OUT/receive.pcap --baseline runs/<other>/receive.pcap"
+  fi
   if [ "${R_FROM:-0}" -gt 0 ]; then
     echo "  *** THE PHONE SENT US $R_FROM PACKETS - the path is TWO-WAY ***"
     echo "  Unicast reached us, so the chip IS ACKing: active monitor works in"
@@ -599,18 +633,30 @@ elif [ "$MODE" = "send" ]; then
     echo ""
     echo "  AWDL sync worked, so the radio is fine. Two usual causes:"
     echo ""
-    echo "  1. The phone has no share sheet open. Apple wakes a receiver's AWDL"
-    echo "     interface with a Bluetooth LE advertisement, which neither OWL nor"
-    echo "     OpenDrop can send - so a dormant iPhone stays dormant and never"
-    echo "     advertises _airdrop._tcp. Control Centre is NOT enough; measured,"
-    echo "     it leaves AWDL completely asleep. Open the share sheet."
+    echo "  1. The phone's AWDL is asleep. Apple wakes a receiver with a"
+    echo "     Bluetooth LE Continuity advertisement. OWL and OpenDrop cannot"
+    echo "     send one, but tools/blewake.sh now can:"
     echo ""
-    echo "  2. Not enough time co-channel. mDNS is multicast and we only share a"
-    echo "     channel with the peer for ~68 ms at a time. FIND_TIME raises the
-     ceiling, but note it has never yet turned a failure into a success."
+    echo "         ./tools/blewake.sh            # leave running in another terminal"
+    echo "         ./airdrop.sh send <file>"
+    echo ""
+    echo "     Set the phone to AirDrop > Everyone and leave the share sheet"
+    echo "     CLOSED for this - an open sheet makes it a sender, and a sender"
+    echo "     never advertises _airdrop._tcp for us to find. Control Centre is"
+    echo "     NOT enough either; measured, it leaves AWDL completely asleep."
+    echo ""
+    echo "  2. The share sheet route: open a share sheet on the phone and leave"
+    echo "     it open. This is what worked for receiving. It does NOT work for"
+    echo "     sending, for the reason in (1) - it is listed only because it is"
+    echo "     the thing to try if blewake.sh turns out not to wake the phone."
+    echo ""
+    echo "  NOT the cause: FIND_TIME. It is a ceiling, not a duration - the"
+    echo "  browse stops the moment a receiver appears - and raising it has"
+    echo "  never once turned a failure into a success. Every failure so far has"
+    echo "  been categorical."
     echo ""
     echo "  On the phone: unlock it, AirDrop > Everyone for 10 Minutes (this"
-    echo "  EXPIRES - re-arm it), then open a share sheet and leave it open."
+    echo "  EXPIRES - re-arm it)."
     exit 1
   fi
   echo "### discovered receivers:"
