@@ -1814,3 +1814,72 @@ the part that mattered most: arm D. Three of this project's wrong conclusions
 came from run-order confounds, and a re-test of the failing arm at the end costs
 90 seconds and converts "I think the phone was fine" into a row in the table.
 Keep doing that.
+
+## §26 - Widening is accepted; what PIN broke was the sequence's CONTENT, not its width
+
+Three `txarms.sh` runs back to back against the same phone, 2026-07-31 20:21,
+20:23, 20:25 (`runs/txarms-2026073 1-2021*`, `-2023*`, `-2025*`). `-S widen -W n`
+takes the peer's own sequence and fills up to n of its empty slots with the
+peer's dominant channel, copying the peer's own encoded bytes and never touching
+slot 0.
+
+| arm | occupancy | ping6 loss |
+|---|---|---|
+| `verbatim` | 4/16 | 60%, 20%, 20%, 40% |
+| `widen -W 2` | 6/16 | 20% |
+| `widen -W 6` | 10/16 | 20% |
+| `widen -W 8` | 12/16 | 20%, 60% |
+| `widen -W 10` | 14/16 | 80% |
+| `widen -W 11` | 15/16 | 20%, 20%, 20% |
+| `widen -W 12` | 16/16 | **100%**, 80%, 80% |
+| `pin` (§25) | 16/16 | 100%, 100%, 100%, 100% |
+
+Controls held in all three runs: the first arm passed and the last arm
+reproduced the arm it repeats.
+
+### The hypothesis I formed after run two was wrong
+
+Run two had `-W 11` passing and run one had `-W 12` failing outright, which
+reads as a clean boundary: **the phone requires at least one empty slot.** It is
+a tidy rule, it explains PIN exactly, and it is false. Run three tested it
+directly, `-W 11` against `-W 12`, twice each, and `-W 12` passed both times.
+The 100% in run one does not reproduce.
+
+Writing that down because the run that killed it took ninety seconds and existed
+only because the rule was written down as a claim to be tested rather than
+adopted. That is the same move that has now paid off three times in this
+project, and the temptation each time was to skip it.
+
+### What actually holds
+
+PIN is rejected categorically: 100% loss in four arms across two sessions, never
+once passing. Widening is accepted at every width tested, up to and including
+full 16/16 occupancy, and `-W 12` is the same occupancy as PIN. So **occupancy
+is not what the phone objects to.**
+
+The difference is content. `-W 12` keeps the peer's own slot 0 (channel 3 here,
+a non-social infra channel) and its channel 6 slot, so what we advertise is
+still recognisably the peer's sequence, widened. PIN replaces all sixteen slots
+with a single 5 GHz channel: no infra channel, no 2.4 GHz slot, nothing of the
+peer's structure left. §25 guessed "no empty slots and no infra channel in slot
+0" and named the wrong one of the two.
+
+### The instrument is too blunt for the next question
+
+Five pings per arm, and `verbatim` alone scored 60/20/20/40 across four runs of
+an identical configuration. That spread is as large as most of the differences
+between widths. So the ranking within the passing rows is not evidence:
+`-W 11` at 20% three times and `-W 12` at 80% twice is *suggestive* that full
+occupancy costs something, and that is all it is.
+
+`ping6` is a categorical test - does anything get through at all - and it has
+been excellent at that. It cannot size an effect. The throughput question needs
+a real transfer and `tools/bursts.py`.
+
+### Not changing the default on this
+
+`verbatim` remains the default. Widening looks better and is plainly accepted,
+but "looks better on a noisy five-packet test" is exactly the evidence this
+project has three times mistaken for a result. The §21 prediction - bursts/s
+1.8 to 4-10, throughput 110-250 kB/s - is about a file transfer, so it gets
+settled by a file transfer, with `verbatim` as the baseline arm.
