@@ -1634,3 +1634,101 @@ unchanged, against the same phone - took one run and settled in eight seconds
 what two hours of reasoning had not.
 
 Build the control first.
+
+## §24 - The TX gate is innocent, and the bisect named the wrong half of PIN
+
+Answered entirely from the §23 bisect logs
+(`runs/txbisect-20260731-195122/`), no new hardware and no phone. The bisect had
+already been run; it had not been read.
+
+### The frames were leaving OWL the whole time
+
+§23 set up `STATS tx_unicast` to split the two failure modes: a software gate
+that never opens, versus frames that leave and die in the radio. The bisect run
+never lived long enough to print a STATS line, so this looked unanswered. It was
+not. Every build logs each unicast data frame it hands to the radio, and the
+counts are identical:
+
+| build | ping6 | channel switches | unicast frames sent |
+|---|---|---|---|
+| `0c48db8` base | 20% loss (PASS) | 21 | 4 |
+| `c3fc4a4` strategies | 100% loss | 1 | 4 |
+| `92a12b8` async set_channel | 100% loss | 1 | 4 |
+| HEAD | 100% loss | 1 | 4 |
+
+Four unicast frames in every arm: the four `ping6` packets. The gate opened
+everywhere. So `awdl_same_channel_as_peer()`, `awdl_can_send_unicast_in()`, the
+`sync_offset` question and the `peer->sequence_enc` decoding bug are **all
+cleared as causes of this regression**. They were the entire content of the
+§23 suspect list. The `-S verbatim` test the handoff proposed as the fastest
+discriminator would have passed and pointed at PIN, which is right, but it would
+not have said *which part* of PIN, and this table does.
+
+The surviving correlate is the middle column, and it is perfect: the one build
+that switched channels 3.5 times a second passed, and all three that switched
+once at startup and never again failed.
+
+### The channel switches were fiction, which makes it stranger and simpler
+
+The base build hopped `3 -> 149 -> 6 -> 149` every ~260 ms, spending about half
+its time nominally on 2.4 GHz where a phone on 149 cannot be heard. Its RX was
+41 action frames in 6 s against HEAD's 45 in 7 s - the same rate. Had the radio
+really gone to channel 3, RX would have roughly halved.
+
+So the retunes never moved the radio. `mon0` holds the 5745 channel context and
+`mon1`'s requests are accepted and ignored, which is precisely the pathology
+already recorded here: on this chip `iw` reports the requested channel
+regardless. **All four builds transmitted on 149 to a phone on 149.** The
+channel each build believed it was on is fiction; the only thing that differed
+in reality is that one of them was issuing `set_channel` netlink calls
+continuously and three were not.
+
+That also disposes of a timing story. The base build sent its unicast frames in
+slot 0, which its own sequence calls channel 3 - the slot where the phone should
+*not* have been listening - and got replies. HEAD sent in slot 2, the phone's
+own 149 slot, where it should have been listening, and got none. Under any
+model where slot alignment is what matters, that is backwards.
+
+### Two explanations survive, and PIN confounded them
+
+`c3fc4a4` changed two things at once:
+
+1. the radio stopped being re-tuned, because a pinned sequence is constant and
+   `awdl_switch_channel()` only calls `set_channel()` on a transition; and
+2. the sequence we **advertise** stopped resembling anything an Apple device
+   emits - one channel in all 16 slots, no infra channel in slot 0, none of the
+   structure every captured iPhone sequence has.
+
+Either could stop the phone replying, and no amount of re-reading the logs
+separates them, because nothing in this data varies one while holding the other
+fixed.
+
+### The control: `tools/txarms.sh`
+
+Four arms against one phone in one setup, one binary throughout:
+
+- **A** `-S verbatim` - hops, conformant advertised sequence. Establishes the
+  phone is reachable at all. If A fails, every row is void.
+- **B** `-S pin` - reproduces the failure.
+- **C** `-S pin -K 250` - advertises exactly what B advertises, and re-issues
+  `set_channel()` for the channel it is already on every 250 ms, poking the
+  radio at roughly A's rate. **This is the whole experiment.**
+- **D** `-S pin` again, last. If D does not reproduce B the phone drifted
+  mid-run and every row is void. Three run-order confounds in this project
+  make the re-test non-optional.
+
+C passes: the driver needs the re-tune, PIN's channel logic is sound, and the
+fix is a keepalive rather than a revert. C fails: the phone is refusing our
+advertised sequence, and the fix is to sit on one channel while still
+advertising a conformant one.
+
+`-K <ms>` is a diagnostic arm, not a feature, and is off by default. Nothing
+here is a fix and nothing here has been measured against a phone. Written down
+before the run, per the rule below.
+
+### Method note
+
+Two of tonight's three wrong diagnoses were about code that this table now shows
+was never involved. The bisect that settled it had already been run and sat
+unread while the reasoning continued. Read the control you built before building
+another one.
