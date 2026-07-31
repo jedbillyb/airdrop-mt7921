@@ -208,12 +208,21 @@ that socket. Only arm 1 was ever a real test, in both rounds.
 These hold the connection constant and copy what the phone **demonstrably does
 when it sends to us**, rather than inventing another theory:
 
-| order | arm | container | `Expect: 100-continue` |
-|---|-----|-----------|------------------------|
-| 1 | `reuse-chunked-gzip`         | cpio + gzip (upstream, control) | no  |
-| 2 | `reuse-chunked-dvzip-expect` | dvzip       | yes |
-| 3 | `reuse-chunked-dvzip`        | dvzip       | no  |
-| 4 | `reuse-chunked-gzip-expect`  | cpio + gzip | yes |
+| order | arm | framing | container |
+|---|-----|---------|-----------|
+| 1 | `reuse-length-gzip`  | `Content-Length` | cpio + gzip |
+| 2 | `reuse-length-dvzip` | `Content-Length` | dvzip |
+| 3 | `reuse-length-plain` | `Content-Length` | bare cpio |
+| 4 | `reuse-chunked-gzip` | chunked (control) | cpio + gzip |
+
+Round three eliminated dvzip and `Expect: 100-continue` (§31): three valid arms,
+all refused, one of them 70 us after our headers - too fast for the body to have
+been read. Round four varies the framing instead.
+
+**The candidate runs first and the control last**, which inverts the usual
+order on purpose. Arm 1 rides the `/Ask` that `cli.send()` already made, so it
+needs no prompt beyond the first; the control has been reproduced in every run
+of the evening and re-proving it costs a tap and a fragile re-Ask.
 
 **Every arm after the first re-sends `/Ask`, so it prompts on the phone and
 costs an Accept tap.** That is the price of an arm that tests what its name

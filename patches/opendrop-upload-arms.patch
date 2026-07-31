@@ -1,18 +1,19 @@
 --- a/opendrop/client.py
 +++ b/opendrop/client.py
-@@ -25,8 +25,10 @@
+@@ -25,8 +25,11 @@
  import plistlib
  import socket
  import ssl
 +import struct
  import threading
 -from http.client import HTTPSConnection
++import time
 +import zlib
 +from http.client import HTTPException, HTTPSConnection
  
  import fleep
  import libarchive
-@@ -145,7 +147,7 @@
+@@ -145,7 +148,7 @@
          self.receiver_port = receiver[1]
          self.http_conn = None
  
@@ -21,7 +22,7 @@
          logger.debug(f"Send {url} request")
  
          AirDropUtil.write_debug(
-@@ -156,6 +158,12 @@
+@@ -156,6 +159,12 @@
          if headers is not None:
              for key, val in headers.items():
                  _headers[key] = val
@@ -34,7 +35,7 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -241,7 +249,33 @@
+@@ -241,7 +250,33 @@
  
          return success
  
@@ -69,7 +70,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +283,153 @@
+@@ -249,29 +284,180 @@
          if is_url:
              return
  
@@ -134,9 +135,16 @@
 +            # /Discover and /Ask, so iOS sending chunked as a client never
 +            # implied it accepts chunked as a server.
 +            #
-+            # Control first, then the candidate.
-+            "reuse-chunked-gzip,reuse-length-gzip,"
-+            "reuse-length-dvzip,reuse-length-plain",
++            # CANDIDATE FIRST, control last. Normally the control leads, but the
++            # control here has been reproduced in every run of the evening,
++            # three of them fully valid arms, so re-proving it is not worth what
++            # it costs: arm 1 rides the /Ask that cli.send() already made, while
++            # every later arm needs a fresh /Ask - another prompt, another tap,
++            # and another chance for the re-Ask to die on a flaky link, which is
++            # exactly what killed the previous run. Putting the untested arm
++            # first buys the answer for one tap and no re-Ask.
++            "reuse-length-gzip,reuse-length-dvzip,"
++            "reuse-length-plain,reuse-chunked-gzip",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):
@@ -169,12 +177,32 @@
 +                    except OSError:
 +                        pass
 +                    self.http_conn = None
-+                try:
-+                    if not reask():
-+                        logger.warning(f"Re-Ask before '{arm}' was refused; stopping")
-+                        return False
-+                except (OSError, HTTPException) as e:
-+                    logger.warning(f"Re-Ask before '{arm}' failed: {e}; stopping")
++                # Retry the re-Ask. A single reset here is usually the AWDL link
++                # rather than a decision by the phone (§28: our TX drops out in
++                # bursts), and giving up on it wastes a run that has already cost
++                # the user a share sheet and a tap.
++                asked = False
++                for attempt in range(3):
++                    try:
++                        if reask():
++                            asked = True
++                            break
++                        logger.warning(f"Re-Ask before '{arm}' was refused")
++                        break  # a considered "no" is not worth retrying
++                    except (OSError, HTTPException) as e:
++                        logger.warning(
++                            f"Re-Ask before '{arm}' failed at the socket "
++                            f"(attempt {attempt + 1}/3): {e}"
++                        )
++                        if self.http_conn is not None:
++                            try:
++                                self.http_conn.close()
++                            except OSError:
++                                pass
++                            self.http_conn = None
++                        time.sleep(2)
++                if not asked:
++                    logger.warning(f"Could not re-Ask before '{arm}'; stopping")
 +                    return False
 +            new_conn = arm.startswith("new")
 +            use_length = "length" in arm
