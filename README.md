@@ -39,8 +39,8 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 | | |
 |---|---|
 | Receiving from an iPhone | **works** (iOS 26, proven end to end) |
-| Sending to an iPhone | **untested** |
-| Throughput | ~50 kB/s - a duty-cycle limit, see [FINDINGS §16](docs/FINDINGS.md) |
+| Sending to an iPhone | discovery not yet achieved - see [FINDINGS §19](docs/FINDINGS.md) |
+| Throughput | ~40-45 kB/s - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)) |
 | Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.12.97 |
 
 The auth wall that everyone warns about was never reached. In **Everyone** mode
@@ -84,17 +84,25 @@ git apply --directory=... patches/opendrop-ios26-airdrop.patch   # see patches/R
 ./airdrop.sh send <file>      # send to a phone
 ```
 
-On the phone, **Settings → General → AirDrop → Everyone for 10 Minutes** — and
-then it depends which way you are going, because the two directions want
-*opposite* things:
+On the phone: **Settings → General → AirDrop → Everyone for 10 Minutes** (this
+expires - re-arm it), then **open a share sheet and leave it open**. That applies
+to *both* directions, and it is not optional.
 
-| you want to | phone's role | open on the phone |
-|---|---|---|
-| **receive** from the phone | sender | the **share sheet** |
-| **send** to the phone | receiver | **Control Centre** (long-press the connectivity tile) |
+**Why the share sheet, specifically.** Apple bootstraps AirDrop discovery over
+Bluetooth LE: a sender broadcasts a BLE advertisement, and that is what wakes a
+nearby receiver's AWDL interface. Neither OWL nor OpenDrop implements the BLE
+side, so we cannot wake a dormant iPhone - it has to already have AWDL running,
+and opening the share sheet is what a user can do to force that.
 
-With the share sheet open, iOS browses for receivers and does not advertise
-`_airdrop._tcp` at all - so a send will find nothing and report no receivers.
+Measured on this hardware, sweeping all five AWDL social channels:
+
+| phone state | AWDL frames heard |
+|---|---|
+| share sheet open | sync established, peer found |
+| Control Centre only | **zero, on every channel** |
+
+So Control Centre is not enough, and a phone sitting locked on a desk is
+invisible no matter what AirDrop is set to.
 
 ### Which phone am I sending to?
 

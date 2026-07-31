@@ -16,7 +16,13 @@
 #   - Settings > General > AirDrop > "Everyone for 10 Minutes".
 #     This is the mode that needs no Apple-signed validation record.
 #     Contacts-only will almost certainly fail.
-#   - Open the AirDrop/share sheet and LEAVE IT OPEN so AWDL keeps advertising.
+#   - Open the SHARE SHEET and LEAVE IT OPEN. This applies to BOTH directions.
+#     Apple bootstraps AirDrop discovery over Bluetooth LE - a sender's BLE
+#     advertisement is what wakes a receiver's AWDL interface - and neither OWL
+#     nor OpenDrop implements that side. So we cannot wake a dormant iPhone; it
+#     must already have AWDL up, and the share sheet is what does that.
+#     Measured: share sheet open -> sync and a peer. Control Centre only -> ZERO
+#     AWDL frames on all five social channels. Control Centre is not enough.
 #
 # STATUS: receiving works, proven end to end against an iPhone on iOS 26
 # (2026-07-31) - a 2.06 MB photo arrived intact. The auth wall that docs/
@@ -60,11 +66,17 @@ case "$CHAN" in
   6)   CHAN_MHZ=2437 ;;
   36)  CHAN_MHZ=5180 ;;
   44)  CHAN_MHZ=5220 ;;
+  132) CHAN_MHZ=5660 ;;
   149) CHAN_MHZ=5745 ;;
-  *)   echo "REFUSING: CHAN must be 6, 36, 44 or 149 (got $CHAN)"; exit 1 ;;
+  *)   echo "REFUSING: CHAN must be 6, 36, 44, 132 or 149 (got $CHAN)"; exit 1 ;;
 esac
 PEER_WAIT=45          # how long to wait for an AWDL peer before giving up
-FIND_TIME=25          # how long to let opendrop scan
+# How long to let opendrop browse for receivers. Generous on purpose: mDNS over
+# AWDL is multicast, and we are only co-channel with the peer for ~68 ms at a time
+# about 1.8 times a second, so a query and its response have few chances to line
+# up. 25 s was not enough - a send failed with "No AirDrop service discovered"
+# while AWDL sync itself was working fine.
+FIND_TIME="${FIND_TIME:-75}"
 # Throughput over AWDL measured at ~0.05 MB/s, so a single photo needs ~40-60s
 # AFTER the user finds and taps this machine. 120s cut a 2 MB transfer off 370
 # bytes from the end - the archive is then genuinely truncated, not mis-decoded.
@@ -249,18 +261,18 @@ BEST_CHAN=""; BEST_N=0; SAW_ANY=0
 # time the user spends staring at a share sheet that has not found us yet.
 # A cold cache, or a phone that moved, just falls through to the full sweep.
 CHAN_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/airdrop-mt7921-channel"
-SWEEP_ORDER="36 149 44 6"
+SWEEP_ORDER="36 149 6 44 132"
 EARLY_OK=100          # frames on one channel that mean "found it, stop looking"
 if [ -r "$CHAN_CACHE" ]; then
   LAST=$(cat "$CHAN_CACHE" 2>/dev/null)
   case "$LAST" in
-    6|36|44|149)
+    6|36|44|132|149)
       SWEEP_ORDER="$LAST $(echo "$SWEEP_ORDER" | tr ' ' '\n' | grep -vx "$LAST" | tr '\n' ' ')"
       echo "  (trying ch $LAST first - it won the last run)" ;;
   esac
 fi
 for c in $SWEEP_ORDER; do
-  case "$c" in 6) mhz=2437 ;; 36) mhz=5180 ;; 44) mhz=5220 ;; 149) mhz=5745 ;; esac
+  case "$c" in 6) mhz=2437 ;; 36) mhz=5180 ;; 44) mhz=5220 ;; 132) mhz=5660 ;; 149) mhz=5745 ;; esac
   sudo iw dev $MON set freq $mhz 2>/dev/null
   sleep 1
   sudo rm -f "$OUT/scan-$c.pcap"
@@ -463,19 +475,19 @@ elif [ "$MODE" = "send" ]; then
   if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
     echo "### cannot send: no AirDrop receiver was discovered."
     echo ""
-    echo "  AWDL sync worked, so the radio is fine - the phone just is not"
-    echo "  advertising itself as a RECEIVER. This is the usual mistake, and it"
-    echo "  is the opposite of what receive mode wants:"
+    echo "  AWDL sync worked, so the radio is fine. Two usual causes:"
     echo ""
-    echo "    to RECEIVE from the phone -> open the SHARE SHEET (phone = sender)"
-    echo "    to SEND to the phone      -> open CONTROL CENTRE (phone = receiver)"
+    echo "  1. The phone has no share sheet open. Apple wakes a receiver's AWDL"
+    echo "     interface with a Bluetooth LE advertisement, which neither OWL nor"
+    echo "     OpenDrop can send - so a dormant iPhone stays dormant and never"
+    echo "     advertises _airdrop._tcp. Control Centre is NOT enough; measured,"
+    echo "     it leaves AWDL completely asleep. Open the share sheet."
     echo ""
-    echo "  With the share sheet open, iOS browses for receivers and does not"
-    echo "  advertise _airdrop._tcp at all, so there is nothing here to find."
+    echo "  2. Not enough time co-channel. mDNS is multicast and we only share a"
+    echo "     channel with the peer for ~68 ms at a time. Try FIND_TIME=150."
     echo ""
-    echo "  On the phone: unlock it, AirDrop > Everyone for 10 Minutes, then open"
-    echo "  Control Centre and long-press the connectivity tile so the AirDrop"
-    echo "  panel is showing. Leave it there and re-run."
+    echo "  On the phone: unlock it, AirDrop > Everyone for 10 Minutes (this"
+    echo "  EXPIRES - re-arm it), then open a share sheet and leave it open."
     exit 1
   fi
   echo "### discovered receivers:"
