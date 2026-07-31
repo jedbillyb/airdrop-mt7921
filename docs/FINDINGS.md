@@ -1266,3 +1266,55 @@ Worth recording, because each cost a real amount of time:
 - Not `FIND_TIME`. Raising the ceiling has never once turned a failure into a
   success; every failure has been categorical. The default is back down to 45 s
   because the only thing a long ceiling buys is a slower failure.
+
+---
+
+## §20 - Where the run time actually went
+
+2026-07-31. A run that should have taken ~2.5 min took ~5, and the artifacts
+timestamp every phase, so it can be attributed exactly rather than guessed at:
+
+```
+17:33:16  start
+17:33:25  channel sweep done   (~9 s - one channel, cache confirmed)
+17:33:41  browse starts
+17:36:20  browse ends          (150 s ceiling, as configured)
+17:38:30  owl finally dies     <-- 2m10s of nothing
+```
+
+Two separate things, and only one of them was the ceiling.
+
+### The ceiling was configured badly
+
+`FIND_TIME=150` was set by hand on that run. It is a **ceiling, not a duration** -
+the browse stops the instant a receiver appears - so the only thing it governs is
+how long a *failure* takes. Every failure here has been categorical: the phone
+either advertises `_airdrop._tcp` or it does not, and no run has ever had one turn
+up late. Raising the ceiling has never once converted a failure into a success. It
+is back to 45 s, and the "try FIND_TIME=150" advice has been removed.
+
+### The real one: an unbounded `wait` after the browse had already finished
+
+The remaining 2m10s came *after* the browse had produced its result. The
+early-exit rework sent SIGINT to `opendrop find` and then called plain
+`wait $FIND_PID`. `opendrop find` handles the `KeyboardInterrupt` and then calls
+`zeroconf.close()`, which tears down threads and sockets and does not reliably
+return - so the script sat there until teardown killed it.
+
+This was masked in testing because the stand-in producer was a plain Python
+script, which dies on SIGINT immediately. The fix is a **bounded** wait: SIGINT,
+up to 5 s to write the discovery report, then SIGKILL. Everything needed from the
+browse is already in the log by that point. Verified against a producer that
+ignores SIGINT outright: **8 s total against a 45 s ceiling**, where before it
+would have hung indefinitely.
+
+`tail -f` also gained `--pid`. Killing a background *pipeline* with `kill $!` only
+kills the last stage - the `sed` - which left `tail -f` running against the log
+forever.
+
+### Rule of thumb this produced
+
+When a phase is bounded by a timer, check what happens *after* the timer fires.
+Both bugs here were in the teardown, not the work: one made failure slow by
+configuration, the other made success slow by hanging on cleanup that had nothing
+left to clean up.

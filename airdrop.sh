@@ -489,7 +489,10 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   # line, would never see it until it was too late to matter.
   PYTHONUNBUFFERED=1 "$OPENDROP" -i $AWDL find > "$OUT/find.log" 2>&1 &
   FIND_PID=$!
-  tail -f "$OUT/find.log" 2>/dev/null | sed 's/^/  /' &
+  # --pid so tail exits with the browse instead of being orphaned. `kill $!` on a
+  # pipeline only kills the LAST stage (the sed), which would leave `tail -f`
+  # running against the log forever.
+  tail -f --pid=$FIND_PID "$OUT/find.log" 2>/dev/null | sed 's/^/  /' &
   TAIL_PID=$!
   FOUND=0
   HALVES=0
@@ -506,7 +509,22 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
     sleep 0.5
     HALVES=$((HALVES + 1))
   done
+  # BOUNDED wait, never `wait $FIND_PID`. Measured 2026-07-31: an unbounded wait
+  # hung for 2m10s AFTER the browse had already finished and produced its result,
+  # which was most of a 5-minute run. `opendrop find` handles the
+  # KeyboardInterrupt and then calls zeroconf.close(), which tears down threads
+  # and sockets and does not reliably return. We already have everything we need
+  # from the log by this point, so give it a few seconds to write its report and
+  # then stop caring.
   kill -INT $FIND_PID 2>/dev/null || true
+  for _ in $(seq 20); do
+    kill -0 $FIND_PID 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 $FIND_PID 2>/dev/null; then
+    echo "  (browse did not exit on SIGINT within 5s - killing it)"
+    kill -9 $FIND_PID 2>/dev/null || true
+  fi
   wait $FIND_PID 2>/dev/null || true
   kill $TAIL_PID 2>/dev/null || true
   sudo pkill -x tcpdump 2>/dev/null || true
