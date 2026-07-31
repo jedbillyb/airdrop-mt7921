@@ -1,0 +1,135 @@
+--- a/opendrop/client.py
++++ b/opendrop/client.py
+@@ -26,7 +26,7 @@
+ import socket
+ import ssl
+ import threading
+-from http.client import HTTPSConnection
++from http.client import HTTPException, HTTPSConnection
+ 
+ import fleep
+ import libarchive
+@@ -145,7 +145,7 @@
+         self.receiver_port = receiver[1]
+         self.http_conn = None
+ 
+-    def send_POST(self, url, body, headers=None):
++    def send_POST(self, url, body, headers=None, new_conn=False):
+         logger.debug(f"Send {url} request")
+ 
+         AirDropUtil.write_debug(
+@@ -156,6 +156,12 @@
+         if headers is not None:
+             for key, val in headers.items():
+                 _headers[key] = val
++        if new_conn and self.http_conn is not None:
++            try:
++                self.http_conn.close()
++            except OSError:
++                pass
++            self.http_conn = None
+         if self.http_conn is None:
+             # Use single connection
+             self.http_conn = HTTPSConnectionAWDL(
+@@ -249,29 +255,80 @@
+         if is_url:
+             return
+ 
+-        headers = {
+-            "Content-Type": "application/x-cpio",
+-        }
+-
+-        # Create archive in memory ...
+-        stream = io.BytesIO()
+-        with libarchive.custom_writer(
+-            stream.write,
+-            "cpio",
+-            filter_name="gzip",
+-            archive_write_class=AbsArchiveWrite,
+-        ) as archive:
+-            for f in [file_path]:
+-                ff = os.path.basename(f)
+-                archive.add_abs_file(f, os.path.join(".", ff))
+-        stream.seek(0)
+-
+-        # ... then send in chunked mode
+-        success, _ = self.send_POST("/Upload", stream, headers=headers)
++        # WHY ARMS. An iPhone on iOS 26 accepts /Ask, returns a full 200 with its
++        # receiver plist, then takes a complete, well-formed chunked /Upload and
++        # answers with a TLS close_notify instead of an HTTP status. It is not
++        # transport loss - captured at 0% ping loss, every byte ACKed. A server
++        # that dislikes a media type answers 406; a silent close points at
++        # framing or connection handling, and one capture cannot say which.
++        #
++        # Each arm costs the user an Accept tap if tested across separate runs,
++        # so they are tried in sequence within one accepted session instead. The
++        # asymmetry to remember when reading the result: a SUCCESS is conclusive,
++        # a FAILURE of a later arm is not, because the phone may have abandoned
++        # the session after the first rejection.
++        arms = os.environ.get(
++            "OPENDROP_UPLOAD_ARMS",
++            "reuse-chunked-gzip,new-chunked-gzip,new-length-gzip,new-length-plain",
++        ).split(",")
++
++        for i, arm in enumerate(arms):
++            arm = arm.strip()
++            if not arm:
++                continue
++            new_conn = arm.startswith("new")
++            use_length = "length" in arm
++            compress = "plain" not in arm
++
++            # Create archive in memory ...
++            stream = io.BytesIO()
++            with libarchive.custom_writer(
++                stream.write,
++                "cpio",
++                filter_name="gzip" if compress else None,
++                archive_write_class=AbsArchiveWrite,
++            ) as archive:
++                for f in [file_path]:
++                    ff = os.path.basename(f)
++                    archive.add_abs_file(f, os.path.join(".", ff))
++            payload = stream.getvalue()
++
++            headers = {"Content-Type": "application/x-cpio"}
++            if use_length:
++                # Content-Length instead of chunked. http.client only chunks when
++                # it cannot determine a length, so handing it bytes with an
++                # explicit length changes the framing on the wire.
++                headers["Content-Length"] = str(len(payload))
++                body = payload
++            else:
++                body = io.BytesIO(payload)
+ 
+-        # TODO better: write archive chunk whenever send_POST does a read to avoid having the whole archive in memory
++            logger.info(
++                f"Upload arm {i + 1}/{len(arms)}: {arm} "
++                f"({len(payload)} B, {'Content-Length' if use_length else 'chunked'},"
++                f" {'gzip' if compress else 'no filter'},"
++                f" {'new connection' if new_conn else 'reused connection'})"
++            )
++            try:
++                success, _ = self.send_POST(
++                    "/Upload", body, headers=headers, new_conn=new_conn
++                )
++            except (OSError, HTTPException) as e:
++                logger.warning(f"Upload arm '{arm}' failed at the socket: {e}")
++                # The connection is unusable now whatever happened to it.
++                if self.http_conn is not None:
++                    try:
++                        self.http_conn.close()
++                    except OSError:
++                        pass
++                    self.http_conn = None
++                continue
++            if success:
++                logger.info(f"Upload arm '{arm}' ACCEPTED - this is the framing to use")
++                return True
++            logger.warning(f"Upload arm '{arm}' was answered, but not with 200")
+ 
+-        return success
++        return False
+ 
+     def _get_headers(self):
+         """

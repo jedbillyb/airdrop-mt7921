@@ -164,3 +164,31 @@ tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
 ```
 
 `airdrop.sh send` now captures `send.pcap` and sets `SSLKEYLOGFILE` for the run.
+
+## opendrop-upload-arms.patch
+
+**An experiment, not a fix.** See [../docs/FINDINGS.md](../docs/FINDINGS.md) §29.
+
+An iPhone on iOS 26 accepts `/Ask`, returns a full 200 with its receiver plist,
+then takes a complete and well-formed chunked `/Upload` and answers with a TLS
+**close_notify** instead of an HTTP status. Not transport loss: captured at 0%
+ping loss with every byte ACKed. A server that dislikes a media type answers
+406, so a silent close points at framing or connection handling - and a single
+capture cannot say which.
+
+Each candidate costs an Accept tap if tried in separate runs, so `send_upload()`
+now tries them in sequence inside one accepted session, controlled by
+`OPENDROP_UPLOAD_ARMS` (comma-separated, in order):
+
+| arm | connection | framing | archive |
+|-----|-----------|---------|---------|
+| `reuse-chunked-gzip` | reused (upstream behaviour) | chunked | cpio + gzip |
+| `new-chunked-gzip`   | fresh                       | chunked | cpio + gzip |
+| `new-length-gzip`    | fresh                       | `Content-Length` | cpio + gzip |
+| `new-length-plain`   | fresh                       | `Content-Length` | bare ODC cpio |
+
+Read the result asymmetrically: **a success is conclusive, a failure of a later
+arm is not**, because the phone may abandon the session after the first
+rejection. Arm 1 reproduces upstream exactly, so it doubles as the control.
+
+`send_POST()` gains `new_conn=`; everything else is unchanged.
