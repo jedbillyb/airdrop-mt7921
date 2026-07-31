@@ -577,12 +577,32 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
             | grep -oP 'Instances list with \K[0-9]+' || echo "?")
     case "$ADV_N" in
       0)
-        echo "  WARNING: no BLE advertising instance is registered."
-        echo "  §27: with the advert down the phone does not advertise"
-        echo "  _airdrop._tcp at all, and this browse will almost certainly find"
-        echo "  nothing (the tell is from_peer=0 below). Start it first:"
-        echo "      ./tools/blewake.sh --duration 2400 &"
-        echo "  Then check it took: btmgmt advinfo | tail -1"
+        # START IT HERE, not before the run. The advert was killed three times
+        # in a row despite being launched with a 2400 s duration, always around
+        # a run. The mt7921 is a COMBO Wi-Fi/Bluetooth part: taking the radio
+        # into monitor mode and writing runtime-pm/deep-sleep resets the shared
+        # controller, and the registered advertising instance goes with it. So
+        # an advert started before layer 1 cannot survive layer 1, and the only
+        # safe moment to start it is here, after the radio has settled.
+        echo "  no BLE advert registered - starting one now."
+        echo "  (starting it BEFORE a run does not work: the mt7921 is a combo"
+        echo "   Wi-Fi/BT part and layer 1 resets the shared controller)"
+        setsid nohup "$PWD/tools/blewake.sh" --duration 600 \
+          > "$OUT/blewake.log" 2>&1 < /dev/null &
+        for _ in $(seq 20); do
+          sleep 1
+          ADV_N=$(sudo timeout 5 btmgmt advinfo 2>/dev/null \
+                  | grep -oP 'Instances list with \K[0-9]+' || echo 0)
+          [ "${ADV_N:-0}" != "0" ] && break
+        done
+        if [ "${ADV_N:-0}" != "0" ]; then
+          echo "  BLE advert up ($ADV_N instance) - giving the phone 3s to react"
+          sleep 3
+        else
+          echo "  WARNING: could not bring the advert up; see $OUT/blewake.log."
+          echo "  §27: without it the phone does not advertise _airdrop._tcp and"
+          echo "  this browse will find nothing (the tell is from_peer=0 below)."
+        fi
         ;;
       [0-9]*) echo "  BLE advert: $ADV_N instance(s) registered - good" ;;
       *)      echo "  BLE advert: could not query btmgmt; continuing" ;;

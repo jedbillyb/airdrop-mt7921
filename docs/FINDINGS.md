@@ -2468,3 +2468,28 @@ worth stating before the run so it cannot be rationalised afterwards. The
 asymmetry would also make sense of everything else: receiving works because we
 are the one being chosen, and a receiver that has been tapped by a human needs
 no proof of who we are.
+
+---
+
+## §36 The BLE advert cannot be started before a run: it is the same chip
+
+2026-07-31, 22:21. The advert was started at 22:14 with `--duration 2400`, and
+by 22:21 `btmgmt advinfo` reported **0 instances**. That is the third time in an
+hour, and every time it died around a run rather than at its timer.
+
+The mt7921 is a **combo Wi-Fi/Bluetooth part**. Layer 1 tears the interface
+down, adds two monitor vifs, and writes `runtime-pm` and `deep-sleep` on the
+shared controller. That resets Bluetooth along with Wi-Fi, and a registered
+advertising instance does not survive it.
+
+So the advice in §27 - "start blewake.sh, then run airdrop.sh" - is wrong in a
+way that is invisible unless you check `advinfo` rather than `pgrep`. The
+process happily survives; the advertisement does not.
+
+`airdrop.sh send` now starts the advert **itself, at layer 3**, after the radio
+has settled, waits for the instance to register and gives the phone three
+seconds to react. `--duration 600` because it only has to outlive one run.
+
+This also retires a small mystery: several "the phone stopped advertising"
+failures earlier in the evening were probably this, not the phone. The `-d`
+check added after the second occurrence is what made the pattern visible.
