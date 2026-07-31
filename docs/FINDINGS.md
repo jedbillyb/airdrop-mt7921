@@ -2493,3 +2493,59 @@ seconds to react. `--duration 600` because it only has to outlive one run.
 This also retires a small mystery: several "the phone stopped advertising"
 failures earlier in the evening were probably this, not the phone. The `-d`
 check added after the second occurrence is what made the pattern visible.
+
+## §37 — the /Upload refusal was our own missing TransferID announcement (written before the test)
+
+Recorded before the run so the result cannot be rationalised afterwards.
+
+Every arm from §29 through §36 sent a `/Upload` whose `TransferID` header the
+`/Ask` had never announced. Our `send_ask` body was:
+
+    SenderComputerName, BundleID, SenderModelName, SenderID, ConvertMediaFormats, Files
+
+and `send_upload` then asserted a freshly-minted `TransferID` on `/Upload`. So the
+receiver saw an upload for a transfer it had never accepted under that id.
+
+The proof is a real iOS 26 sender's own `/Ask`, captured by our own receiver at
+22:09 on 2026-07-31 (`~/.opendrop/debug/receive_ask_request.plist`). Its body
+carries what ours never did:
+
+    TransferID   = {'id': '664D3979-F245-4E9E-9EAC-80453E255E31'}   # a DICT
+    TransferType = {'files': {}}
+    SenderRecordData = <CMS-signed Apple-ID validation record>
+    SenderIdentityAuthTag = b'\x0b9\xe6'
+
+and that same phone's `/Upload` header (FINDINGS §34) was `TransferID:
+664D3979-F245-4E9E-9EAC-80453E255E31` — **the identical id**. The receiver binds
+`/Upload` to the `/Ask` it accepted by this id. Ours matched nothing, which is
+why the refusal landed on the headers ~31 microseconds-to-milliseconds in,
+before the body was read (§31), on connections the phone had just accepted an
+`/Ask` on. Every "container eliminated" and "framing eliminated" conclusion from
+the earlier rounds is therefore void: they all shared this one defect, so none of
+them could have succeeded regardless of container or framing.
+
+This also corrects §34/§35's read that we had matched the Apple upload. We had
+matched its *headers*; we had not matched the *session* those headers referred
+to, because we never announced it.
+
+FIX: `send_ask` now declares `TransferID = {'id': self._transfer_id}` and
+`TransferType = {'files': {}}` in the `/Ask` body, and `/Upload` repeats the same
+`self._transfer_id`. The default arm list collapses to one arm,
+`reuse-chunked-dvzip-rawhdr`: reused connection, chunked, dvzip container,
+Apple's exact header set and order — now a byte-level copy of the observed Apple
+`/Upload` **and** of the session it belongs to, apart from the values we cannot
+forge.
+
+THE ONE REMAINING FORGERY-PROOF DIFFERENCE, stated in advance:
+`SenderRecordData` — the Apple-signed Apple-ID validation record — and its
+companion `SenderIdentityAuthTag`. We have no Apple ID and cannot mint either.
+
+- If this arm is ACCEPTED (200): the file lands on the phone. Anonymous AirDrop
+  *sending* to iOS 26 works; the whole evening's wall was one unannounced id.
+- If it is refused on the headers *again*, now that the id is announced: the
+  refusal can only be `SenderRecordData`. The conclusion is then that iOS 26
+  requires a genuine signed sender identity to *receive* an upload it already
+  visibly accepted, and anonymous sending is closed while receiving stays open.
+
+These two outcomes are distinguishable on the wire: a header-time close_notify
+means the id did not fix it; a `100-continue` or a read of the body means it did.

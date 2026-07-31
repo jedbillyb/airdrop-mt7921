@@ -22,7 +22,7 @@
  
  import fleep
  import libarchive
-@@ -144,18 +149,43 @@
+@@ -144,18 +149,45 @@
          self.receiver_host = receiver[0]
          self.receiver_port = receiver[1]
          self.http_conn = None
@@ -40,6 +40,8 @@
 +            "="
 +        ).replace("+", "-").replace("/", "_")
 +        self._push_token = os.urandom(32).hex().upper()
++        # Filled in by send_ask from the receiver's /Ask reply (FINDINGS §37).
++        self._ask_response = {}
 +
 +    def send_POST(
 +        self, url, body, headers=None, new_conn=False, minimal=False, raw=False
@@ -69,7 +71,7 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -164,7 +194,25 @@
+@@ -164,7 +196,25 @@
                  interface_name=self.config.interface,
                  context=self.config.get_ssl_context(),
              )
@@ -96,7 +98,42 @@
          http_resp = self.http_conn.getresponse()
  
          response_bytes = http_resp.read()
-@@ -241,7 +289,33 @@
+@@ -203,6 +253,16 @@
+             "SenderModelName": self.config.computer_model,
+             "SenderID": self.config.service_id,
+             "ConvertMediaFormats": False,
++            # DECLARE THE TRANSFER ID IN THE ASK BODY. Captured from a real iOS 26
++            # sender's /Ask (FINDINGS §37): the sender announces the transfer here
++            # as a dict {'id': UUID} and then repeats the SAME id in the /Upload
++            # TransferID header. The receiver correlates the two. Our sender used
++            # to invent a fresh id on /Upload that /Ask never announced, so the
++            # phone had no accepted transfer to bind it to and refused on the
++            # headers ~31 ms in, before reading the body - the exact refusal shape
++            # we saw all evening. This value must equal the /Upload TransferID.
++            "TransferID": {"id": self._transfer_id},
++            "TransferType": {"files": {}},
+         }
+         if self.config.record_data:
+             ask_body["SenderRecordData"] = self.config.record_data
+@@ -237,11 +297,50 @@
+         ask_binary = plistlib.dumps(
+             ask_body, fmt=plistlib.FMT_BINARY  # pylint: disable=no-member
+         )
+-        success, _ = self.send_POST("/Ask", ask_binary)
++        success, response_bytes = self.send_POST("/Ask", ask_binary)
++
++        # Keep whatever the receiver handed back. A real iOS 26 receiver answers
++        # /Ask with a plist carrying IDSSessionID, ReceiverPseudonym and
++        # ReceiverPushToken (FINDINGS §37) - values an Apple sender may be
++        # expected to echo on /Upload, and which we can only obtain from this
++        # reply. Parsed leniently: an empty or non-plist body must not break the
++        # send.
++        self._ask_response = {}
++        if response_bytes:
++            try:
++                self._ask_response = plistlib.loads(response_bytes)
++            except Exception:
++                pass
  
          return success
  
@@ -131,7 +168,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +323,239 @@
+@@ -249,29 +348,250 @@
          if is_url:
              return
  
@@ -215,8 +252,19 @@
 +            # Accept-Encoding, which Apple never sends. "rawhdr" emits Apple's
 +            # exact header set in Apple's exact order with neither of those.
 +            # That is the last difference left under our control.
-+            "reuse-chunked-dvzip-rawhdr,reuse-chunked-gzip-rawhdr,"
-+            "reuse-chunked-dvzip-applehdr,reuse-chunked-gzip",
++            # Round five. §37 changed the question. Every arm to date sent a
++            # /Upload TransferID that the /Ask never announced, so all of them
++            # were malformed in the same way and none could have succeeded - the
++            # earlier "eliminations" only proved the receiver rejects an
++            # unannounced transfer, not that any container or framing is wrong.
++            # send_ask now declares TransferID in the /Ask body exactly as a real
++            # iOS 26 sender does, and this single arm is a byte-level copy of the
++            # observed Apple /Upload: reused connection, chunked, dvzip container,
++            # Apple's exact header set and order (rawhdr), carrying the announced
++            # TransferID. One arm, one tap. A success is the whole goal; a failure
++            # now isolates the remaining difference to SenderRecordData, the
++            # Apple-signed Apple-ID validation record we cannot forge.
++            "reuse-chunked-dvzip-rawhdr",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):
