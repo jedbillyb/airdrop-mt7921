@@ -69,7 +69,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +283,136 @@
+@@ -249,29 +283,153 @@
          if is_url:
              return
  
@@ -116,10 +116,27 @@
 +        # so could not attribute its failures. Only arm 1 was interpretable.
 +        arms = os.environ.get(
 +            "OPENDROP_UPLOAD_ARMS",
-+            # Control first, then the strongest candidate, so that abandoning
-+            # the run after two taps still yields an interpretable result.
-+            "reuse-chunked-gzip,reuse-chunked-dvzip-expect,"
-+            "reuse-chunked-dvzip,reuse-chunked-gzip-expect",
++            # Round four. dvzip and Expect are eliminated - three valid arms in
++            # §30's successor all drew an identical close_notify, one of them
++            # 70 microseconds after our headers, far too fast for the body to
++            # have been read. That timing says the request is refused on its
++            # HEADERS.
++            #
++            # The discriminator was already in our own captures. On the very
++            # same connection:
++            #
++            #   POST /Ask     Content-Length: 333        -> 200, every run
++            #   POST /Upload  Transfer-Encoding: chunked -> close_notify, always
++            #
++            # plistlib.dumps() returns bytes so http.client sets a length, while
++            # send_upload handed it a BytesIO, which forces chunked. Nothing
++            # else differs. Our own receiver needed chunked support ADDED for
++            # /Discover and /Ask, so iOS sending chunked as a client never
++            # implied it accepts chunked as a server.
++            #
++            # Control first, then the candidate.
++            "reuse-chunked-gzip,reuse-length-gzip,"
++            "reuse-length-dvzip,reuse-length-plain",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):

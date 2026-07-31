@@ -2170,3 +2170,71 @@ it intended - `-K` in §24, the connection/framing confound in §29, and now the
 silent connection-reuse failure. The pattern is the same each time: the arm was
 described by what the code was *meant* to do rather than by what it would
 actually put on the wire. The capture is what caught it twice. Capture first.
+
+---
+
+## §31 The upload is refused on its HEADERS, and chunked is the only thing left
+
+2026-07-31, 21:49. First round of arms where every arm tested what its name
+said: each re-sent `/Ask`, got a real Accept tap, got a 200, and uploaded on
+that same connection.
+
+| arm | container | `Expect` | result |
+|-----|-----------|----------|--------|
+| `reuse-chunked-gzip` (control) | cpio + gzip | no  | close_notify |
+| `reuse-chunked-dvzip-expect`   | dvzip       | yes | close_notify |
+| `reuse-chunked-dvzip`          | dvzip       | no  | close_notify |
+
+**dvzip and `Expect: 100-continue` are eliminated.** Both were well-motivated -
+they are what the phone does when it sends to us - and both are wrong.
+
+### The timing is the finding
+
+```
+44.846304  US -> PHONE   POST /Upload (headers)
+44.846374  PHONE -> US   TLS close_notify
+```
+
+**70 microseconds.** The phone cannot have read, decompressed or inspected the
+body. It refused the request on its headers. That kills every hypothesis about
+payload format at once, which is why the dvzip result is worth having despite
+being negative.
+
+### The control was in our own capture all along
+
+On the same TCP connection, in every run:
+
+| request | framing | result |
+|---------|---------|--------|
+| `POST /Ask`    | `Content-Length: 333`        | **200 OK**, always |
+| `POST /Upload` | `Transfer-Encoding: chunked` | close_notify, always |
+
+Nothing else differs - same headers, same connection, same TLS session. The
+cause is not visible in the arm matrix because *every arm so far has been
+chunked*. `plistlib.dumps()` returns bytes, so `http.client` computes a length
+for `/Ask`; `send_upload()` passed a `BytesIO`, which forces chunked.
+
+Round one did include `Content-Length` arms, but on the bogus connections
+described in §30 - no `/Ask`, so they were refused for a different reason and
+told us nothing. **Content-Length on a valid session has never been tested.**
+
+The asymmetry to keep hold of: our own receiver had to have chunked support
+*added* to `handle_discover` and `handle_ask` (`opendrop-ios26-airdrop.patch`
+fix 1), because iOS sends chunked **as a client**. That never implied iOS
+accepts chunked **as a server**, and this is the first evidence it does not.
+
+### Round four
+
+| order | arm | framing | container |
+|---|-----|---------|-----------|
+| 1 | `reuse-chunked-gzip`  | chunked (control) | cpio + gzip |
+| 2 | `reuse-length-gzip`   | `Content-Length`  | cpio + gzip |
+| 3 | `reuse-length-dvzip`  | `Content-Length`  | dvzip |
+| 4 | `reuse-length-plain`  | `Content-Length`  | bare cpio |
+
+If arm 2 succeeds the whole thing was one missing header, and arms 3 and 4 are
+unnecessary. If arm 2 fails but 3 or 4 succeeds, framing and container interact.
+If all four fail, the refusal is in a header we have not varied at all -
+`Connection: keep-alive`, `Accept-Encoding`, or `User-Agent: AirDrop/1.0` - and
+the next move is to capture what an Apple device puts in its own `/Upload`
+headers rather than guess again.
