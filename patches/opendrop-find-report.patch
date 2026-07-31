@@ -1,0 +1,52 @@
+--- a/opendrop/cli.py
++++ b/opendrop/cli.py
+@@ -125,10 +125,34 @@
+         except KeyboardInterrupt:
+             pass
+         finally:
++            # Save BEFORE stopping the browser. browser.stop() ends in
++            # zeroconf.close(), which tears down threads and sockets and does not
++            # reliably return on this link -- measured hanging for over two
++            # minutes. With the write ordered after it, a browse could discover a
++            # receiver, print it, and still leave the report unwritten, so the
++            # following `opendrop send` read a stale report and failed with
++            # "Receiver does not exist". Nothing about serialising self.discover
++            # needs the browser to be stopped first; take the lock instead, since
++            # _send_discover appends from a callback thread.
++            self._save_discovery_report()
+             self.browser.stop()
+-            logger.debug(f"Save discovery results to {self.config.discovery_report}")
+-            with open(self.config.discovery_report, "w") as f:
+-                json.dump(self.discover, f)
++
++    def _save_discovery_report(self):
++        logger.debug(f"Save discovery results to {self.config.discovery_report}")
++        self.lock.acquire()
++        try:
++            discover = list(self.discover)
++        finally:
++            self.lock.release()
++        # Write via a temp file in the same directory and rename, so a reader can
++        # never see a half-written report and an interrupted write cannot destroy
++        # the previous one.
++        tmp = self.config.discovery_report + ".tmp"
++        with open(tmp, "w") as f:
++            json.dump(discover, f)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, self.config.discovery_report)
+ 
+     def _found_receiver(self, info):
+         thread = threading.Thread(target=self._send_discover, args=(info,))
+@@ -176,6 +200,11 @@
+         else:
+             logger.debug(f"Receiver ID {identifier} is not discoverable")
+         self.lock.release()
++        # Persist on every discovery, not only at shutdown. A browse driven by a
++        # script is liable to be killed outright once it has printed what the
++        # caller wanted, and the report is the only channel through which `send`
++        # learns the receiver's address and port.
++        self._save_discovery_report()
+ 
+     def receive(self):
+         self.server = AirDropServer(self.config)

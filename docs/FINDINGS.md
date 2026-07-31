@@ -1883,3 +1883,78 @@ but "looks better on a noisy five-packet test" is exactly the evidence this
 project has three times mistaken for a result. The §21 prediction - bursts/s
 1.8 to 4-10, throughput 110-250 kB/s - is about a file transfer, so it gets
 settled by a file transfer, with `verbatim` as the baseline arm.
+
+---
+
+## §27 The send direction: the phone was always answering, we were never asking
+
+2026-07-31, evening. Everything up to here is the **receive** direction, iPhone
+to laptop. The remaining goal is the other way round, and §22 had concluded that
+the phone never advertises `_airdrop._tcp` for us to find. That conclusion is
+wrong.
+
+### The phone does advertise, and BLE is what makes it
+
+Three consecutive runs, same binary, same `ACTIVE=1 CHAN=149`, same open share
+sheet:
+
+| time  | BLE Continuity advert | result                                    |
+|-------|-----------------------|-------------------------------------------|
+| 20:43 | running               | `Found index 0 ID 21a582faf894 name Jed's iPhone` in ~6 s |
+| 20:50 | **expired at 20:49:14** | no receiver, despite 0% ping loss on awdl0 |
+| 20:54 | restarted 20:53:32    | `Found index 0 ID 21a582faf894` in ~4 s   |
+
+The middle run is the control that makes this readable: the AWDL link was
+*better* there than in either neighbour (0% loss vs 60%), the peer was found,
+the IPv6 neighbour was present, and mDNS still turned up nothing. The only
+variable that moved is the BLE advertisement.
+
+That settles a question `tools/blewake.sh` has had open since it was written: it
+does something. §22's "the phone never advertises" was measured without it, or
+after it had timed out - the advert defaults to 600 s and nothing in the harness
+made its expiry visible.
+
+**Availability is not the constraint, acceptability is** (§25) has a sibling
+here: the phone is not asleep, it is not addressing us. It answers ICMP and
+ignores mDNS until Continuity has told it a nearby device wants something.
+
+### Two plumbing bugs stood between discovery and a transfer
+
+Both were invisible until discovery started working, and both produced the same
+misleading symptom - a receiver printed on stdout and then
+`Receiver does not exist`.
+
+1. **`opendrop find` never wrote its discovery report.** `find()` writes
+   `discover.last.json` in a `finally:` block, but *after* `self.browser.stop()`
+   - and `stop()` ends in `zeroconf.close()`, which §-earlier already measured
+   hanging over two minutes on this link. So the browse printed
+   `Found index 0 ...`, hung, got killed, and wrote nothing. `send` then read a
+   **13 313 second old** report. Fixed in `patches/opendrop-find-report.patch`:
+   write before `stop()`, write on every discovery rather than only at shutdown,
+   and write atomically.
+
+   Worth being explicit about why `-r 21a582faf894` did not rescue this:
+   `_get_receiver_info()` resolves the ID *inside the report*. The report is not
+   a convenience, it is the only path by which `send` learns the receiver's
+   address and port. Printing the ID to a terminal carries none of that.
+
+2. **`airdrop.sh` picked the receiver positionally.** It defaulted to index `0`
+   against a report that in one run held `[]`, giving
+   `TypeError: object of type 'int' has no len()` out of OpenDrop's
+   index-then-ID fallback chain. It now parses the ID out of *this run's*
+   `find.log` and passes that, falling back to `0` only if nothing parsed.
+
+Neither of these is AWDL. They are the same class of bug as §-py314: OpenDrop's
+send path had simply never been run to completion by anyone.
+
+### Status
+
+Discovery is reproducible. The transfer itself is still unproven - no run has
+yet got past `_get_receiver_info()` with a good report, because the fix landed
+after the last attempt. The next run is the first real test of `send_ask` and
+the upload, and it is also the first time the receive-path patches (dvzip, cpio,
+icon generation) get exercised in the sending role.
+
+Open, and deliberately not asserted: whether the BLE advert must stay up for the
+duration of the transfer or only long enough to provoke the mDNS advertisement.
+The three runs above only establish that it must be up during the browse.

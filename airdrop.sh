@@ -539,6 +539,10 @@ fi
 if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   echo ""
   echo "### layer 3: AirDrop service discovery over $AWDL"
+  # opendrop writes its discovery report here and `opendrop send` reads it back.
+  # Remember the mtime so a stale report cannot be mistaken for this run's.
+  OD_REPORT="${OD_REPORT:-$HOME/.opendrop/discover.last.json}"
+  OD_REPORT_MTIME=$(stat -c %Y "$OD_REPORT" 2>/dev/null || echo 0)
   # -s INT, not the default SIGTERM. `opendrop find` blocks forever and only
   # writes its discovery report from a finally: block reached via KeyboardInterrupt.
   # Python does not turn SIGTERM into KeyboardInterrupt, so plain `timeout` killed
@@ -592,13 +596,24 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   # and sockets and does not reliably return. We already have everything we need
   # from the log by this point, so give it a few seconds to write its report and
   # then stop caring.
+  # Wait for the REPORT, not for the process. Those are different events and
+  # conflating them cost a working send: the browse found the iPhone, we gave it
+  # a flat 5s, zeroconf.close() had not returned, we SIGKILLed it, and the report
+  # was never written -- so `opendrop send` then read a THREE HOUR OLD empty
+  # report and failed. Waiting on the file distinguishes "has written what we
+  # need" from "has finished tidying up", and only the first one matters.
   kill -INT $FIND_PID 2>/dev/null || true
-  for _ in $(seq 20); do
+  for _ in $(seq 80); do
     kill -0 $FIND_PID 2>/dev/null || break
+    [ -s "$OD_REPORT" ] && [ "$(stat -c %Y "$OD_REPORT" 2>/dev/null || echo 0)" -gt "$OD_REPORT_MTIME" ] && break
     sleep 0.25
   done
   if kill -0 $FIND_PID 2>/dev/null; then
-    echo "  (browse did not exit on SIGINT within 5s - killing it)"
+    if [ "$(stat -c %Y "$OD_REPORT" 2>/dev/null || echo 0)" -gt "$OD_REPORT_MTIME" ]; then
+      echo "  (report written; killing the browse, which does not exit cleanly)"
+    else
+      echo "  (browse wrote no discovery report within 20s - killing it)"
+    fi
     kill -9 $FIND_PID 2>/dev/null || true
   fi
   wait $FIND_PID 2>/dev/null || true
@@ -730,10 +745,21 @@ elif [ "$MODE" = "send" ]; then
   # Apple devices in range - and "Everyone" makes every one of them a candidate -
   # index 0 is a coin toss. Prefer the NAME:
   #     RECEIVER="Jed's iPhone" ./airdrop.sh send photo.jpg
-  RECEIVER="${RECEIVER:-0}"
+  # Default to the ID of the first device THIS run found, not to index 0.
+  #
+  # Index 0 is worse than it looks. opendrop's _get_receiver_info() does
+  # int(receiver), indexes the report, and on IndexError falls through to
+  # len(receiver) -- which is now an int, so an empty or short report does not
+  # produce "receiver does not exist" but a TypeError traceback. That is exactly
+  # what a stale report gave us, and it reads as an opendrop crash rather than as
+  # "the report is empty". An ID from this run's own log cannot be stale, and
+  # unlike an index it is not positional, so extra Apple devices in range cannot
+  # silently redirect the transfer.
+  DISCOVERED_ID=$(grep -oP 'Found\s+index\s+\S+\s+ID\s+\K[0-9a-f]{12}' "$OUT/find.log" | head -1)
+  RECEIVER="${RECEIVER:-${DISCOVERED_ID:-0}}"
   case "$RECEIVER" in
-    [0-9]*) echo "    sending to index $RECEIVER - set RECEIVER=\"<device name>\" to be sure" ;;
-    *)      echo "    sending to \"$RECEIVER\"" ;;
+    [0-9]) echo "    sending to index $RECEIVER - no ID was parsed, so this is positional" ;;
+    *)     echo "    sending to \"$RECEIVER\"" ;;
   esac
   echo ""
   echo "### layer 4: sending $SENDFILE"

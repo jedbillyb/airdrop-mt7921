@@ -117,3 +117,31 @@ PTR question at a steady interval, default 1.5 s, overridable with
 in the browse window went 7 -> 68 and replies from the peer went **0 -> 14**.
 
 Apply after `opendrop-py314-send.patch`.
+
+## opendrop-find-report.patch
+
+`opendrop find` could discover a receiver, print `Found index 0 ID ... name
+...`, and still leave `~/.opendrop/discover.last.json` untouched - so the
+`opendrop send` that followed read a hours-old report and died with **"Receiver
+does not exist"** while the phone was sitting there discovered. Hit on
+2026-07-31 on the send path; see [../docs/FINDINGS.md](../docs/FINDINGS.md) §27.
+
+The report is the only channel through which `send` learns the receiver's
+address and port. `Found ...` on stdout is not enough, and neither is passing
+`-r <ID>`: `_get_receiver_info()` looks the ID up *inside the report*.
+
+1. **Write the report before `browser.stop()`, not after.** `stop()` ends in
+   `zeroconf.close()`, which this project has already measured hanging for over
+   two minutes on an AWDL link. Ordered after it, the write simply never
+   happened. Nothing about serialising `self.discover` needs the browser
+   stopped; the callback thread is handled by taking `self.lock`.
+
+2. **Write on every discovery, not only at shutdown.** A browse driven by a
+   script gets killed once it has printed what the caller wanted, and that is a
+   legitimate way to use it.
+
+3. **Write atomically** (temp file in the same directory, `fsync`, `rename`), so
+   a reader never sees a half-written report and an interrupted write cannot
+   destroy the previous one.
+
+Apply after `opendrop-mdns-repeat.patch`.
