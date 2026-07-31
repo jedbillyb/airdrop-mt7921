@@ -442,10 +442,21 @@ for i in $(seq $PEER_WAIT); do
 done
 if [ "$FOUND" = "0" ]; then
   echo "  no AWDL peer found in ${PEER_WAIT}s."
-  echo "  DESPITE $BEST_N AWDL frames present on ch $CHAN during the scan."
-  echo "  So the phone IS transmitting but OWL is not adding it as a peer -"
-  echo "  that points at OWL parsing/election, not the radio."
-  echo "  (The sweep now runs in both modes, so this is never ambiguous.)"
+  if [ "${BEST_N:-0}" -gt 0 ] 2>/dev/null; then
+    # Only meaningful when the sweep actually ran; with an explicit CHAN it did
+    # not, and there is no frame count to reason from.
+    echo "  DESPITE $BEST_N AWDL frames present on ch $CHAN during the scan."
+    echo "  So the phone IS transmitting but OWL is not adding it as a peer -"
+    echo "  that points at OWL parsing/election, not the radio."
+  else
+    echo "  No scan was run (CHAN=$CHAN was given explicitly), so we cannot tell"
+    echo "  'phone is silent' from 'phone is on another channel' from here."
+    echo "  Re-run without CHAN= to sweep, or check the phone is awake:"
+    echo "    - unlock it, keep the screen ON"
+    echo "    - AirDrop > Everyone  (this EXPIRES after 10 minutes - re-arm it)"
+    echo "    - open a share sheet and LEAVE IT OPEN; that is what wakes its"
+    echo "      AWDL interface, and nothing on this side can do it for you"
+  fi
   echo "  Logs: $OUT/"
   exit 1
 fi
