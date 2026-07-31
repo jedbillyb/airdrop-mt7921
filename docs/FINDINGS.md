@@ -1958,3 +1958,88 @@ icon generation) get exercised in the sending role.
 Open, and deliberately not asserted: whether the BLE advert must stay up for the
 duration of the transfer or only long enough to provoke the mDNS advertisement.
 The three runs above only establish that it must be up during the browse.
+
+---
+
+## §28 The send stalls because our ACKs do not land, and layer 2.5 predicts it
+
+2026-07-31, 21:02 and 21:07. Two send runs, same binary, same command. They
+failed at different points, and the difference between them is not in the
+AirDrop protocol at all.
+
+| run   | layer 2.5 ping | got as far as                          |
+|-------|----------------|----------------------------------------|
+| 21:02 | **0% loss**    | `Receiver accepted` - the phone prompted, the tap happened, died on `/Upload` |
+| 21:07 | **60% loss**   | died reading the `/Ask` **response**    |
+
+### What the capture shows
+
+`send.pcap` with `SSLKEYLOGFILE` decrypts to a single `POST /Ask`, 333 bytes,
+at t=3.868. The phone answered at t=5.397 with a 93-byte segment. Then:
+
+```
+5.397  PHONE -> US   93  PSH,ACK
+5.437  US -> PHONE    0  ACK
+5.566  PHONE -> US   93  [retransmission]
+5.828  PHONE -> US   93  [retransmission]
+6.446 ... 21.167     93  [retransmission x11, exponential backoff]
+23.280 PHONE -> US    0  RST
+```
+
+The phone retransmitted the same 93 bytes **thirteen times over eighteen
+seconds** and then reset the connection. We ACKed every single one. It received
+none of the ACKs.
+
+### It is not a software gate, and it is not the wrong channel
+
+Both of the obvious explanations are dead, and the logs kill them:
+
+- **OWL sent every ACK.** `owl.log` has thirteen `Send data (len 133)` frames to
+  the peer at exactly the retransmit timestamps. `awdl_same_channel_as_peer()`
+  opened, the frames went to the radio.
+- **They were on the right channel.** Eleven of the thirteen went out in slot 0,
+  which looks damning against the peer's first advertised sequence
+  (`3,0,149,0,...` - slot 0 is channel **3**, a different band). But the phone
+  re-advertised four times during the run, and from 21:07:51 its sequence was
+  `149,149,149,0,...`, making slot 0 channel 149 - the channel we are pinned to.
+  Every stalled ACK was sent after that change.
+
+So: correctly gated, correctly channelled, handed to the radio, and lost on air.
+Thirteen consecutive failures is not 50/50 chance; something is systematically
+eating our small frames while the phone's frames reach us perfectly.
+
+**RX is flawless and TX is broken, in the same second, on the same channel.**
+That is the same asymmetry as the 60% ping loss measured 90 seconds earlier in
+the same run.
+
+### The reframing
+
+Layer 2.5 ping loss is not a health readout, it is a **prediction of how far
+the transfer will get**. 0% reached the Accept prompt; 60% could not complete a
+single request/response round trip. The two failures look like different bugs
+and are one.
+
+This also **retires a hypothesis that was never tested**: the `/Upload` failure
+in the 21:02 run was written up as possibly chunked-encoding related, on the
+strength of our own receiver having needed teaching to accept chunked bodies
+(`opendrop-ios26-airdrop.patch` fix 1). That shape-matching was wrong, or at
+least wholly unevidenced - `RemoteDisconnected` is what TX loss looks like from
+inside `http.client`, and we now have a capture showing exactly that mechanism
+on a different request. Do not patch the HTTP layer on this evidence.
+
+### What changed
+
+`airdrop.sh` re-measures the ping up to `PING_TRIES` (3) times when loss exceeds
+`PING_MAX_LOSS` (20%), and warns explicitly when it cannot get a good link. The
+warning matters because the run costs the user a share sheet, an Accept tap and
+two minutes, and 8 seconds of re-measurement can predict that it will be wasted.
+
+### Open
+
+Why our unicast TX fails in sustained bursts while RX is perfect is still the
+central unanswered question of this project, now with its cleanest measurement
+yet: 13 frames, correctly scheduled, all lost. Note the stalled ACKs cluster at
+`tu` 55-61 out of 64 - the first ~5 TU of an availability window - whereas the
+frames that got through earlier were spread across the window. That is one
+narrow, testable idea (the phone may not be listening at the very start of its
+AW) and it has **not** been tested. It is recorded here as a lead, not a cause.

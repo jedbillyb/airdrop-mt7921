@@ -490,8 +490,36 @@ else
   # capture while we ping, so we see whether replies come back at all
   sudo timeout 14 tcpdump -i $AWDL -w "$OUT/awdl0.pcap" >/dev/null 2>&1 &
   sleep 1
-  echo "  ping6 (5 attempts, 8s):"
-  timeout 12 ping6 -c 5 -W 2 -I $AWDL "$PEER6" 2>&1 | tail -4 | sed "s/^/    /"
+  # RE-MEASURE ON PARTIAL LOSS. Our TX to the phone is intermittent and it is
+  # the single best predictor of how far a transfer gets (§28): the 21:02 run
+  # pinged 0% and reached "Receiver accepted", the 21:07 run pinged 60% and
+  # stalled with the phone retransmitting its /Ask response 13 times into 18
+  # seconds of silence. Loss here is not cosmetic, it is the outcome. Retrying
+  # costs 8 s; a bad run costs a share sheet, an Accept tap and two minutes.
+  PING_MAX_LOSS="${PING_MAX_LOSS:-20}"
+  PING_TRIES="${PING_TRIES:-3}"
+  LOSS=100
+  for try in $(seq "$PING_TRIES"); do
+    [ "$try" -gt 1 ] && echo "  ping6 (attempt $try of $PING_TRIES - retrying, loss was ${LOSS}%):"
+    [ "$try" = "1" ] && echo "  ping6 (5 attempts, 8s):"
+    PING_OUT=$(timeout 12 ping6 -c 5 -W 2 -I $AWDL "$PEER6" 2>&1)
+    echo "$PING_OUT" | tail -4 | sed "s/^/    /"
+    LOSS=$(echo "$PING_OUT" | grep -oE "[0-9]+% packet loss" | grep -oE "^[0-9]+")
+    LOSS="${LOSS:-100}"
+    [ "$LOSS" -le "$PING_MAX_LOSS" ] && break
+    [ "$try" -lt "$PING_TRIES" ] && sleep 2
+  done
+  if [ "$LOSS" -gt "$PING_MAX_LOSS" ] && [ "$LOSS" -lt 100 ]; then
+    echo ""
+    echo "  WARNING: ${LOSS}% of our frames are not reaching the phone, after"
+    echo "  $PING_TRIES attempts. The link is up and TCP will connect, but a"
+    echo "  transfer is likely to stall partway: measured, the phone sends its"
+    echo "  reply, our ACK never lands, and it retransmits until it gives up."
+    echo "  This is a TX-reliability problem, not a protocol one, and it varies"
+    echo "  run to run - re-running is often enough. Set PING_MAX_LOSS=100 to"
+    echo "  silence this."
+    echo ""
+  fi
   sleep 2
   sudo pkill -x tcpdump 2>/dev/null || true
   sleep 1
