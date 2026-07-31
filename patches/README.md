@@ -40,3 +40,26 @@ Each was found by hitting it in a live run on 2026-07-31 - see ../docs/FINDINGS.
 
 Verified end to end: a 2.06 MB transfer decoded to 17 blocks consuming the file
 exactly, yielding `IMG_8276.JPG`, a 4032x3024 JPEG.
+
+## opendrop-recv-window.patch
+
+Two correctness fixes around the receive path. **Neither improves throughput** -
+that was measured and is written up in [../docs/FINDINGS.md](../docs/FINDINGS.md)
+§18. They are here because the behaviour they fix is wrong on its own terms and
+because they remove a confound from any future measurement.
+
+Apply after `opendrop-ios26-airdrop.patch`.
+
+1. **`SO_RCVBUF` on the listening socket.** Measured on a real transfer, the
+   advertised receive window opened at 64766 B, collapsed to **528 B** - below one
+   MSS - in a single step, and then took ~40 s to crawl back, which is longer than
+   the transfer. AWDL delivers in ~68 ms bursts separated by ~450 ms of silence, so
+   a connection gets only a couple of round trips per second and the kernel's
+   receive-window recovery is correspondingly glacial. A large fixed buffer means
+   the sender's opening burst cannot overrun us, so `rcv_ssthresh` never collapses.
+   With this, the median window went 2 728 B -> 41 462 B.
+
+2. **Answer `Expect: 100-continue` only when ready to read.** Upstream answered it
+   before the chunked-encoding check, before building the reader and before opening
+   the output file - so the sender began transmitting while the server was still
+   getting ready. That race is what overran the buffer in the first place.

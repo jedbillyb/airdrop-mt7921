@@ -896,6 +896,9 @@ or just `ACTIVE=1 ./airdrop.sh receive`, which does all of it.
   bandwidth - worth measuring against a fixed channel.
 
 ## 16. 2026-07-31: the ~50 kB/s ceiling is duty cycle, not rate
+> **Read with §17 and §18.** The burst measurement below stands. The *cause* named
+> in "The actual cause" is wrong (§17), and the receive-window theory that followed
+> is also ruled out (§18).
 
 Answering the last rough edge in §15, entirely from the logs of the successful
 2.06 MB receive (`owl-airdrop-20260731-111821`) - no new hardware runs. §15
@@ -1077,3 +1080,71 @@ Everything above came from `owl.log` and `receive.pcap` of the two runs. Burst
 structure is the diagnostic that matters here - per-second averages hid it
 completely, and the gap *histogram* is what falsified the blocking-`set_channel`
 theory in §16 and the peer-follow theory here.
+
+## 18. 2026-07-31: the receive window was a real pathology but NOT the limit
+
+A clean negative, recorded because it closes off a whole avenue.
+
+### The pathology
+
+Reading the baseline capture's window trace at connection start:
+
+```
+64766 64766 64766 528 528 528 528 528 528 528 571 609 631 638 638 ...
+```
+
+The advertised receive window opens at 64766 B, collapses to **528 B** - below one
+MSS - in a single step, then crawls back at a few bytes per round trip, reaching
+only 2.0 MSS by t=10 s and 7.3 MSS by t=45 s. Two zero-window events.
+
+Mechanism: the sender opens with a full 64 kB window and blasts it while OpenDrop
+is still between answering `Expect: 100-continue` and its first `read()`. That one
+overrun collapses `rcv_ssthresh`. Linux regrows it only as clean data arrives, and
+AWDL gives a connection roughly two round trips per 500 ms, so recovery takes ~40 s
+- longer than the transfer.
+
+OpenDrop's reader was ruled out first: `HTTPChunkedReader` benchmarks at 2-6 GB/s
+in isolation, so the application was never the slow part.
+
+### The fix, and the measurement that killed the theory
+
+Two changes: a 4 MB `SO_RCVBUF` on the listening socket, and answering
+`100-continue` only after the output file is open and the reader built.
+
+| | baseline | window fixed |
+|---|---|---|
+| median advertised window | 2 728 B | **41 462 B** |
+| collapse | 64766 -> **528** | none; settles 32782, climbs |
+| in-burst rate | 3.0 Mbit/s | 3.57 Mbit/s |
+| burst duration | 68 ms | 49 ms |
+| bytes per burst | 25.2 kB | **21.9 kB** |
+| bursts per second | 1.84 | **1.82** |
+| **throughput** | **45 kB/s** | **40 kB/s** |
+
+The fix worked exactly as designed - the window is 15x larger and never collapses -
+and **throughput did not improve**. We now move the same ~22 kB in 49 ms instead of
+68 ms, and then wait just as long for the next availability window (mean gap 504 ms,
+unchanged).
+
+### What this establishes
+
+**Bytes per availability window is fixed at ~22-25 kB, independent of the TCP
+receive window.** Since bursts arrive at ~1.8/s, that product *is* the 40-45 kB/s.
+Neither factor is TCP's and neither is the PHY's - the burst ends because the
+airtime does, not because the window fills or the link runs out of rate.
+
+That rules out the entire receiver-side avenue: TCP tuning, socket buffers,
+application read speed. None of it can move this number. The only remaining lever
+is **more availability windows per second**, i.e. more overlapping slots with the
+peer - which is what §16 was reaching for and §17 showed must be done by rotating
+an adopted sequence into our own clock phase, not by copying it.
+
+### Kept anyway
+
+Both changes stay in `patches/`. A 528-byte window is indefensible on its own
+terms, the `100-continue` ordering is simply correct, and together they remove a
+confound from every future measurement. They are documented as **correctness fixes
+that do not affect throughput**, which is exactly what they are.
+
+The `net.core.rmem_max` bump that was briefly in `airdrop.sh` has been removed:
+it changes global system state, and it buys nothing measurable.

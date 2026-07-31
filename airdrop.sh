@@ -23,8 +23,8 @@
 # FINDINGS.md §7 predicted was never reached: in "Everyone" mode the phone
 # accepts an unsigned receiver. Sending TO the phone is UNTESTED.
 #
-# Throughput is ~50 kB/s. That is a duty-cycle limit, not a rate limit - see
-# docs/FINDINGS.md §16.
+# Throughput is ~40-45 kB/s: each AWDL availability window delivers ~22-25 kB and
+# we get ~1.8 of them a second. Not TCP, not the PHY - see docs/FINDINGS.md §18.
 #
 # NOTE: this takes the Wi-Fi card exclusively - no internet while it runs.
 #
@@ -120,6 +120,7 @@ fi
 # Regulatory domain. Governs which channels are legal to use; the 5 GHz AWDL
 # social channels are not available everywhere. Set to your own country.
 REG="${REG:-NZ}"
+
 
 RESTORE_CMDS='
   sudo pkill -x owl 2>/dev/null || true
@@ -242,7 +243,23 @@ echo ""
 echo "### layer 0: locating the phone (AWDL BSSID 00:25:00:ff:94:73)"
 AWDL_BSSID="00:25:00:ff:94:73"
 BEST_CHAN=""; BEST_N=0; SAW_ANY=0
-for c in 36 149 44 6; do
+# Try whichever channel won last time first, and stop the sweep early if it is
+# clearly busy. The phone is usually where it was a few minutes ago, and the full
+# four-channel sweep costs ~28 s before we can start advertising - which is dead
+# time the user spends staring at a share sheet that has not found us yet.
+# A cold cache, or a phone that moved, just falls through to the full sweep.
+CHAN_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/airdrop-mt7921-channel"
+SWEEP_ORDER="36 149 44 6"
+EARLY_OK=100          # frames on one channel that mean "found it, stop looking"
+if [ -r "$CHAN_CACHE" ]; then
+  LAST=$(cat "$CHAN_CACHE" 2>/dev/null)
+  case "$LAST" in
+    6|36|44|149)
+      SWEEP_ORDER="$LAST $(echo "$SWEEP_ORDER" | tr ' ' '\n' | grep -vx "$LAST" | tr '\n' ' ')"
+      echo "  (trying ch $LAST first - it won the last run)" ;;
+  esac
+fi
+for c in $SWEEP_ORDER; do
   case "$c" in 6) mhz=2437 ;; 36) mhz=5180 ;; 44) mhz=5220 ;; 149) mhz=5745 ;; esac
   sudo iw dev $MON set freq $mhz 2>/dev/null
   sleep 1
@@ -257,6 +274,10 @@ for c in 36 149 44 6; do
   printf '  ch %-4s AWDL frames: %s\n' "$c" "$n"
   [ "$n" -gt 0 ] && SAW_ANY=1
   if [ "$n" -gt "$BEST_N" ]; then BEST_N=$n; BEST_CHAN=$c; fi
+  if [ "$n" -ge "$EARLY_OK" ]; then
+    echo "  ch $c is busy enough ($n frames) - skipping the rest of the sweep"
+    break
+  fi
 done
 
 if [ "$SAW_ANY" = "0" ]; then
@@ -272,6 +293,7 @@ if [ "$SAW_ANY" = "0" ]; then
 fi
 
 echo "  --> strongest on channel $BEST_CHAN ($BEST_N frames); using it"
+mkdir -p "$(dirname "$CHAN_CACHE")" 2>/dev/null && echo "$BEST_CHAN" > "$CHAN_CACHE"
 CHAN=$BEST_CHAN
 case "$CHAN" in 6) CHAN_MHZ=2437 ;; 36) CHAN_MHZ=5180 ;; 44) CHAN_MHZ=5220 ;; 149) CHAN_MHZ=5745 ;; esac
 sudo iw dev $MON set freq $CHAN_MHZ 2>/dev/null
@@ -361,16 +383,26 @@ else
 fi
 
 # ---------- layers 3 + 4: OpenDrop ----------
-echo ""
-echo "### layer 3: AirDrop service discovery over $AWDL"
-timeout $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
-
-if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
+# In receive mode, SKIP discovery. It contributes nothing - we are the one being
+# discovered - and it is pure dead time before we start advertising, which is the
+# only thing that makes this machine appear on the phone's share sheet. Measured
+# on a real run: 89 s from script start to the first mDNS announcement, of which
+# ~25 s was this phase. It is also currently broken on Python 3.14 (opendrop's
+# client passes key_file= to HTTPSConnection, removed in 3.12+), so in receive
+# mode it only ever produced a traceback and a misleading "No AirDrop service
+# discovered" warning. Set FIND=1 to run it anyway when debugging discovery.
+if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   echo ""
-  echo "  No AirDrop service discovered."
-  echo "  AWDL sync works (peer was found), so this is layer 3/4: the phone is"
-  echo "  not advertising _airdrop._tcp to us, or is refusing us. Check that"
-  echo "  AirDrop is set to 'Everyone for 10 Minutes' and the sheet is open."
+  echo "### layer 3: AirDrop service discovery over $AWDL"
+  timeout $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
+
+  if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
+    echo ""
+    echo "  No AirDrop service discovered."
+    echo "  AWDL sync works (peer was found), so this is layer 3/4: the phone is"
+    echo "  not advertising _airdrop._tcp to us, or is refusing us. Check that"
+    echo "  AirDrop is set to 'Everyone for 10 Minutes' and the sheet is open."
+  fi
 fi
 
 if [ "$MODE" = "receive" ]; then
