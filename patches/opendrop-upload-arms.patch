@@ -1,6 +1,14 @@
 --- a/opendrop/client.py
 +++ b/opendrop/client.py
-@@ -25,8 +25,11 @@
+@@ -17,6 +17,7 @@
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ """
+ 
++import base64
+ import io
+ import ipaddress
+ import logging
+@@ -25,8 +26,12 @@
  import plistlib
  import socket
  import ssl
@@ -8,14 +16,28 @@
  import threading
 -from http.client import HTTPSConnection
 +import time
++import uuid
 +import zlib
 +from http.client import HTTPException, HTTPSConnection
  
  import fleep
  import libarchive
-@@ -145,17 +148,28 @@
+@@ -144,18 +149,41 @@
+         self.receiver_host = receiver[0]
          self.receiver_port = receiver[1]
          self.http_conn = None
++        # Sender identity for the Apple /Upload headers. Generated once per
++        # client so a retried arm reuses the same values, and shaped to match
++        # what the phone sends: a UUID in upper case, a "pseud:" prefix followed
++        # by 22 characters of base64 (16 bytes, unpadded), and a 32-byte token
++        # in upper-case hex. We have no Apple ID, so the pseudonym and token
++        # cannot be real - the open question is whether the receiver merely
++        # requires them to be present and well formed.
++        self._transfer_id = str(uuid.uuid4()).upper()
++        self._pseudonym = "pseud:" + base64.b64encode(os.urandom(16)).decode().rstrip(
++            "="
++        ).replace("+", "-").replace("/", "_")
++        self._push_token = os.urandom(32).hex().upper()
  
 -    def send_POST(self, url, body, headers=None):
 +    def send_POST(self, url, body, headers=None, new_conn=False, minimal=False):
@@ -44,7 +66,7 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -241,7 +255,33 @@
+@@ -241,7 +269,33 @@
  
          return success
  
@@ -79,7 +101,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +289,195 @@
+@@ -249,29 +303,216 @@
          if is_url:
              return
  
@@ -154,7 +176,11 @@
 +            # first buys the answer for one tap and no re-Ask.
 +            # §33: the phone sends three headers, we send seven. The minimal
 +            # arms come first because that is the largest untested difference.
-+            "reuse-chunked-gzip-minhdr,reuse-length-gzip-minhdr,"
++            # §34: the phone's /Upload carries TotalBytes, TransferID,
++            # SenderPseudonym and SenderPushToken. "applehdr" sends all four,
++            # with dvzip and chunked, which is now a full copy of an observed
++            # Apple upload rather than a theory about one.
++            "reuse-chunked-dvzip-applehdr,reuse-chunked-gzip-applehdr,"
 +            "reuse-chunked-dvzip-minhdr,reuse-chunked-gzip",
 +        ).split(",")
 +
@@ -237,10 +263,27 @@
 +            if dvzip:
 +                payload = self._cpio_to_dvzip(payload)
 +
-+            minimal = "minhdr" in arm
++            minimal = "minhdr" in arm or "applehdr" in arm
 +            headers = {
 +                "Content-Type": "application/x-dvzip" if dvzip else "application/x-cpio"
 +            }
++            if "applehdr" in arm:
++                # The four headers an iOS 26 sender puts on /Upload that we have
++                # never sent, captured 2026-07-31 22:09 by logging a real
++                # phone-to-laptop transfer (FINDINGS §34):
++                #
++                #   TotalBytes: 1303171
++                #   SenderPseudonym: pseud:RDUDcHgUEfGhmdJSNF0FmQ
++                #   SenderPushToken: 1D0DD878...0493
++                #   TransferID: 664D3979-F245-4E9E-9EAC-80453E255E31
++                #
++                # TransferID is the interesting one: without it the receiver has
++                # no way to tie an upload to the session it just accepted, which
++                # is exactly the shape of a refusal issued on the headers alone.
++                headers["TotalBytes"] = str(len(payload))
++                headers["TransferID"] = self._transfer_id
++                headers["SenderPseudonym"] = self._pseudonym
++                headers["SenderPushToken"] = self._push_token
 +            if minimal:
 +                # Match the shape the phone uses: User-Agent, Connection, and
 +                # the framing header http.client adds itself. Content-Type stays

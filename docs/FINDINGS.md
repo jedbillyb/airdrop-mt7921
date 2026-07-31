@@ -2350,3 +2350,68 @@ rather than letting two-thirds of the answer look like the whole of it.
 Apple sender must set it on `/Upload` even though it sets none on `/Discover` or
 `/Ask`. That last point is an inference, not an observation, and a captured
 `/Upload` would settle it.
+
+---
+
+## §34 The /Upload headers, captured at last
+
+2026-07-31, 22:09. A complete 1.23 MB phone-to-laptop transfer, logged with
+`-d`. This is what an iOS 26 sender puts on `/Upload`:
+
+```
+User-Agent: AirDrop/1.0
+TotalBytes: 1303171
+Content-Type: application/x-dvzip
+SenderPseudonym: pseud:RDUDcHgUEfGhmdJSNF0FmQ
+SenderPushToken: 1D0DD878B679E3AA7C9EC13EC596983FA9CF05E3AAEA25F978B5B14D4AB50493
+TransferID: 664D3979-F245-4E9E-9EAC-80453E255E31
+Connection: keep-alive
+Transfer-Encoding: chunked
+```
+
+**Four headers we have never sent:** `TotalBytes`, `SenderPseudonym`,
+`SenderPushToken`, `TransferID`.
+
+`TransferID` is the one to look at. Without it a receiver has no way to tie an
+incoming upload to the session it just accepted at `/Ask` - and "cannot
+correlate this request with anything" is exactly the shape of a refusal issued
+on the headers alone, before a byte of body is read (§31's 70 microsecond
+close_notify).
+
+It also settles two things that four rounds of arms could not:
+
+- **chunked is correct.** Apple uses it. §31's Content-Length hypothesis was not
+  merely unhelpful, it was pointing the wrong way.
+- **dvzip is correct**, and `Content-Type` *is* set on `/Upload` even though
+  `/Discover` and `/Ask` carry none. §33 inferred that; it is now observed.
+
+Both were already tested and both failed, which is the point: they were
+necessary and not sufficient, and no amount of varying them was ever going to
+work while four required headers were missing.
+
+### The new arm
+
+`applehdr` sends all four alongside dvzip and chunked - a copy of an observed
+Apple upload rather than a theory about one. Values:
+
+| header | value |
+|--------|-------|
+| `TotalBytes` | actual payload length |
+| `TransferID` | fresh upper-case UUID4 |
+| `SenderPseudonym` | `pseud:` + 22 chars of base64 over 16 random bytes |
+| `SenderPushToken` | 32 random bytes, upper-case hex |
+
+Generated once per client so a retried arm reuses them.
+
+**The caveat that matters:** we have no Apple ID, so the pseudonym and push token
+cannot be genuine. If the receiver only checks that they are present and well
+formed, this works. If it validates them against Apple's identity service, it
+cannot, and no amount of header engineering will change that - the answer would
+then be that anonymous AirDrop *sending* to iOS 26 is closed, while receiving
+stays open. That distinction is worth stating in advance so the result is
+readable either way.
+
+Note the phone's `SenderPseudonym` and `SenderPushToken` match the
+`ReceiverPseudonym` and `ReceiverPushToken` it returned in its own `/Ask`
+response earlier in the evening - they are its stable identity, not per-transfer
+values. Only `TransferID` is per-transfer.
