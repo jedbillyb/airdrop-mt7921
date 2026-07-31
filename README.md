@@ -14,6 +14,12 @@ that got there.
 > warranty, and no promise that it works on your hardware. Issues and PRs may
 > sit unread.
 
+## Documentation
+- [docs/FINDINGS.md](docs/FINDINGS.md) - numbered session-by-session findings log
+- [docs/NOTES.md](docs/NOTES.md) - project notes
+- [patches/README.md](patches/README.md) - what each opendrop patch does and why
+- [tools/README.md](tools/README.md) - diagnostic tool scripts
+
 ## Why this exists
 
 Every guide for AirDrop on Linux tells you the same thing: you need a card with
