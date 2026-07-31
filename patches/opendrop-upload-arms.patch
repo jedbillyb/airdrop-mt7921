@@ -22,10 +22,12 @@
  
  import fleep
  import libarchive
-@@ -144,18 +149,41 @@
+@@ -144,18 +149,43 @@
          self.receiver_host = receiver[0]
          self.receiver_port = receiver[1]
          self.http_conn = None
+-
+-    def send_POST(self, url, body, headers=None):
 +        # Sender identity for the Apple /Upload headers. Generated once per
 +        # client so a retried arm reuses the same values, and shaped to match
 +        # what the phone sends: a UUID in upper case, a "pseud:" prefix followed
@@ -38,9 +40,10 @@
 +            "="
 +        ).replace("+", "-").replace("/", "_")
 +        self._push_token = os.urandom(32).hex().upper()
- 
--    def send_POST(self, url, body, headers=None):
-+    def send_POST(self, url, body, headers=None, new_conn=False, minimal=False):
++
++    def send_POST(
++        self, url, body, headers=None, new_conn=False, minimal=False, raw=False
++    ):
          logger.debug(f"Send {url} request")
  
          AirDropUtil.write_debug(
@@ -66,7 +69,34 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -241,7 +269,33 @@
+@@ -164,7 +194,25 @@
+                 interface_name=self.config.interface,
+                 context=self.config.get_ssl_context(),
+             )
+-        self.http_conn.request("POST", url, body=body, headers=_headers)
++        if raw:
++            # Byte-for-byte control of the request line and headers.
++            # http.client.request() always inserts Host and Accept-Encoding,
++            # and an iOS 26 sender emits neither (§34/§35). It also reorders
++            # headers, and Apple's order is fixed. putrequest() can suppress
++            # both insertions; the chunked framing is then ours to write, which
++            # is a handful of bytes.
++            self.http_conn.putrequest(
++                "POST", url, skip_host=True, skip_accept_encoding=True
++            )
++            for key, val in _headers.items():
++                self.http_conn.putheader(key, val)
++            self.http_conn.endheaders()
++            payload = body if isinstance(body, bytes) else body.read()
++            self.http_conn.send(
++                b"%x\r\n" % len(payload) + payload + b"\r\n0\r\n\r\n"
++            )
++        else:
++            self.http_conn.request("POST", url, body=body, headers=_headers)
+         http_resp = self.http_conn.getresponse()
+ 
+         response_bytes = http_resp.read()
+@@ -241,7 +289,33 @@
  
          return success
  
@@ -101,7 +131,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +303,216 @@
+@@ -249,29 +323,239 @@
          if is_url:
              return
  
@@ -180,8 +210,13 @@
 +            # SenderPseudonym and SenderPushToken. "applehdr" sends all four,
 +            # with dvzip and chunked, which is now a full copy of an observed
 +            # Apple upload rather than a theory about one.
-+            "reuse-chunked-dvzip-applehdr,reuse-chunked-gzip-applehdr,"
-+            "reuse-chunked-dvzip-minhdr,reuse-chunked-gzip",
++            # §35: applehdr sent all four Apple headers and was still refused,
++            # and the capture showed http.client had added Host and
++            # Accept-Encoding, which Apple never sends. "rawhdr" emits Apple's
++            # exact header set in Apple's exact order with neither of those.
++            # That is the last difference left under our control.
++            "reuse-chunked-dvzip-rawhdr,reuse-chunked-gzip-rawhdr,"
++            "reuse-chunked-dvzip-applehdr,reuse-chunked-gzip",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):
@@ -263,10 +298,27 @@
 +            if dvzip:
 +                payload = self._cpio_to_dvzip(payload)
 +
-+            minimal = "minhdr" in arm or "applehdr" in arm
-+            headers = {
-+                "Content-Type": "application/x-dvzip" if dvzip else "application/x-cpio"
-+            }
++            minimal = "minhdr" in arm or "applehdr" in arm or "rawhdr" in arm
++            raw = "rawhdr" in arm
++            headers = {}
++            if raw:
++                # Apple's exact set, in Apple's exact order (§34). dicts preserve
++                # insertion order, and send_POST emits them in that order when
++                # raw is set, so this literally reproduces the observed request.
++                headers["User-Agent"] = "AirDrop/1.0"
++                headers["TotalBytes"] = str(len(payload))
++                headers["Content-Type"] = (
++                    "application/x-dvzip" if dvzip else "application/x-cpio"
++                )
++                headers["SenderPseudonym"] = self._pseudonym
++                headers["SenderPushToken"] = self._push_token
++                headers["TransferID"] = self._transfer_id
++                headers["Connection"] = "keep-alive"
++                headers["Transfer-Encoding"] = "chunked"
++            else:
++                headers["Content-Type"] = (
++                    "application/x-dvzip" if dvzip else "application/x-cpio"
++                )
 +            if "applehdr" in arm:
 +                # The four headers an iOS 26 sender puts on /Upload that we have
 +                # never sent, captured 2026-07-31 22:09 by logging a real
@@ -318,6 +370,7 @@
 +                    headers=headers,
 +                    new_conn=new_conn,
 +                    minimal=minimal,
++                    raw=raw,
 +                )
 +            except (OSError, HTTPException) as e:
 +                logger.warning(f"Upload arm '{arm}' failed at the socket: {e}")

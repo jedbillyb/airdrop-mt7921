@@ -2415,3 +2415,56 @@ Note the phone's `SenderPseudonym` and `SenderPushToken` match the
 `ReceiverPseudonym` and `ReceiverPushToken` it returned in its own `/Ask`
 response earlier in the evening - they are its stable identity, not per-transfer
 values. Only `TransferID` is per-transfer.
+
+---
+
+## §35 applehdr failed, and the capture named the last two differences
+
+2026-07-31, 22:16. All four Apple `/Upload` headers sent, with dvzip and
+chunked. Refused, same close_notify. The arm was valid this time - the decrypted
+request confirms it:
+
+```
+POST /Upload HTTP/1.1
+Host: [fe80::38dd:74ff:fe15:955c]:8770      <- Apple sends NO Host
+Accept-Encoding: identity                    <- Apple sends NO Accept-Encoding
+Transfer-Encoding: chunked
+Content-Type: application/x-dvzip
+TotalBytes: 160
+TransferID: BD0D1E93-524F-48D3-BEFA-CB0E3B84A8DD
+SenderPseudonym: pseud:zGKTAi1gF0HF_RlcsHUFGw
+SenderPushToken: 66D733785226A9FAA075E7D176C75865E786588CC305371F7BAE724D992F5ECD
+User-Agent: AirDrop/1.0
+Connection: keep-alive
+```
+
+`http.client.request()` inserts `Host` and `Accept-Encoding` unconditionally,
+and an iOS 26 sender emits neither. It also reorders the headers, and Apple's
+order is fixed. So even a request built to copy Apple exactly did not, and the
+copy was never byte-accurate.
+
+### rawhdr
+
+`putrequest(skip_host=True, skip_accept_encoding=True)` suppresses both
+insertions, and the chunked framing is then a few bytes to write by hand. The
+`rawhdr` arm emits Apple's exact set in Apple's exact order and nothing else.
+Verified offline against a local server: no `Host`, no `Accept-Encoding`, order
+preserved, chunked body decoded intact, 200 returned.
+
+**This is the last difference under our control.** After it, the request is a
+byte-level copy of an observed Apple upload apart from the two values we cannot
+forge.
+
+### What a failure would mean
+
+If `rawhdr` is refused, the remaining difference is `SenderPseudonym` and
+`SenderPushToken` being well-formed but not genuine - we have no Apple ID and
+no push token, and cannot obtain either. The conclusion would then be that iOS
+26 validates sender identity on `/Upload`, and that **anonymous AirDrop sending
+to iOS 26 is closed while receiving remains open**.
+
+That is a legitimate result rather than a failure to find the bug, and it is
+worth stating before the run so it cannot be rationalised afterwards. The
+asymmetry would also make sense of everything else: receiving works because we
+are the one being chosen, and a receiver that has been tapped by a human needs
+no proof of who we are.
