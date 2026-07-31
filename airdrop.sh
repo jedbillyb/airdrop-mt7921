@@ -712,10 +712,21 @@ if [ "$MODE" = "receive" ]; then
   # what an Apple sender actually puts on an /Upload rather than theorising. The
   # extra verbosity is worth the ground truth.
   ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
-  if grep -q "^Headers" "$OUT/receive.log" 2>/dev/null; then
+  if grep -q "POST request at" "$OUT/receive.log" 2>/dev/null; then
     echo ""
     echo "### the phone's own request headers (ground truth for the send path)"
-    sed -n '/^POST request at/,/^$/p' "$OUT/receive.log" | sed 's/^/    /'
+    grep -A 8 "POST request at" "$OUT/receive.log" \
+      | sed 's/^[0-9-]* [0-9:,]* [A-Z]* *opendrop.server: //' \
+      | grep -v "^--$" | sed 's/^/    /'
+    echo ""
+    if grep -q "POST request at /Upload" "$OUT/receive.log" 2>/dev/null; then
+      echo "  /Upload headers captured - this is what the send path must match."
+    else
+      echo "  NO /Upload yet. /Discover and /Ask are not enough: the send path"
+      echo "  fails specifically on /Upload, so its headers are the ones needed."
+      echo "  The transfer has to COMPLETE. If it reset partway, that is §28 TX"
+      echo "  loss - just run it again."
+    fi
   fi
   sudo pkill -x tcpdump 2>/dev/null || true
   sleep 1

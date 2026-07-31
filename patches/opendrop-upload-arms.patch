@@ -13,16 +13,25 @@
  
  import fleep
  import libarchive
-@@ -145,7 +148,7 @@
+@@ -145,17 +148,28 @@
          self.receiver_port = receiver[1]
          self.http_conn = None
  
 -    def send_POST(self, url, body, headers=None):
-+    def send_POST(self, url, body, headers=None, new_conn=False):
++    def send_POST(self, url, body, headers=None, new_conn=False, minimal=False):
          logger.debug(f"Send {url} request")
  
          AirDropUtil.write_debug(
-@@ -156,6 +159,12 @@
+             self.config, body, f"send_{url.lower().strip('/')}_request.plist"
+         )
+ 
+-        _headers = self._get_headers()
++        # `minimal` drops upstream's Accept/Accept-Language/Accept-Encoding.
++        # Measured on 2026-07-31 by logging what the iPhone sends US: its
++        # /Discover and /Ask carry exactly three headers - User-Agent,
++        # Connection, Transfer-Encoding - and no Accept*, no Content-Type and no
++        # Host. Upstream sends seven. See FINDINGS §33.
++        _headers = {} if minimal else self._get_headers()
          if headers is not None:
              for key, val in headers.items():
                  _headers[key] = val
@@ -35,7 +44,7 @@
          if self.http_conn is None:
              # Use single connection
              self.http_conn = HTTPSConnectionAWDL(
-@@ -241,7 +250,33 @@
+@@ -241,7 +255,33 @@
  
          return success
  
@@ -70,7 +79,7 @@
          """
          Send a file to a receiver.
          """
-@@ -249,29 +284,180 @@
+@@ -249,29 +289,195 @@
          if is_url:
              return
  
@@ -143,8 +152,10 @@
 +            # and another chance for the re-Ask to die on a flaky link, which is
 +            # exactly what killed the previous run. Putting the untested arm
 +            # first buys the answer for one tap and no re-Ask.
-+            "reuse-length-gzip,reuse-length-dvzip,"
-+            "reuse-length-plain,reuse-chunked-gzip",
++            # §33: the phone sends three headers, we send seven. The minimal
++            # arms come first because that is the largest untested difference.
++            "reuse-chunked-gzip-minhdr,reuse-length-gzip-minhdr,"
++            "reuse-chunked-dvzip-minhdr,reuse-chunked-gzip",
 +        ).split(",")
 +
 +        for i, arm in enumerate(arms):
@@ -226,9 +237,18 @@
 +            if dvzip:
 +                payload = self._cpio_to_dvzip(payload)
 +
++            minimal = "minhdr" in arm
 +            headers = {
 +                "Content-Type": "application/x-dvzip" if dvzip else "application/x-cpio"
 +            }
++            if minimal:
++                # Match the shape the phone uses: User-Agent, Connection, and
++                # the framing header http.client adds itself. Content-Type stays
++                # because our own receiver reads it to pick a decoder, so an
++                # Apple sender must set it on /Upload even though it sets none on
++                # /Discover or /Ask.
++                headers["User-Agent"] = "AirDrop/1.0"
++                headers["Connection"] = "keep-alive"
 +            if expect:
 +                headers["Expect"] = "100-continue"
 +            if use_length:
@@ -250,7 +270,11 @@
 +            )
 +            try:
 +                success, _ = self.send_POST(
-+                    "/Upload", body, headers=headers, new_conn=new_conn
++                    "/Upload",
++                    body,
++                    headers=headers,
++                    new_conn=new_conn,
++                    minimal=minimal,
 +                )
 +            except (OSError, HTTPException) as e:
 +                logger.warning(f"Upload arm '{arm}' failed at the socket: {e}")

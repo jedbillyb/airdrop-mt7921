@@ -2288,3 +2288,65 @@ instead of guessing at it.
 
 That is the whole next step, and it costs one transfer in the direction that has
 worked since §15.
+
+---
+
+## §33 Apple sends three headers. We send seven.
+
+2026-07-31, 22:04. `airdrop.sh receive -d` logged what the iPhone puts on its
+own requests, and the answer is short:
+
+```
+POST /Discover                 POST /Ask
+User-Agent: AirDrop/1.0        User-Agent: AirDrop/1.0
+Connection: close              Connection: keep-alive
+Transfer-Encoding: chunked     Transfer-Encoding: chunked
+```
+
+That is the whole header set. **No `Content-Type`, no `Accept`, no
+`Accept-Language`, no `Accept-Encoding`, no `Host`.** Upstream OpenDrop sends
+all of those:
+
+```
+Content-Type: application/octet-stream
+Connection: keep-alive
+Accept: */*
+User-Agent: AirDrop/1.0
+Accept-Language: en-us
+Accept-Encoding: br, gzip, deflate
+Host: [fe80::...]:8770
+```
+
+This is a far larger divergence from Apple than anything varied in §29-§32, and
+it was invisible for the whole evening because nobody had run the working
+direction with `-d`.
+
+### What it does and does not explain
+
+It does **not** straightforwardly explain the `/Upload` refusal, and that has to
+be said plainly: our `/Ask` carries every one of those extra headers and is
+accepted every time, with a real prompt and a 200. So the extra headers are not
+inherently offensive to the phone's HTTP server.
+
+What changes is the prior. Four rounds of arms have excluded container, framing,
+`Expect` and connection reuse, and the refusal is on the headers (§31's 70 us
+close_notify). The headers we have never touched are precisely the ones Apple
+does not send. `Accept-Encoding: br, gzip, deflate` on a request whose response
+is a plist is the odd one out, and `handle_upload` is the one endpoint where the
+server has to decide how to read a body.
+
+### Still missing: the /Upload headers
+
+The run captured `/Discover` and `/Ask` and then reset before the phone's
+`/Upload` (§28 TX loss, the link was at 20-40%). **`/Upload` is the endpoint the
+send path fails on, so its headers are the ones that matter**, and they are
+still unknown. `airdrop.sh` now says so explicitly at the end of a receive run
+rather than letting two-thirds of the answer look like the whole of it.
+
+### Next arms
+
+`minhdr` strips the Accept* set and sends only what the phone sends, keeping
+`Content-Type` because our own receiver reads it to choose a decoder - so an
+Apple sender must set it on `/Upload` even though it sets none on `/Discover` or
+`/Ask`. That last point is an inference, not an observation, and a captured
+`/Upload` would settle it.
