@@ -293,11 +293,19 @@ BEST_CHAN=""; BEST_N=0; SAW_ANY=0
 # A cold cache, or a phone that moved, just falls through to the full sweep.
 CHAN_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/airdrop-mt7921-channel"
 SWEEP_ORDER="36 149 6 44 132"
-EARLY_OK=100          # frames on one channel that mean "found it, stop looking"
+EARLY_OK=100          # frames on ANY channel that mean "found it, stop looking"
+# A far lower bar applies to the CACHED channel, because that one already won a
+# complete sweep - we are confirming a previous result, not choosing blind. Each
+# channel costs ~7 s, so confirming the cache instead of sweeping all five saves
+# ~28 s off every run. Measured: the winning channel yields ~50 frames in the 5 s
+# dwell, a loser yields 0, so 25 separates them with room to spare.
+CACHED_OK=25
+CACHED_CHAN=""
 if [ -r "$CHAN_CACHE" ]; then
   LAST=$(cat "$CHAN_CACHE" 2>/dev/null)
   case "$LAST" in
     6|36|44|132|149)
+      CACHED_CHAN="$LAST"
       SWEEP_ORDER="$LAST $(echo "$SWEEP_ORDER" | tr ' ' '\n' | grep -vx "$LAST" | tr '\n' ' ')"
       echo "  (trying ch $LAST first - it won the last run)" ;;
   esac
@@ -319,6 +327,10 @@ for c in $SWEEP_ORDER; do
   if [ "$n" -gt "$BEST_N" ]; then BEST_N=$n; BEST_CHAN=$c; fi
   if [ "$n" -ge "$EARLY_OK" ]; then
     echo "  ch $c is busy enough ($n frames) - skipping the rest of the sweep"
+    break
+  fi
+  if [ "$c" = "$CACHED_CHAN" ] && [ "$n" -ge "$CACHED_OK" ]; then
+    echo "  ch $c confirmed ($n frames, it won last time) - skipping the rest"
     break
   fi
 done
@@ -456,8 +468,44 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   # "our query never went out" from "it went out and the phone ignored it".
   sudo timeout $((FIND_TIME + 10)) tcpdump -i $AWDL -w "$OUT/find.pcap" >/dev/null 2>&1 &
   sleep 1
-  timeout -s INT $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
+
+  # STOP AS SOON AS SOMETHING IS FOUND. `opendrop find` never exits on its own,
+  # so this used to burn the whole FIND_TIME even when the receiver turned up in
+  # the first few seconds. FIND_TIME is now only a ceiling, not a duration: the
+  # browse runs in the background, we poll its log, and the moment a receiver
+  # line appears we SIGINT it (SIGINT, not SIGTERM - see above, the report is
+  # written from a finally: block reached via KeyboardInterrupt).
+  : > "$OUT/find.log"
+  # PYTHONUNBUFFERED is load-bearing, not hygiene. Python block-buffers stdout
+  # when it is a file rather than a tty, so the receiver line would sit in an
+  # 8 KiB buffer until exit - and the poll below, which exists to notice that
+  # line, would never see it until it was too late to matter.
+  PYTHONUNBUFFERED=1 "$OPENDROP" -i $AWDL find > "$OUT/find.log" 2>&1 &
+  FIND_PID=$!
+  tail -f "$OUT/find.log" 2>/dev/null | sed 's/^/  /' &
+  TAIL_PID=$!
+  FOUND=0
+  HALVES=0
+  MAX_HALVES=$((FIND_TIME * 2))
+  while [ $HALVES -lt $MAX_HALVES ]; do
+    kill -0 $FIND_PID 2>/dev/null || break
+    if grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
+      FOUND=1
+      # Give it a beat to print the whole list before we cut it off - a second
+      # receiver one line later would otherwise be lost.
+      sleep 2
+      break
+    fi
+    sleep 0.5
+    HALVES=$((HALVES + 1))
+  done
+  kill -INT $FIND_PID 2>/dev/null || true
+  wait $FIND_PID 2>/dev/null || true
+  kill $TAIL_PID 2>/dev/null || true
   sudo pkill -x tcpdump 2>/dev/null || true
+  if [ "$FOUND" = "1" ]; then
+    echo "  found a receiver after ~$((HALVES / 2))s - stopping the browse early"
+  fi
   sleep 1
 
   # Did our _airdrop._tcp query leave, and did anything answer?
