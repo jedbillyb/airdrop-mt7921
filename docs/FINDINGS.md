@@ -1467,3 +1467,69 @@ nothing here counts yet.** This is the third confident diagnosis in this
 project; the previous two were both contradicted by their own logs. The
 difference this time is that the prediction is quantified and its failure
 conditions are written down in advance.
+
+---
+
+## §22 - The BLE wake is unproven, and AWDL being awake is not enough
+
+2026-07-31, with a phone in the room set to AirDrop → Everyone and **the share
+sheet closed**. Two runs, differing only in whether `tools/blewake.sh` was
+broadcasting.
+
+### Result: no difference
+
+| | BLE advertising | BLE off (control) |
+|---|---|---|
+| AWDL frames on ch6 | 31 | 29 |
+| peer found | yes, `3a:dd:74:15:95:5c` | yes, `3a:dd:74:15:95:5c` |
+| advertised sequence | `36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36` | identical |
+| service UUID | `fdad762f-a86e-429b-9ad7-98e0d5399fec` | identical |
+| `_airdrop._tcp` from peer | **none** | **none** |
+
+The phone's AWDL was already awake for reasons of its own, so **the experiment
+cannot say whether the BLE advertisement does anything.** It is confounded, not
+negative. `blewake.sh` remains untested in the sense that matters.
+
+To test it properly the phone's AWDL has to be verifiably *asleep* first -
+confirmed by seeing zero AWDL frames on all social channels, as §19 once did -
+and only then should the advertisement be switched on. Getting an iPhone into
+that state reliably is itself unsolved.
+
+### The more useful finding: waking AWDL is not sufficient
+
+§19 framed the send blocker as "AWDL is asleep, and only a BLE advertisement
+wakes it". That framing is incomplete. Here AWDL was demonstrably awake - a peer
+was discovered, with a live channel sequence, over several minutes - and the
+phone **still did not advertise `_airdrop._tcp`**. Our 37 mDNS queries went out;
+nothing came back (`from_peer=0`).
+
+So there are two separate gates, not one:
+
+1. the AWDL interface being up, and
+2. the AirDrop *service* being advertised on it.
+
+Only (1) was ever attributed to the BLE bootstrap. Something else governs (2) -
+plausibly the Everyone window having expired (iOS reverts to Contacts Only after
+10 minutes, and it is not obvious from the outside when that has happened), or
+the service advertisement being gated on the contact-hash match that our
+all-zero hashes cannot satisfy.
+
+**Next time, the first thing to check is that Everyone has not silently
+expired.** It is the cheapest explanation and nothing downstream can be
+interpreted without ruling it out.
+
+### A real bug, caught by having a phone present
+
+The same run exposed a defect in the PIN channel picker. The phone advertised
+ch36 in 6 of 16 slots, ch149 in 2, ch6 in 1, while `airdrop.sh` had swept to
+channel 6 - it picks by raw frame count, which disagreed with the sequence.
+
+`awdl_chanseq_dominant_chan()` returned the operator's channel whenever it
+appeared at all, so it would have pinned to **ch6 for 1 slot of 16 instead of
+ch36 for 6** - the peer's worst channel over its best, the exact opposite of the
+point of pinning. Now the operator's channel breaks exact ties only. Fixed with
+the real sequence as the test case.
+
+Worth noting the sweep and the sequence disagreed at all: frame count on a
+channel is not the same as slots-per-sequence, and the sequence is the better
+guide. `slotmap.py` reads it directly.
