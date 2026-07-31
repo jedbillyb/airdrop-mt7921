@@ -2549,3 +2549,26 @@ companion `SenderIdentityAuthTag`. We have no Apple ID and cannot mint either.
 
 These two outcomes are distinguishable on the wire: a header-time close_notify
 means the id did not fix it; a `100-continue` or a read of the body means it did.
+
+### §37 RESULT (2026-07-31 22:35) — SENDING WORKS
+
+`run airdrop-20260731-223526`. On the wire, decrypted:
+
+    POST /Ask     -> 200 OK
+    POST /Upload  -> 200 OK        (frame 65, ~1 s after /Ask)
+
+The file landed on the iPhone. The single arm `reuse-chunked-dvzip-rawhdr`
+was ACCEPTED on its first and only attempt.
+
+So the answer to the pre-registered question is the first branch:
+**anonymous AirDrop sending to iOS 26 works.** The entire evening's refusal
+was one unannounced `TransferID`. `SenderRecordData` is NOT required to send -
+the phone accepted the upload from a sender with no Apple ID, no signed
+validation record, and forged pseudonym/push-token. The identity fields are
+carried but not verified at the `/Upload` stage; the binding the receiver
+actually enforces is that `/Upload`'s `TransferID` was announced in a `/Ask`
+it accepted.
+
+Laptop -> iPhone AirDrop over an MT7921 is now end-to-end complete:
+link-layer sync (OWL) -> IPv6 over awdl0 -> BLE wake -> /Discover -> /Ask ->
+/Upload 200.
