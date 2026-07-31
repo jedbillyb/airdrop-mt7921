@@ -392,8 +392,11 @@ sleep 1
 # channel.h in the owl fork and FINDINGS §21, §25.
 #
 #   verbatim  copy the sync master's sequence -- upstream behaviour, and the
-#             DEFAULT, because it is the only strategy an iPhone has ever been
-#             observed to answer (§25).
+#             DEFAULT until a real transfer says otherwise (§26).
+#   widen     the peer's own sequence with up to WIDEN_MAX of its empty slots
+#             filled with the peer's dominant channel. Accepted by the phone at
+#             every width tested (§26); this is the candidate for the §21
+#             duty-cycle win and the arm to measure against verbatim.
 #   pin       sit on the peer's dominant social channel in all 16 slots. BREAKS
 #             AIRDROP against iOS 26: the phone stops replying entirely. Measured
 #             twice in one session against verbatim's 60% ping loss. Only useful
@@ -402,15 +405,19 @@ sleep 1
 #
 # The point of exposing it is that all three can be measured against the same
 # phone in one session, which is the only way this gets settled:
-#   for s in verbatim pin rotate; do STRATEGY=$s ACTIVE=1 ./airdrop.sh receive; done
-#   tools/bursts.py runs/<a-run>/receive.pcap --baseline runs/<b-run>/receive.pcap
+#   for s in verbatim widen; do STRATEGY=$s ACTIVE=1 ./airdrop.sh receive; done
+#   tools/bursts.py runs/<widen-run>/receive.pcap --baseline runs/<verbatim-run>/receive.pcap
 STRATEGY="${STRATEGY-verbatim}"
 # Set STRATEGY= (empty) to omit the flag entirely, which is what an OWL build
 # from before -S existed needs -- the pre-change binary is the reference for
 # deciding whether a regression is ours or the environment's, and it aborts on
 # an unknown option.
+# WIDEN_MAX is how many of the peer's empty slots -S widen may fill (owl's own
+# default is 4). Only meaningful with STRATEGY=widen; see FINDINGS §26.
+WIDEN_MAX="${WIDEN_MAX:-}"
 if [ -n "$STRATEGY" ]; then
   set -- -S "$STRATEGY"
+  [ -n "$WIDEN_MAX" ] && set -- "$@" -W "$WIDEN_MAX"
 else
   set --
   echo "  (no -S flag: assuming an OWL build that predates channel strategies)"
