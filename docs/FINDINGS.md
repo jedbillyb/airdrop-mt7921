@@ -940,7 +940,7 @@ window at 3 Mbit/s. We simply only get one usable window in about seven.
   entirely incapable of explaining 450 ms gaps. I had most of a case built for
   this before checking the gap distribution; the gap histogram killed it.
 
-### The actual cause: we follow the wrong device's channel sequence
+### The proposed cause — **WRONG, see §17.** Kept because the error is instructive.
 
 `awdl_adopt_sync_master_chanseq()` adopted the channel sequence of whichever
 peer won the *election*. That is right for staying in sync and wrong for being
@@ -976,9 +976,8 @@ The peer table ages entries out after 2 s and adoption re-runs every 1 s, so the
 5 s data-peer window cannot cause flapping - a peer that goes quiet is removed
 before the window expires.
 
-**Not yet verified against hardware.** The prediction, if the cause is right: a
-transfer that no longer waits for the election to swing, more bursts per second,
-and throughput scaling roughly with the number of overlapping slots.
+**This fix was tested against the phone and made throughput ~6x WORSE. It is
+reverted. See §17.**
 
 ### Still open
 
@@ -989,3 +988,92 @@ and throughput scaling roughly with the number of overlapping slots.
 - TX is hardcoded to 12 Mbit/s legacy OFDM (`src/tx.c:312`, under upstream's own
   `TODO Adjust PHY parameters based on receiver capabilities`). This caps the
   *send* direction, which is still untested.
+
+## 17. 2026-07-31: §16's fix was wrong, and it made things 6x worse
+
+The §16 *measurement* stands: the ceiling is duty cycle. The *cause* I attached
+to it, and the fix that followed, did not survive contact with the phone.
+
+### The measurement
+
+| | baseline (§16) | with the fix |
+|---|---|---|
+| transferred | 2.06 MB in 46 s | 1.36 MB in 189 s (then failed) |
+| throughput | **45 kB/s** | **7.2 kB/s** |
+| bursts per second | 1.84 | 0.37 |
+| bytes per burst | 25.2 kB | 19.7 kB |
+| burst duration | 68 ms | 67 ms |
+| in-burst rate | 3.0 Mbit/s | 2.4 Mbit/s |
+| gaps | 350-550 ms | 250-1000 ms, tail to **7.5 s** |
+| channel switches | 3.5/s | 4.1/s |
+
+Burst *structure* is unchanged - still one AWDL slot long, still ~2-3 Mbit/s
+inside the burst. We simply got far fewer of them. So the duty-cycle diagnosis
+was right and the intervention was actively harmful.
+
+### Why: a channel sequence is meaningless without the clock it was written against
+
+`awdl_switch_channel()` picks its slot with
+
+```c
+slot = awdl_sync_current_eaw(now, &state->sync) % AWDL_CHANSEQ_LENGTH;
+chan_new = awdl_state->channel.sequence[slot];
+```
+
+`state->sync` tracks the **elected master** - `awdl_handle_sync_params_tlv()`
+returns `RX_IGNORE` for sync params from anyone else. So the slot index is in
+the master's phase. Copying a *non-master* peer's sequence array into
+`channel.sequence` while indexing it with the master's phase puts us on the
+right channels at the wrong times.
+
+The codebase already knew this. `awdl_same_channel_as_peer()` compares against a
+peer by explicitly correcting the phase:
+
+```c
+peer_slot = awdl_sync_current_eaw(now + peer->sync_offset, &state->sync) % AWDL_CHANSEQ_LENGTH;
+```
+
+`awdl_switch_channel()` applies no such correction, because upstream only ever
+fed it the master's sequence, where the offset is zero by construction.
+
+### The baseline was a natural experiment, and I misread it
+
+§16 noted that the fast transfer began two seconds after the election swung to
+the phone, and called it luck. Re-reading the log, at 11:20:02 it says
+`following channel sequence of sync master 3a:dd:74:15:95:5c` - **sync master**.
+The phone had won the election, so sequence and clock came from the same device.
+That was not luck to be engineered away; it was the precondition for the
+transfer being fast. The one configuration that worked was the one I removed.
+
+### Second defect: the source flaps
+
+A second device, `2e:38:e1:a9:db:2c`, was also sending us data frames, so
+"most recent data peer" oscillated between it and the phone at the 1 Hz adoption
+tick - visible in the log at 12:04:44 -> :50 -> :51 -> :55 -> :56. Each flip
+rewrites the whole sequence. Channel switching rose from 3.5/s to 4.1/s.
+
+### Where this leaves it
+
+Reverted; `master` is back to the 45 kB/s behaviour.
+
+The underlying observation from §16 is still real - being on a bystander's
+sequence is bad - but acting on it requires **rotating** the adopted sequence
+into our own phase, not copying it verbatim:
+
+```
+delta = (awdl_sync_current_eaw(now + peer->sync_offset) -
+         awdl_sync_current_eaw(now)) % AWDL_CHANSEQ_LENGTH
+our_sequence[i] = peer_sequence[(i + delta) % AWDL_CHANSEQ_LENGTH]
+```
+
+plus hysteresis so the choice cannot flap. Both need building and *measuring*.
+Given that this is the second confident fix in this project to be contradicted by
+its own logs, the rule stands: on this hardware, nothing counts until it has been
+measured against the phone.
+
+### Method note
+
+Everything above came from `owl.log` and `receive.pcap` of the two runs. Burst
+structure is the diagnostic that matters here - per-second averages hid it
+completely, and the gap *histogram* is what falsified the blocking-`set_channel`
+theory in §16 and the peer-follow theory here.
