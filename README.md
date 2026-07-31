@@ -3,9 +3,10 @@
 AirDrop on Linux using the **built-in MediaTek MT7921** Wi-Fi chip, with no USB
 adapter.
 
-Receiving a photo from an iPhone on iOS 26 works, end to end. This repo is the
-script that sets it up, the OpenDrop patches that make iOS 26 transfers parse,
-and the research that got there.
+Sending to **and** receiving from an iPhone on iOS 26 both work, end to end,
+with no Apple ID and no signed identity. This repo is the script that sets it up,
+the OpenDrop patches that make iOS 26 transfers parse and send, and the research
+that got there.
 
 > **Unsupported personal fork / personal project.** This is my own work, done on
 > my own laptop, published in case it is useful. It is not affiliated with the
@@ -39,13 +40,23 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 | | |
 |---|---|
 | Receiving from an iPhone | **works** (iOS 26, proven end to end) |
-| Sending to an iPhone | blocked on Apple's BLE bootstrap - see [FINDINGS §19](docs/FINDINGS.md) |
-| Throughput | ~40-45 kB/s with `-S verbatim` - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)). `-S pin` (default) should raise the window count several-fold; **not yet measured against a phone** ([§21](docs/FINDINGS.md)) |
-| Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.12.97 |
+| Sending to an iPhone | **works** (iOS 26, `POST /Upload -> 200`, file delivered - see [FINDINGS §37](docs/FINDINGS.md)) |
+| Receive throughput | ~40-45 kB/s with `-S verbatim` - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)) |
+| Send throughput | not yet measured - the proving run sent a 68-byte file; needs a real file + `tools/bursts.py` |
+| Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.18.33 |
 
-The auth wall that everyone warns about was never reached. In **Everyone** mode
-an iPhone accepts an unsigned receiver. Contacts-only would need an
-Apple-key-signed validation record and is genuinely not forgeable.
+The auth wall that everyone warns about was never reached, in **either**
+direction. In **Everyone** mode an iPhone both accepts an unsigned receiver and
+accepts an upload from an unsigned sender - no Apple ID, no push token, no signed
+validation record. Contacts-only would need an Apple-key-signed validation record
+and is genuinely not forgeable.
+
+**What made sending work** ([§37](docs/FINDINGS.md)): the whole block was one
+missing field. Our `/Ask` never declared a `TransferID`, but the `/Upload` header
+asserted a fresh one, so the phone had no accepted transfer to bind the upload to
+and refused it on the headers before reading the body. A real iOS 26 sender
+announces `TransferID={'id': UUID}` in its `/Ask` body and repeats the same id on
+`/Upload`. Do the same and the phone takes the file. It was never an auth wall.
 
 ## Requirements
 
@@ -67,14 +78,27 @@ git clone https://github.com/jedbillyb/owl.git ~/owl
 cd ~/owl && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
-**2. Install and patch OpenDrop.** iOS 26 breaks stock OpenDrop in three
-independent places - see [patches/README.md](patches/README.md):
+**2. Install and patch OpenDrop.** Stock OpenDrop cannot complete an iOS 26
+transfer in either direction. The patches are applied in order, in place, inside
+the venv - see [patches/README.md](patches/README.md) for what each one does and
+why:
 
 ```sh
 python -m venv ~/owl/.venv-opendrop
 ~/owl/.venv-opendrop/bin/pip install opendrop
-git apply --directory=... patches/opendrop-ios26-airdrop.patch   # see patches/README.md
+cd ~/owl/.venv-opendrop/lib/python*/site-packages
+for p in ios26-airdrop recv-window py314-send mdns-repeat find-report \
+         tls-keylog upload-arms; do
+  git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch
+done
 ```
+
+The first two make **receiving** work; the rest make **sending** work
+(`py314-send` unbreaks the send path on modern Python, `mdns-repeat` gets the
+phone to answer, `find-report` hands the receiver to `send`, `tls-keylog` makes
+failures decryptable, and `upload-arms` carries the `TransferID` fix that
+delivers the file). Void has no `patch(1)`; `git apply` is what the patches are
+verified against.
 
 **3. Run it.**
 
@@ -84,15 +108,25 @@ git apply --directory=... patches/opendrop-ios26-airdrop.patch   # see patches/R
 ./airdrop.sh send <file>      # send to a phone
 ```
 
-On the phone: **Settings → General → AirDrop → Everyone for 10 Minutes** (this
-expires - re-arm it), then **open a share sheet and leave it open**. That applies
-to *both* directions, and it is not optional.
+On the phone, always: **Settings → General → AirDrop → Everyone for 10 Minutes**
+(this expires - re-arm it). The rest depends on direction, because the phone
+plays opposite roles:
 
-**Why the share sheet, specifically.** Apple bootstraps AirDrop discovery over
-Bluetooth LE: a sender broadcasts a BLE advertisement, and that is what wakes a
-nearby receiver's AWDL interface. Neither OWL nor OpenDrop implements the BLE
-side, so we cannot wake a dormant iPhone - it has to already have AWDL running,
-and opening the share sheet is what a user can do to force that.
+- **Receiving** (`./airdrop.sh receive`): the phone is the *sender*. **Open a
+  share sheet and leave it open** - that wakes its AWDL and lets it query for you.
+- **Sending** (`./airdrop.sh send <file>`): the phone must be the *receiver*, so
+  **do not open a share sheet** (that puts it in sender mode, where it queries but
+  never advertises). Just keep the phone unlocked and awake. The script wakes the
+  phone's AWDL over Bluetooth LE itself (see below), then discovers it.
+
+**The Bluetooth LE bootstrap.** Apple bootstraps AirDrop discovery over BLE: a
+sender broadcasts a Continuity advertisement, and that is what wakes a nearby
+receiver's AWDL interface. For *receiving*, opening the share sheet is how a user
+forces the phone's AWDL up. For *sending*, `tools/blewake.sh` emits that
+advertisement for us - and `airdrop.sh send` now starts it automatically, because
+the MT7921 is a combined Wi-Fi/BT chip and reconfiguring Wi-Fi resets the BT
+controller, so the advert has to come up *after* the radio is set
+([§36](docs/FINDINGS.md)).
 
 Measured on this hardware, sweeping all five AWDL social channels:
 
@@ -129,35 +163,49 @@ All optional, all environment variables:
 | `RECV_DIR` | `~/Downloads` | where received files are extracted |
 | `RECV_TIME` | `300` | seconds to stay advertising |
 | `OUT_DIR` | `./runs` | where logs and captures go |
-| `STRATEGY` | `pin` | how OWL derives its channel sequence: `pin`, `rotate`, `verbatim` |
+| `STRATEGY` | `verbatim` | how OWL derives its channel sequence: `verbatim`, `widen`, `rotate`, `pin`. `verbatim` is the default because `pin` breaks TX to iOS 26 ([§25](docs/FINDINGS.md)) |
 
-## The open experiment: does `pin` beat `verbatim`?
+## Open questions
 
-Untested against a phone as of 2026-07-31. [§21](docs/FINDINGS.md) argues the
-~45 kB/s ceiling is simply the 2-of-16-slot channel sequence we chose to copy,
-while the transferring device was offering up to 11 of 16. `-S pin` sits on the
-peer's channel in all 16 slots instead. To settle it, with the phone in the room:
+Two throughput questions remain; both need a human and a phone in the room.
+
+**1. How fast is sending?** Sending is proven to *work* ([§37](docs/FINDINGS.md))
+but the proving run sent a 68-byte file, which measures nothing. Send a real one
+and read the rate:
 
 ```sh
-# Send a photo from the phone to this machine, twice, changing only the strategy.
-STRATEGY=verbatim ACTIVE=1 ./airdrop.sh receive     # reproduce the old baseline
-STRATEGY=pin      ACTIVE=1 ./airdrop.sh receive     # the change under test
+./airdrop.sh send ~/some-photo.jpg
+tools/bursts.py runs/<send-run>/send.pcap
+```
 
-tools/bursts.py runs/<pin-run>/receive.pcap \
+The `send` TX path is hardcoded to 12 Mbit/s legacy OFDM (`src/tx.c`, under
+upstream's own TODO), so send may well be slower than the ~45 kB/s receive
+ceiling. Unknown until measured.
+
+**2. Does widening the channel sequence beat `verbatim` on receive?**
+[§21](docs/FINDINGS.md) argues the ~45 kB/s ceiling is the 2-of-16-slot sequence
+we copy, while the phone offers up to 11 of 16. `-S pin` (all 16 slots) was the
+first attempt and **breaks TX to iOS 26** ([§25](docs/FINDINGS.md)) - it is
+disqualified. `-S widen -W n` keeps the peer's own sequence and fills only its
+empty slots, which iOS 26 *does* accept ([§26](docs/FINDINGS.md)). To settle it:
+
+```sh
+STRATEGY=verbatim ACTIVE=1 ./airdrop.sh receive     # reproduce the baseline
+STRATEGY=widen    ACTIVE=1 ./airdrop.sh receive     # the change under test
+
+tools/bursts.py runs/<widen-run>/receive.pcap \
    --baseline runs/<verbatim-run>/receive.pcap
 ```
 
 Read **bursts per second**, not throughput. §18 established that bytes per
 availability window is fixed at ~22-25 kB and cannot be moved from this side, so
-window count is the only real lever.
+window count is the only real lever. **Check first whether the run was winnable:**
+if `tools/slotmap.py --log runs/<run>/owl.log` shows the peer never offered more
+than 2 of 16 slots, there was nothing to gain and the run proves nothing.
 
-**Check first whether the run was winnable.** If `tools/slotmap.py --log
-runs/<run>/owl.log` shows the data peer never offered more than 2 of 16 slots,
-there was nothing to gain and the run proves nothing either way.
-
-The prediction and its falsification conditions are written down in §21 in
-advance, because the previous two confident diagnoses in this project were both
-contradicted by their own logs.
+The predictions and their falsification conditions are written down in §21 in
+advance, because the earlier confident diagnoses in this project were more than
+once contradicted by their own logs.
 
 ## Safety
 

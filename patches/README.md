@@ -167,13 +167,43 @@ tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
 
 ## opendrop-upload-arms.patch
 
-**An experiment, not a fix.** See [../docs/FINDINGS.md](../docs/FINDINGS.md) §29.
+**This is what makes sending work.** It began as an experiment and ended as the
+fix; the history is kept because the dead ends are informative. Result first,
+then how we got there.
+
+### SOLVED (§37): announce the TransferID in `/Ask`
+
+The `/Upload` was refused because our `/Ask` never declared a `TransferID`, yet
+`/Upload` asserted a fresh one - so the receiver had no accepted transfer to bind
+it to and rejected on the headers. A real iOS 26 sender's `/Ask` body carries
+`TransferID={'id': UUID}` and `TransferType`, and repeats the same id on
+`/Upload`. `send_ask()` now does the same, and the default arm list collapses to a
+single arm, `reuse-chunked-dvzip-rawhdr`, which is a byte-level copy of an
+observed Apple upload: reused connection, chunked, dvzip container, Apple's exact
+header set and order, no `Host`, no `Accept-Encoding`. On the wire:
+`POST /Ask -> 200`, `POST /Upload -> 200 OK`, file delivered. **`SenderRecordData`
+- the Apple-signed validation record - is not required.** Identity fields are
+carried but not verified at `/Upload`; the receiver only enforces that the upload's
+id was announced in an `/Ask` it accepted.
+
+`send_ask()` also stashes the receiver's `/Ask` reply (`IDSSessionID`,
+`ReceiverPseudonym`, `ReceiverPushToken`) on the client in case a future step
+needs to echo it - see [../docs/FINDINGS.md §37](../docs/FINDINGS.md).
+
+### How we got there (the arms)
+
+See [../docs/FINDINGS.md](../docs/FINDINGS.md) §29-§37.
 
 An iPhone on iOS 26 accepts `/Ask`, returns a full 200 with its receiver plist,
-then takes a complete and well-formed `/Upload` and answers with a TLS
+then took a complete and well-formed `/Upload` and answered with a TLS
 **close_notify** instead of an HTTP status. Not transport loss: captured at 0%
 ping loss with every byte ACKed. A server that dislikes a media type answers
-406, so a silent close points elsewhere.
+406, so a silent close pointed elsewhere. The arms machinery below walked
+candidate framings/containers/headers inside one accepted session. It ruled out a
+lot - and every one of those arms shared the missing-TransferID defect, so their
+"eliminations" only proved the receiver rejects an unannounced transfer. The real
+answer came from diffing our request against a real Apple `/Ask` our own receiver
+had saved to disk, not from the arms themselves.
 
 `send_upload()` walks a list of arms inside one accepted session, controlled by
 `OPENDROP_UPLOAD_ARMS`, because each candidate otherwise costs the user an
@@ -203,34 +233,24 @@ silently became "new", and worse, that connection carried no `/Ask`, so the
 phone was asked to accept an upload for a session it had never agreed to on
 that socket. Only arm 1 was ever a real test, in both rounds.
 
-### Round three (current default)
+### Rounds three and four (eliminated container, framing and Expect)
 
-These hold the connection constant and copy what the phone **demonstrably does
-when it sends to us**, rather than inventing another theory:
+Later rounds held the connection constant and copied what the phone demonstrably
+does when it sends to us, varying one thing at a time: dvzip vs cpio+gzip vs bare
+cpio; `Content-Length` vs chunked; `Expect: 100-continue` present vs absent; and
+finally Apple's exact minimal header set (`rawhdr`). All refused, one of them 70 us
+after our headers - too fast for the body to have been read, which said the request
+was refused on its **headers**. That was the clue that sent us to compare headers,
+and ultimately the whole `/Ask`, against a real Apple transfer - where the missing
+`TransferID` announcement finally showed up (§37).
 
-| order | arm | framing | container |
-|---|-----|---------|-----------|
-| 1 | `reuse-length-gzip`  | `Content-Length` | cpio + gzip |
-| 2 | `reuse-length-dvzip` | `Content-Length` | dvzip |
-| 3 | `reuse-length-plain` | `Content-Length` | bare cpio |
-| 4 | `reuse-chunked-gzip` | chunked (control) | cpio + gzip |
+**Every arm after the first re-sends `/Ask`, so it prompts on the phone and costs
+an Accept tap.** With the fix in place the default is a single arm, so a normal
+send costs exactly one tap; the multi-arm machinery survives for future
+experiments via `OPENDROP_UPLOAD_ARMS`.
 
-Round three eliminated dvzip and `Expect: 100-continue` (§31): three valid arms,
-all refused, one of them 70 us after our headers - too fast for the body to have
-been read. Round four varies the framing instead.
-
-**The candidate runs first and the control last**, which inverts the usual
-order on purpose. Arm 1 rides the `/Ask` that `cli.send()` already made, so it
-needs no prompt beyond the first; the control has been reproduced in every run
-of the evening and re-proving it costs a tap and a fragile re-Ask.
-
-**Every arm after the first re-sends `/Ask`, so it prompts on the phone and
-costs an Accept tap.** That is the price of an arm that tests what its name
-says. The control is first and the strongest candidate second, so stopping
-after two taps still yields a usable result.
-
-Both differences are observed, not guessed. Our receiver had to be taught to
-answer `Expect: 100-continue` because the iPhone sends it, and to decode
+The observed differences the arms copied are real: our receiver had to be taught
+to answer `Expect: 100-continue` because the iPhone sends it, and to decode
 `application/x-dvzip` because the iPhone sends that too.
 
 `_cpio_to_dvzip()` is the exact inverse of `dvzip_to_cpio()` in `server.py`, and
