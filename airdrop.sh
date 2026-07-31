@@ -567,6 +567,27 @@ fi
 if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   echo ""
   echo "### layer 3: AirDrop service discovery over $AWDL"
+  # CHECK THE BLE ADVERT IS ACTUALLY UP. §27 established that the phone only
+  # advertises _airdrop._tcp while a Continuity advert is running, and this has
+  # now cost two runs: blewake.sh's advert expires on a timer, and it has also
+  # been observed to vanish while the script still looked alive. The process
+  # existing is NOT the test - the registered advertising instance is.
+  if [ "$MODE" = "send" ]; then
+    ADV_N=$(sudo timeout 5 btmgmt advinfo 2>/dev/null \
+            | grep -oP 'Instances list with \K[0-9]+' || echo "?")
+    case "$ADV_N" in
+      0)
+        echo "  WARNING: no BLE advertising instance is registered."
+        echo "  §27: with the advert down the phone does not advertise"
+        echo "  _airdrop._tcp at all, and this browse will almost certainly find"
+        echo "  nothing (the tell is from_peer=0 below). Start it first:"
+        echo "      ./tools/blewake.sh --duration 2400 &"
+        echo "  Then check it took: btmgmt advinfo | tail -1"
+        ;;
+      [0-9]*) echo "  BLE advert: $ADV_N instance(s) registered - good" ;;
+      *)      echo "  BLE advert: could not query btmgmt; continuing" ;;
+    esac
+  fi
   # opendrop writes its discovery report here and `opendrop send` reads it back.
   # Remember the mtime so a stale report cannot be mistaken for this run's.
   OD_REPORT="${OD_REPORT:-$HOME/.opendrop/discover.last.json}"
