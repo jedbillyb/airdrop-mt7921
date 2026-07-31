@@ -81,11 +81,30 @@ git apply --directory=... patches/opendrop-ios26-airdrop.patch   # see patches/R
 ```sh
 ./airdrop.sh receive          # advertise this machine as an AirDrop target
 ./airdrop.sh                  # discover nearby devices only
-./airdrop.sh send <file>      # untested
+./airdrop.sh send <file>      # send to a phone
 ```
 
-On the phone: **Settings → General → AirDrop → Everyone for 10 Minutes**, then
-open the share sheet and leave it open.
+On the phone, **Settings → General → AirDrop → Everyone for 10 Minutes** — and
+then it depends which way you are going, because the two directions want
+*opposite* things:
+
+| you want to | phone's role | open on the phone |
+|---|---|---|
+| **receive** from the phone | sender | the **share sheet** |
+| **send** to the phone | receiver | **Control Centre** (long-press the connectivity tile) |
+
+With the share sheet open, iOS browses for receivers and does not advertise
+`_airdrop._tcp` at all - so a send will find nothing and report no receivers.
+
+### Which phone am I sending to?
+
+`AirDrop → Everyone` makes *every* Apple device in range a candidate, and the
+default `-r 0` picks whichever answered mDNS first. Check the discovered list the
+script prints, then select by name rather than position:
+
+```sh
+RECEIVER="Jed's iPhone" ./airdrop.sh send photo.jpg
+```
 
 Files land in `~/Downloads`. Per-run logs and captures go to `./runs/`.
 

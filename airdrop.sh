@@ -401,7 +401,13 @@ fi
 if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   echo ""
   echo "### layer 3: AirDrop service discovery over $AWDL"
-  timeout $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
+  # -s INT, not the default SIGTERM. `opendrop find` blocks forever and only
+  # writes its discovery report from a finally: block reached via KeyboardInterrupt.
+  # Python does not turn SIGTERM into KeyboardInterrupt, so plain `timeout` killed
+  # it outright and the report was NEVER written - which surfaces much later, and
+  # very confusingly, as "No discovery report exists, please run 'opendrop find'
+  # first" during send. SIGINT lets the finally: block run.
+  timeout -s INT $FIND_TIME "$OPENDROP" -i $AWDL find 2>&1 | tee "$OUT/find.log" | sed 's/^/  /'
 
   if ! grep -qE "^\s*[0-9]+\)|Found" "$OUT/find.log" 2>/dev/null; then
     echo ""
@@ -472,8 +478,22 @@ elif [ "$MODE" = "send" ]; then
     echo "  panel is showing. Leave it there and re-run."
     exit 1
   fi
-  echo "### layer 4: attempting to send $SENDFILE to receiver index 0"
-  "$OPENDROP" -i $AWDL send -r 0 -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
+  echo "### discovered receivers:"
+  grep -oP 'Found\s+index\s+\K.*' "$OUT/find.log" | sed 's/^/    index /'
+  echo ""
+  # WHICH PHONE? -r takes an index, a 12-char ID, or the device name. Index is
+  # positional and depends on which device answered mDNS first, so with several
+  # Apple devices in range - and "Everyone" makes every one of them a candidate -
+  # index 0 is a coin toss. Prefer the NAME:
+  #     RECEIVER="Jed's iPhone" ./airdrop.sh send photo.jpg
+  RECEIVER="${RECEIVER:-0}"
+  case "$RECEIVER" in
+    [0-9]*) echo "    sending to index $RECEIVER - set RECEIVER=\"<device name>\" to be sure" ;;
+    *)      echo "    sending to \"$RECEIVER\"" ;;
+  esac
+  echo ""
+  echo "### layer 4: sending $SENDFILE"
+  "$OPENDROP" -i $AWDL send -r "$RECEIVER" -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
 else
   echo ""
   echo "### discovery-only mode. Re-run with:"
