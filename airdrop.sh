@@ -706,7 +706,17 @@ if [ "$MODE" = "receive" ]; then
   sleep 1
   # opendrop extracts into its working directory, so run it from RECV_DIR
   mkdir -p "$RECV_DIR"
-  ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
+  # -d so the phone's own request headers land in the log. §31/§32: sending TO
+  # the phone is refused on its headers, and every guess about which header has
+  # been wrong. The receive direction works, so it is the one place we can read
+  # what an Apple sender actually puts on an /Upload rather than theorising. The
+  # extra verbosity is worth the ground truth.
+  ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
+  if grep -q "^Headers" "$OUT/receive.log" 2>/dev/null; then
+    echo ""
+    echo "### the phone's own request headers (ground truth for the send path)"
+    sed -n '/^POST request at/,/^$/p' "$OUT/receive.log" | sed 's/^/    /'
+  fi
   sudo pkill -x tcpdump 2>/dev/null || true
   sleep 1
   R_TOT=$(sudo tcpdump -r "$OUT/receive.pcap" 2>/dev/null | wc -l)

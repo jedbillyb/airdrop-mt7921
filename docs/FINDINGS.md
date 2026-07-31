@@ -2238,3 +2238,53 @@ If all four fail, the refusal is in a header we have not varied at all -
 `Connection: keep-alive`, `Accept-Encoding`, or `User-Agent: AirDrop/1.0` - and
 the next move is to capture what an Apple device puts in its own `/Upload`
 headers rather than guess again.
+
+---
+
+## §32 Framing is eliminated too. Stop guessing headers and go read Apple's.
+
+2026-07-31, 22:00. Round four, four arms, all valid - each re-sent `/Ask`, got a
+real Accept tap and a 200, and uploaded on that same connection.
+
+| arm | framing | container | result |
+|-----|---------|-----------|--------|
+| `reuse-length-gzip`  | `Content-Length: 168` | cpio + gzip | close_notify |
+| `reuse-length-dvzip` | `Content-Length: 160` | dvzip       | close_notify |
+| `reuse-length-plain` | `Content-Length: 243` | bare cpio   | close_notify |
+| `reuse-chunked-gzip` | chunked (control)     | cpio + gzip | close_notify |
+
+**The §31 Content-Length hypothesis is dead.** It was the best-evidenced guess
+of the night - on the same connection, `/Ask` with a Content-Length gets 200
+every time while `/Upload` with chunked is always refused - and it was still
+wrong. Content-Length changes nothing.
+
+What is now eliminated for `/Upload`, all on valid accepted sessions:
+
+- container: cpio+gzip, bare cpio, dvzip
+- framing: chunked, Content-Length
+- `Expect: 100-continue`, present and absent
+- connection: reused post-`/Ask` (and, invalidly, fresh)
+
+The refusal is on the request headers - §31's 70 microsecond close_notify is
+unambiguous about that - and it is in a header we have never varied:
+`Connection: keep-alive`, `Accept-Encoding: br, gzip, deflate`,
+`User-Agent: AirDrop/1.0`, or something absent entirely that Apple requires.
+
+### The move is to stop theorising
+
+Four hypotheses in a row have been plausible, well-motivated, and wrong. Two of
+them were motivated by what we had observed the phone do, which is the best kind
+of motivation available, and they were still wrong. The pattern says the answer
+is not reachable by reasoning from our end of the wire.
+
+We do not have to reason. **The receive direction works.** When the phone sends
+us a file it issues its own `/Upload`, and `do_POST()` already logs the complete
+request headers at debug level - we have simply never run receive with `-d`.
+
+`airdrop.sh receive` now passes `-d` and prints the phone's request headers at
+the end of the run. One receive, one file sent from the phone, and the exact
+header set an Apple sender uses is on screen. Then the send path copies it
+instead of guessing at it.
+
+That is the whole next step, and it costs one transfer in the direction that has
+worked since §15.
