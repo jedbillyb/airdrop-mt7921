@@ -1,0 +1,125 @@
+#!/bin/bash
+# The ONLY privileged entry point. Install root-owned and grant NOPASSWD on
+# exactly this path - never on iw/ip/tcpdump/owl directly.
+#
+#   sudo install -o root -g root -m 755 daemon/airdrop-helper /usr/local/bin/
+#   printf 'jed ALL=(root) NOPASSWD: /usr/local/bin/airdrop-helper\n' \
+#     | sudo tee /etc/sudoers.d/zz-airdrop >/dev/null
+#   sudo chmod 440 /etc/sudoers.d/zz-airdrop
+#
+# WHY A WRAPPER RATHER THAN AN ALLOWLIST OF COMMANDS: `sudo tcpdump -w <path>`
+# is an arbitrary-file-write-as-root primitive, so NOPASSWD on tcpdump is
+# indistinguishable from NOPASSWD on everything. `iw` and `ip` are nearly as
+# bad. This wrapper takes a fixed verb, accepts no free-form paths, and does a
+# closed set of things, so what is actually granted is what it can do.
+#
+# It exists because waybar has NO TTY: airdrop.sh's `sudo -v` simply hangs
+# there, and this box has NOPASSWD only for xbps-install, wg-quick,
+# fprintd-restart and poweroff/reboot. Same pattern as the existing
+# /etc/sudoers.d/zzz-swaylock-fp-restart entry.
+set -u
+
+PHY="${PHY:-phy0}"
+IFACE="${IFACE:-}"
+MON=mon0
+MONA=mon1
+MT76=/sys/kernel/debug/ieee80211/$PHY/mt76
+
+if [ "$(id -u)" != "0" ]; then
+  echo "airdrop-helper: must run as root (via sudo)" >&2
+  exit 1
+fi
+
+# Resolve the Wi-Fi interface here rather than trusting an argument. A caller
+# who could name the interface could name anything, which is most of the point
+# of not allowlisting `iw` in the first place.
+#
+# Must skip our own monitor vifs. They are mt7921-driven too and `mon0`/`mon1`
+# sort BEFORE `wlp2s0`, so a plain driver match picks a monitor vif whenever the
+# stack is up - and then `status` reports assoc=false, chan=null about an
+# interface that has no association to report, while the real link is fine.
+# airdrop.sh gets away with the naive loop only because it resolves the
+# interface before creating any vifs; this can be called at any time.
+if [ -z "$IFACE" ]; then
+  for d in /sys/class/net/*/device/driver; do
+    case "$(basename "$(readlink -f "$d")")" in
+      mt7921*)
+        cand=$(basename "$(dirname "$(dirname "$d")")")
+        [ "$(iw dev "$cand" info 2>/dev/null | awk '/^\ttype /{print $2}')" = "managed" ] \
+          || continue
+        IFACE=$cand; break ;;
+    esac
+  done
+fi
+
+usage() {
+  cat >&2 <<EOF
+usage: airdrop-helper <verb>
+
+  up            create the monitor pair, disable runtime PM, report the channel
+  down          remove the monitor vifs and restore runtime PM
+  status        print JSON: vifs present, channel, association state
+  ap-channel    print the channel the managed interface is associated on
+
+Never takes a path or a command. See the header for why.
+EOF
+  exit 2
+}
+
+ap_channel() {
+  iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
+}
+
+case "${1:-}" in
+  ap-channel)
+    ap_channel
+    ;;
+
+  up)
+    mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+    # THE PAIR (FINDINGS §14): a `flags active` vif alone is stuck at 5180
+    # forever, but one created alongside an already-present plain vif rides its
+    # channel at full reception and can ACK. Order matters; mon0 must exist
+    # first. Under KEEP_WIFI the managed vif owns the channel context, so
+    # neither monitor vif is tuned here at all - the retune would be EBUSY and
+    # the channel we want is the one the AP already holds (§38).
+    iw dev $MONA del 2>/dev/null
+    iw dev $MON del 2>/dev/null
+    iw phy "$PHY" interface add $MON type monitor || exit 1
+    ip link set $MON up || exit 1
+    echo 0 > "$MT76/runtime-pm" 2>/dev/null
+    echo 0 > "$MT76/deep-sleep" 2>/dev/null
+    if iw phy "$PHY" interface add $MONA type monitor flags active 2>/dev/null; then
+      ip link set $MONA up 2>/dev/null
+      echo 0 > "$MT76/runtime-pm" 2>/dev/null
+      echo 0 > "$MT76/deep-sleep" 2>/dev/null
+    fi
+    printf '{"iface":"%s","mon":"%s","active":%s,"chan":%s}\n' \
+      "$IFACE" "$MON" \
+      "$(ip link show $MONA >/dev/null 2>&1 && echo true || echo false)" \
+      "$(ap_channel || echo null)"
+    ;;
+
+  down)
+    ip link set $MONA down 2>/dev/null
+    iw dev $MONA del 2>/dev/null
+    ip link set $MON down 2>/dev/null
+    iw dev $MON del 2>/dev/null
+    echo 1 > "$MT76/runtime-pm" 2>/dev/null
+    echo 1 > "$MT76/deep-sleep" 2>/dev/null
+    # Deliberately does NOT touch $IFACE, NetworkManager or wpa_supplicant.
+    # Nothing here ever took them down, and bouncing a working association on
+    # the way out is the exact outage this design exists to avoid (§38).
+    echo '{"ok":true}'
+    ;;
+
+  status)
+    printf '{"mon":%s,"active":%s,"assoc":%s,"chan":%s}\n' \
+      "$(ip link show $MON  >/dev/null 2>&1 && echo true || echo false)" \
+      "$(ip link show $MONA >/dev/null 2>&1 && echo true || echo false)" \
+      "$(iw dev "$IFACE" link 2>/dev/null | grep -q '^Connected' && echo true || echo false)" \
+      "$(ap_channel || echo null)"
+    ;;
+
+  *) usage ;;
+esac

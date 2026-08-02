@@ -1,0 +1,68 @@
+--- a/opendrop/server.py
++++ b/opendrop/server.py
+@@ -267,11 +267,65 @@
+         self._set_response(len(discover_answer_binary))
+         self.wfile.write(discover_answer_binary)
+ 
++    # The confirmation hook. opendrop 0.13.0 accepts every /Ask
++    # unconditionally: it returns 200 with the machine name, with no prompt and
++    # no extension point. That is survivable for a harness a human launches for
++    # one transfer, and unacceptable for an always-on receiver, where it means
++    # anyone in range with AirDrop set to Everyone can write files to the
++    # machine unattended and unlogged.
++    #
++    # AIRDROP_CONFIRM names a program that is asked. Non-zero exit refuses the
++    # transfer with 403 and the phone shows "Declined". If the variable is
++    # unset, behaviour is unchanged from upstream, so the research harness and
++    # every existing FINDINGS run are unaffected.
++    #
++    # It fails CLOSED: if the hook cannot be run at all, the answer is no. An
++    # unaskable question is not consent, and this is the one place where
++    # guessing wrong hands a stranger a write primitive.
++    def _ask_user(self, post_data):
++        hook = os.environ.get("AIRDROP_CONFIRM")
++        if not hook:
++            return True
++        sender = "unknown sender"
++        detail = ""
++        try:
++            req = plistlib.loads(post_data)
++            sender = req.get("SenderComputerName") or req.get(
++                "SenderPseudonym") or sender
++            files = req.get("Files") or []
++            names = [f.get("FileName", "?") for f in files if isinstance(f, dict)]
++            if names:
++                detail = ", ".join(names[:3])
++                if len(names) > 3:
++                    detail += f" (+{len(names) - 3} more)"
++        except Exception:
++            # A malformed body is exactly when we least want to auto-accept,
++            # but it is also not a reason to crash - fall through and ask with
++            # whatever we managed to learn.
++            logger.warning("could not parse /Ask body; asking anyway")
++        try:
++            import subprocess
++            rc = subprocess.call([hook, str(sender), str(detail)])
++        except Exception as e:
++            logger.error("confirm hook %s failed to run (%s) - DECLINING", hook, e)
++            return False
++        if rc != 0:
++            logger.info("user declined transfer from %s", sender)
++            return False
++        logger.info("user accepted transfer from %s", sender)
++        return True
++
+     def handle_ask(self):
+         post_data = self._read_request_body()
+ 
+         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
+ 
++        if not self._ask_user(post_data):
++            self.send_response(403)
++            self.send_header("Content-Length", 0)
++            self.end_headers()
++            return
++
+         ask_response = {
+             "ReceiverModelName": self.config.computer_model,
+             "ReceiverComputerName": self.config.computer_name,

@@ -2635,3 +2635,66 @@ re-run without `KEEP_WIFI` so the sweep can distinguish "phone asleep" from
 
 **Unconditional fallback:** give AWDL its own radio (the AR9271). Two phys, no
 shared channel context, no condition to satisfy.
+
+## §39 On-demand AirDrop: the stack comes up in 0.19 s, so always-on is a BLE problem (2026-08-02)
+
+Investigating a waybar AirDrop module. Three measurements, no phone required.
+
+**1. Time to a working AWDL stack, measured:**
+
+| step | time |
+|---|---|
+| monitor pair created, PM off | 0.057 s |
+| OWL started to "Host device" | 0.117 s |
+| `awdl0` present and up | 0.015 s |
+| **total** | **0.190 s** |
+
+Every `sleep 2` / `sleep 4` in `airdrop.sh` is a conservative fixed delay, not a
+requirement. Its ~90 s time-to-advertising is almost entirely self-imposed.
+
+**2. BLE scanning works.** `btmon` + `btmgmt find -l` sees Apple Continuity
+adverts continuously (96 in 10 s), with RSSI, including devices at -40 dBm.
+
+**3. The BT controller survived layer 1 under `KEEP_WIFI`** — still `powered`
+after the monitor pair and the runtime-pm/deep-sleep writes. §36's "layer 1
+resets the shared BT controller" appears specific to the exclusive path where
+the managed interface goes down. Only `powered` was checked, not that a
+registered advertising instance survives.
+
+**So always-on AirDrop is not an AWDL problem, it is a BLE problem.** A Mac does
+not hold AWDL up either; it scans BLE and wakes AWDL on demand. Implemented as
+`daemon/airdropd`. This also dissolves the §38 dilemma: rather than choosing once
+between "no internet" and "locked to the AP's channel", the radio is committed
+only while a transfer is happening.
+
+### The security hole this exposed
+
+**`handle_ask` in opendrop 0.13.0 accepts unconditionally** — returns 200 with
+the machine name, no prompt, no extension point. Fine for a harness driven by
+hand; for an always-on receiver it means anyone in range with AirDrop set to
+Everyone can write files to the box unattended and unlogged.
+`patches/opendrop-ask-confirm.patch` adds a fail-closed hook. Six paths verified,
+including "hook unrunnable → decline" and "no Wayland session → decline". An
+unaskable question is not consent.
+
+### Gotchas paid for
+
+- **`stdbuf -oL btmon` is load-bearing.** Piped, btmon gets 4 KiB full buffering
+  from libc: **zero output over 20 s** into the parser, while the identical parse
+  of a captured file succeeded every time. Same fix airdrop.sh needs for OWL.
+- **Parse the manufacturer-data bytes, not btmon's labels** — it renders
+  unrecognised subtypes as `Type: Unknown (16)` and its label set is bluez-version
+  dependent.
+- **btmon shows outgoing commands too**, so a naive parser detects our own
+  `blewake.sh` type-0x05 advert and triggers against itself. A `<`/`>` direction
+  filter is required. Verified with the advert actually registered: 0 detections.
+- **Continuity type 1 is REAL** (`4c 00 01 00 …`, btmon "Identifier"), not a
+  parse artefact. Only type 0 padding needed suppressing.
+- **mt7921 interface autodetect must skip monitor vifs** — they are mt7921-driven
+  and `mon0` sorts before `wlp2s0`, so the naive loop picks a monitor vif whenever
+  the stack is up and then reports `assoc:false, chan:null` about the wrong
+  interface. airdrop.sh escapes it only by resolving before creating vifs.
+
+**NOT YET PROVEN: an end-to-end transfer through `airdropd`.** Needs a phone. The
+trigger has never seen a real iPhone share-sheet advert, only our own — which it
+is designed to ignore.

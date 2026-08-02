@@ -1,0 +1,73 @@
+#!/bin/bash
+# Ask the user whether to accept an incoming AirDrop transfer.
+#
+#   airdrop-confirm "<sender name>" "<what they are sending>"
+#
+# Exit 0 = accept, non-zero = decline. OpenDrop's handle_ask calls this via
+# patches/opendrop-ask-confirm.patch and refuses the transfer on non-zero.
+#
+# WHY THIS EXISTS: opendrop 0.13.0's `handle_ask` accepts unconditionally - it
+# returns 200 with the machine name and there is no prompt and no hook. That is
+# tolerable for a research harness you launch by hand for one transfer. It is
+# not tolerable for an always-on receiver, where it means anyone in range with
+# AirDrop set to Everyone can put files on the machine unattended and unlogged.
+# So the confirmation is a REQUIREMENT of the always-on design, not a nicety.
+#
+# swaynag, not notify-send: there is no notification daemon running on this box
+# (no mako, no dunst), so notify-send would return success having shown nobody
+# anything - the worst possible failure mode for a security prompt. swaynag is
+# part of sway itself, always present, draws its own surface, and blocks until
+# answered, which is exactly the semantics needed here.
+set -u
+
+SENDER="${1:-unknown sender}"
+DETAIL="${2:-}"
+# Refuse rather than accept if we cannot ask. A prompt that fails open is not a
+# prompt. This is the branch that runs if swaynag is missing, if there is no
+# Wayland display (a daemon started outside the session), or if the user's
+# session has gone away - and in every one of those cases there is nobody
+# present to consent, so the answer is no.
+TIMEOUT="${AIRDROP_CONFIRM_TIMEOUT:-45}"
+
+log() { printf '[airdrop-confirm] %s\n' "$*" >&2; }
+
+if ! command -v swaynag >/dev/null 2>&1; then
+  log "swaynag not found - DECLINING (cannot ask, so cannot consent)"
+  exit 1
+fi
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${SWAYSOCK:-}" ]; then
+  log "no Wayland session visible - DECLINING (nobody to ask)"
+  exit 1
+fi
+
+MSG="AirDrop: accept file from ${SENDER}?"
+[ -n "$DETAIL" ] && MSG="$MSG"$'\n'"$DETAIL"
+
+# swaynag has no built-in timeout and no exit code that distinguishes the
+# buttons, so both are built here: a marker file written by the Accept button,
+# and a watchdog that kills the prompt if nobody answers. Leaving an
+# unanswered prompt on screen forever would wedge the transfer AND the daemon.
+MARK=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/airdrop-accept.XXXXXX")
+rm -f "$MARK"
+
+swaynag \
+  --type warning \
+  --message "$MSG" \
+  --button-dismiss-no-terminal "Accept" "/bin/sh -c 'touch \"$MARK\"'" \
+  --button-dismiss-no-terminal "Decline" "/bin/true" \
+  >/dev/null 2>&1 &
+NAG=$!
+
+( sleep "$TIMEOUT"; kill "$NAG" 2>/dev/null ) &
+KILLER=$!
+
+wait "$NAG" 2>/dev/null
+kill "$KILLER" 2>/dev/null
+
+if [ -e "$MARK" ]; then
+  rm -f "$MARK"
+  log "accepted by user"
+  exit 0
+fi
+log "declined or timed out after ${TIMEOUT}s"
+exit 1

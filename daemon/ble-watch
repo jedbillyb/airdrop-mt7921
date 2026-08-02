@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Watch for Apple Continuity AirDrop BLE advertisements.
+
+This is the trigger for on-demand AirDrop (FINDINGS §39). A Mac does not hold
+AWDL up permanently; it scans BLE continuously - which costs nothing on the
+Wi-Fi side - and brings AWDL up only when an iPhone announces it wants to send
+something. Opening the share sheet on an iPhone starts exactly such an
+advertisement. This program detects it and prints one line per sighting, so a
+supervisor can bring the stack up in response (measured at 0.19 s, §39).
+
+Prints to stdout, one JSON object per line:
+
+    {"ts": 1754..., "addr": "45:2E:...", "rssi": -53, "type": 5, "kind": "airdrop"}
+
+Detection works on the raw manufacturer-data bytes, `ff 4c 00 <type>`:
+`ff` is the AD type for manufacturer-specific data, `4c 00` is Apple's company
+ID little-endian, and the byte after it is the Continuity message type. 0x05 is
+AirDrop - the same value tools/blewake.sh emits, which is what makes this
+self-testable without an iPhone (see --selftest in the README).
+
+Reading the BYTES rather than btmon's labels is deliberate. btmon renders
+unrecognised Continuity subtypes as "Type: Unknown (16)" and its label set
+varies with the bluez version, so a text match on "AirDrop" silently stops
+working on a different machine. The byte layout is fixed by Apple.
+
+Requires btmon (root) for the decode and an active scan to make devices
+advertise. bluez owns the controller, so raw HCI is not available to us - the
+same wall tools/blewake.sh documents - hence btmgmt/btmon rather than hcitool.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+APPLE_COMPANY_ID = 0x004C
+CONTINUITY_AIRDROP = 0x05
+
+# btmon indents hex dumps; the payload lines are pure hex pairs plus an ASCII
+# gutter. Match only the hex, and only when it is indented, so a stray line of
+# prose containing hex-looking words cannot be mistaken for advert bytes.
+HEX_LINE = re.compile(r"^\s+((?:[0-9a-f]{2} )+)\s*")
+RSSI_LINE = re.compile(r"RSSI:\s*(-?\d+)")
+ADDR_LINE = re.compile(r"Address:\s*([0-9A-F:]{17})")
+
+# btmon is a full HCI trace: it shows what we SEND as well as what we receive.
+# `> ` prefixes events coming from the controller, `< ` commands going to it.
+# Without this distinction our own outgoing advertisement - tools/blewake.sh
+# emits the very same type 0x05 - would be parsed as an incoming sighting and
+# trigger the stack against ourselves. It would also make the self-test pass
+# for entirely the wrong reason.
+DIRECTION = re.compile(r"^([<>])\s")
+# Only these carry advertisements from other devices.
+ADV_REPORT = re.compile(r"(LE Advertising Report|LE Extended Advertising Report)")
+
+
+def find_continuity_types(payload: bytes):
+    """Yield Continuity message types present in an advert payload.
+
+    An advert is a sequence of length-prefixed AD structures:
+        <len> <ad_type> <len-1 bytes of data>
+    We walk that structure rather than searching for `ff 4c 00` anywhere in the
+    buffer, because a naive substring search matches those bytes appearing by
+    chance inside some other field's payload - and at 96 Apple adverts per 10
+    seconds, "rare" coincidences show up within the hour.
+    """
+    n = len(payload)
+    # Anchor on the manufacturer-data header rather than walking from offset 0.
+    # We accumulate several btmon hex-dump lines per report and cannot be sure
+    # the buffer begins exactly on an AD-structure boundary; walking blindly
+    # from 0 then misaligns and invents TLVs, which is where the phantom type 1
+    # alongside every real type 16 came from.
+    #
+    # The anchor is validated, not merely located: the byte BEFORE `ff` must be
+    # the AD length, and the region it declares must fit inside the buffer. A
+    # chance occurrence of `ff 4c 00` inside some other field is very unlikely
+    # to be preceded by a length that also checks out.
+    for i in range(1, n - 3):
+        if payload[i] != 0xFF:
+            continue
+        length = payload[i - 1]
+        if length < 3 or i + length > n:
+            continue
+        data = payload[i + 1 : i - 1 + 1 + length]
+        if len(data) >= 3:
+            company = data[0] | (data[1] << 8)
+            if company == APPLE_COMPANY_ID:
+                # Continuity packs one or more TLVs after the company ID.
+                # Both guards below are load-bearing: without them the walk
+                # runs past the real TLVs into the advert's zero padding and
+                # reports a phantom type 0 after every genuine message. That
+                # matters here beyond tidiness, because this drives an
+                # automatic trigger - one padding byte reading 0x05 would
+                # bring the whole Wi-Fi stack up against a device that never
+                # asked for anything.
+                #
+                # Type 1 is NOT a phantom, though it looks like one: it
+                # arrives alongside almost every type 16 and it is real. The
+                # advert is literally `4c 00 01 00 00 ...` - type 0x01 with
+                # length 0 - which btmon renders as "Identifier". Verified
+                # against the raw bytes; do not "fix" it.
+                j = 2
+                while j + 1 < len(data):
+                    msg_type = data[j]
+                    msg_len = data[j + 1]
+                    if msg_type == 0x00:
+                        break                      # padding, not a TLV
+                    if j + 2 + msg_len > len(data):
+                        break                      # truncated: length lies
+                    yield msg_type
+                    j += 2 + msg_len
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--type", type=lambda s: int(s, 0), default=CONTINUITY_AIRDROP,
+                    help="Continuity message type to report (default 0x05 AirDrop)")
+    ap.add_argument("--any-apple", action="store_true",
+                    help="report every Apple Continuity advert, whatever the type")
+    ap.add_argument("--min-rssi", type=int, default=-90,
+                    help="ignore sightings weaker than this (default -90). An "
+                         "AirDrop transfer needs the phone within a few metres, "
+                         "so a very weak advert is someone else's device.")
+    ap.add_argument("--cooldown", type=float, default=10.0,
+                    help="seconds to suppress repeat sightings of the same "
+                         "address (default 10). Phones re-advertise several "
+                         "times a second; without this a single share-sheet "
+                         "opening would fire the trigger dozens of times.")
+    ap.add_argument("--once", action="store_true",
+                    help="exit after the first matching sighting")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        print("ble-watch: must run as root (btmon needs it)", file=sys.stderr)
+        return 1
+
+    # btmon shows what reaches the controller; btmgmt find drives an ACTIVE
+    # scan. Passive alone sees far less - many devices only answer a scan
+    # request - so both are needed and the scanner is restarted as it expires.
+    # stdbuf -oL is load-bearing, not hygiene. btmon's stdout is a pipe here,
+    # not a tty, so libc gives it 4 KiB FULL buffering and nothing reaches us
+    # until that fills - which on a quiet channel can be far longer than the
+    # trigger is useful for. Measured: piping btmon straight into this parser
+    # produced ZERO output over 20 s while the identical parse of a captured
+    # file found adverts on every run. airdrop.sh needs the same treatment for
+    # OWL, for the same reason.
+    btmon = subprocess.Popen(
+        ["stdbuf", "-oL", "btmon"], stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+
+    scanner = None
+
+    def stop(*_):
+        for p in (btmon, scanner):
+            if p and p.poll() is None:
+                p.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    last_seen = {}
+    addr = None
+    rssi = None
+    buf = bytearray()
+    next_scan = 0.0
+    incoming = False        # are we inside a `> ` block?
+    in_adv_report = False   # ...and is that block an advertising report?
+
+    try:
+        for line in btmon.stdout:
+            now = time.time()
+
+            # Keep the active scan alive first, unconditionally. btmgmt find
+            # expires, and if this lived further down it could only run while
+            # adverts were already arriving - which is precisely when it is not
+            # needed, and never when the scan has lapsed and they have stopped.
+            if now >= next_scan:
+                if scanner and scanner.poll() is None:
+                    scanner.terminate()
+                scanner = subprocess.Popen(
+                    ["btmgmt", "find", "-l"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL)
+                next_scan = now + 8.0
+
+            m = DIRECTION.match(line)
+            if m:
+                # A new top-level HCI record. Anything accumulated belonged to
+                # the previous one and must not leak across the boundary.
+                incoming = m.group(1) == ">"
+                in_adv_report = False
+                addr = None
+                rssi = None
+                buf = bytearray()
+                continue
+            if incoming and not in_adv_report:
+                # The record type is named on the line AFTER the `> ` header
+                # ("> HCI Event: LE Meta Event" then "LE Extended Advertising
+                # Report"), so this cannot be decided from the header alone.
+                if ADV_REPORT.search(line):
+                    in_adv_report = True
+                continue
+            if not in_adv_report:
+                # Our own advertisement, scan commands, and everything else we
+                # tell the controller to do lands here and is ignored.
+                continue
+
+            m = ADDR_LINE.search(line)
+            if m:
+                # A new report starts: flush whatever we accumulated for the
+                # previous one before reusing the buffer.
+                addr = m.group(1)
+                rssi = None
+                buf = bytearray()
+                continue
+            m = RSSI_LINE.search(line)
+            if m:
+                rssi = int(m.group(1))
+                continue
+            m = HEX_LINE.match(line)
+            if m:
+                try:
+                    buf.extend(bytes.fromhex(m.group(1).replace(" ", "")))
+                except ValueError:
+                    pass
+                if not buf:
+                    continue
+                for msg_type in find_continuity_types(bytes(buf)):
+                    if not args.any_apple and msg_type != args.type:
+                        continue
+                    if rssi is not None and rssi < args.min_rssi:
+                        continue
+                    key = (addr, msg_type)
+                    if now - last_seen.get(key, 0) < args.cooldown:
+                        continue
+                    last_seen[key] = now
+                    print(json.dumps({
+                        "ts": round(now, 3),
+                        "addr": addr,
+                        "rssi": rssi,
+                        "type": msg_type,
+                        "kind": "airdrop" if msg_type == CONTINUITY_AIRDROP else "apple",
+                    }), flush=True)
+                    if args.once:
+                        stop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

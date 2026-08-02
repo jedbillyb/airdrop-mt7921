@@ -1,0 +1,194 @@
+#!/bin/bash
+# On-demand AirDrop receiver: idle on Bluetooth, wake on an iPhone's share sheet.
+#
+#   airdropd run        # foreground; this is what a waybar toggle starts
+#   airdropd status     # one line of JSON for waybar
+#   airdropd stop       # ask a running instance to exit
+#
+# THE MODEL (FINDINGS §39). A Mac does not hold AWDL up permanently either. It
+# scans BLE continuously - which costs nothing on the Wi-Fi side - and brings
+# AWDL up only when an iPhone announces, by opening its share sheet, that it
+# wants to send something. We can do the same: the stack measures 0.19 s to
+# come up, so there is no reason to hold the radio hostage between transfers.
+#
+# That also sidesteps the §38 dilemma. Rather than choosing once between "no
+# internet" and "locked to the AP's channel", the choice is made per transfer,
+# and the radio is only committed while something is actually happening.
+#
+# Layers reused from airdrop.sh; this file is orchestration only. airdrop.sh
+# stays the research harness and is not imported, because its value is its
+# commentary and its willingness to be slow and thorough - the opposite of
+# what a bar toggle wants.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+
+HELPER="${AIRDROP_HELPER:-/usr/local/bin/airdrop-helper}"
+[ -x "$HELPER" ] || HELPER="$HERE/airdrop-helper"
+BLE_WATCH="$HERE/ble-watch"
+CONFIRM="${AIRDROP_CONFIRM:-$HERE/airdrop-confirm}"
+OWL_DIR="${OWL_DIR:-$HOME/owl}"
+OWL="${OWL:-$OWL_DIR/build/daemon/owl}"
+OPENDROP="${OPENDROP:-$OWL_DIR/.venv-opendrop/bin/opendrop}"
+RECV_DIR="${RECV_DIR:-$HOME/Downloads}"
+
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/airdropd"
+STATE="$RUNDIR/state.json"
+LOCK="$RUNDIR/lock"
+LOG="$RUNDIR/airdropd.log"
+mkdir -p "$RUNDIR"
+
+# How long to keep the stack up after a trigger with nothing arriving. The
+# phone's share sheet stays open while the user picks a target, and mDNS over
+# AWDL is slow (co-channel only a fraction of the time), so this cannot be
+# tight. It is also the worst case for how long the radio is committed.
+WINDOW="${AIRDROP_WINDOW:-90}"
+# Ignore adverts weaker than this. An AirDrop transfer happens at arm's length;
+# a faint advert is a stranger's phone in the next room and waking the radio for
+# it is pure cost.
+MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
+
+# State is written for waybar to read. Keep it a single line and always
+# rewrite atomically: waybar polls on its own schedule and a half-written file
+# is a parse error on the bar.
+set_state() {
+  local st="$1" detail="${2:-}"
+  printf '{"state":"%s","detail":"%s","ts":%s}\n' "$st" "$detail" "$(date +%s)" \
+    > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+teardown() {
+  [ -n "${OWL_PID:-}" ] && kill "$OWL_PID" 2>/dev/null
+  [ -n "${OD_PID:-}" ] && kill "$OD_PID" 2>/dev/null
+  sudo -n "$HELPER" down >/dev/null 2>&1
+  log "stack down"
+}
+
+cleanup() {
+  teardown
+  [ -n "${BLE_PID:-}" ] && kill "$BLE_PID" 2>/dev/null
+  set_state off
+  log "airdropd exiting"
+}
+
+# One transfer window: bring the stack up, advertise, wait, tear down.
+# Everything here is bounded - a bar toggle that can wedge is worse than one
+# that occasionally misses a transfer.
+serve_window() {
+  local trigger="$1"
+  log "trigger from $trigger - bringing stack up"
+  set_state waking "$trigger"
+
+  local up
+  if ! up=$(sudo -n "$HELPER" up 2>&1); then
+    log "helper up FAILED: $up"
+    set_state error "no privilege - see README (sudoers)"
+    return 1
+  fi
+  local chan
+  chan=$(printf '%s' "$up" | grep -oP '"chan":\K[0-9]+')
+  log "stack up on ch ${chan:-?}"
+
+  "$OWL" -i mon1 -c "${chan:-36}" -N -S verbatim -vv >> "$LOG" 2>&1 &
+  OWL_PID=$!
+  # awdl0 appears within ~0.02 s in practice; allow far more and fail fast
+  # rather than assuming.
+  local i
+  for i in $(seq 50); do
+    ip link show awdl0 >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if ! ip link show awdl0 >/dev/null 2>&1; then
+    log "awdl0 never appeared"
+    set_state error "awdl0 failed"
+    teardown
+    return 1
+  fi
+  sudo -n ip link set awdl0 up 2>/dev/null
+
+  set_state armed "ch ${chan:-?}"
+  log "advertising for ${WINDOW}s"
+  mkdir -p "$RECV_DIR"
+  # AIRDROP_CONFIRM is what makes the patched handle_ask prompt. Without it
+  # opendrop accepts silently, which is precisely what must not happen when
+  # this is running unattended.
+  ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" \
+      timeout "$WINDOW" "$OPENDROP" -i awdl0 receive ) >> "$LOG" 2>&1 &
+  OD_PID=$!
+  wait "$OD_PID" 2>/dev/null
+  OD_PID=""
+
+  teardown
+  set_state idle
+  return 0
+}
+
+cmd_run() {
+  # Single instance. Without this a second toggle deletes the first's mon0
+  # mid-transfer, which presents as a mysterious mid-file failure.
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    echo "airdropd: already running" >&2
+    exit 1
+  fi
+  echo $$ >&9
+
+  for p in "$HELPER" "$BLE_WATCH" "$CONFIRM" "$OWL" "$OPENDROP"; do
+    [ -x "$p" ] || { echo "airdropd: missing or not executable: $p" >&2; exit 1; }
+  done
+  if ! sudo -n "$HELPER" status >/dev/null 2>&1; then
+    echo "airdropd: cannot run $HELPER without a password." >&2
+    echo "  waybar has no tty, so this must be passwordless. See daemon/README.md." >&2
+    exit 1
+  fi
+
+  trap 'cleanup; exit 0' INT TERM
+  trap cleanup EXIT
+
+  : > "$LOG"
+  set_state idle
+  log "airdropd started; watching BLE for AirDrop adverts (min rssi $MIN_RSSI)"
+
+  # ble-watch needs root for btmon. It is long-lived and its output drives the
+  # loop, so it is the one thing started under sudo up front rather than per
+  # transfer.
+  #
+  # Via a FIFO rather than a process substitution so we hold a real PID to kill
+  # on the way out. Bash does not set $! for `< <(...)`, and an unkillable
+  # ble-watch means an orphaned btmon plus a btmgmt scanner running forever
+  # after the toggle is switched off.
+  FIFO="$RUNDIR/ble.fifo"
+  rm -f "$FIFO"; mkfifo "$FIFO"
+  sudo -n "$BLE_WATCH" --min-rssi "$MIN_RSSI" --cooldown 30 2>>"$LOG" > "$FIFO" &
+  BLE_PID=$!
+
+  local line addr rssi
+  while IFS= read -r line; do
+    addr=$(printf '%s' "$line" | grep -oP '"addr": "\K[^"]+')
+    rssi=$(printf '%s' "$line" | grep -oP '"rssi": \K-?[0-9]+')
+    serve_window "${addr:-?} (${rssi:-?} dBm)"
+  done < "$FIFO"
+}
+
+cmd_status() {
+  if [ -r "$STATE" ]; then cat "$STATE"; else echo '{"state":"off"}'; fi
+}
+
+cmd_stop() {
+  if [ -r "$LOCK" ]; then
+    local pid; pid=$(cat "$LOCK" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null && { echo "stopped"; return 0; }
+  fi
+  echo "not running" >&2
+  return 1
+}
+
+case "${1:-run}" in
+  run)    cmd_run ;;
+  status) cmd_status ;;
+  stop)   cmd_stop ;;
+  *) echo "usage: airdropd [run|status|stop]" >&2; exit 2 ;;
+esac
