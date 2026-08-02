@@ -2818,3 +2818,66 @@ discovery and not the payload.
 
 There is no fourth option that is only configuration on our side. Upstream OWL's
 "you need a specific adapter" requirement is a symptom of exactly this.
+
+## §42 Making the mt7921 do both — what the driver work actually is (2026-08-02)
+
+Constraint: one chip, no router config, no second radio. So it is kernel work.
+Scoped by inspection of the shipped modules (decompressed with Python 3.14's
+`compression.zstd`, since `zstd(1)` is not installed here).
+
+**The good news — this chip does REAL multi-channel, not emulated:**
+
+- `mt7921-common.ko` links `mt792x_assign_vif_chanctx` / `mt792x_unassign_vif_chanctx`.
+- `mt76.ko` exports the full set: `mt76_{add,remove,change}_chanctx`,
+  `mt76_{assign,unassign,switch}_vif_chanctx`.
+- **No `ieee80211_emulate_*` symbols anywhere**, so mac80211 is not faking
+  contexts for this driver.
+
+**The blocker, precisely:**
+
+```
+#{managed,P2P-client} <= 2, #{P2P-GO} <= 1, #{P2P-device} <= 1, total <= 3, #channels <= 2
+#{managed,P2P-client} <= 2, #{AP}     <= 1, #{P2P-device} <= 1, total <= 3, #channels <= 1
+```
+
+Two channels are permitted **only in the P2P-GO combination**, and **monitor
+appears in no combination at all**. Measured consequences, all with the managed
+vif associated:
+
+| attempt | result |
+|---|---|
+| `__ap` vif + `set freq 5745` | created, **no channel** (claims a ctx only once it beacons) |
+| `__p2pgo` vif + `set freq 5745` | created, **no channel**, same reason |
+| monitor `set freq 5745`, either present | **EBUSY (-16)** |
+
+So the EBUSY is `ieee80211_set_monitor_channel()` refusing whenever a non-monitor
+vif is up, *and* cfg80211 would reject the combination regardless.
+
+### The patch is therefore two parts
+
+1. **mt76**: add `monitor` to the interface-combination limits that carry
+   `num_different_channels = 2`.
+2. **mac80211**: relax `ieee80211_set_monitor_channel()` so a monitor vif may take
+   its own chanctx when the advertised combinations allow it, instead of
+   returning EBUSY on `open_count != monitors`.
+
+### Do this experiment FIRST — it is much cheaper and can invalidate the whole plan
+
+The `#channels <= 2` claim is made for **managed + P2P-GO**. The firmware
+implements MCC for that case; nothing says monitor is wired into its channel
+scheduler. If it is not, the patch will create a chanctx the firmware quietly
+ignores — which is *precisely* this chip's signature failure mode (accepts the
+call, logs no error, does not work: §"three mt7921 bugs, all silent").
+
+**So prove MCC works at all before patching:** get a P2P-GO beaconing on 149
+while associated on 36, and confirm with radiotap that both channels are really
+serviced. Needs a P2P-capable `wpa_supplicant` (this box's has no
+`p2p_group_add`) or `hostapd` (not installed).
+
+### Build prerequisites on this box
+
+- Only `linux6.18-headers` is installed; the `linux6.18` source package exists
+  but is not. Headers alone are not enough to rebuild mac80211.
+- `flex` and `bison` are **missing**; `gcc` and `make` are present.
+- mac80211 and mt76 are both modules, so an out-of-tree rebuild of just those
+  two is viable and avoids rebuilding the whole kernel.
