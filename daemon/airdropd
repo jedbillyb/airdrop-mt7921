@@ -24,9 +24,14 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
+# Prefer the root-owned installed copies. The in-repo fallbacks exist so the
+# daemon can be exercised from a checkout, but they must NEVER be the paths in
+# sudoers: this tree is writable by the invoking user, and NOPASSWD on a script
+# the user can edit is a straight escalation to root. See daemon/README.md.
 HELPER="${AIRDROP_HELPER:-/usr/local/bin/airdrop-helper}"
 [ -x "$HELPER" ] || HELPER="$HERE/airdrop-helper"
-BLE_WATCH="$HERE/ble-watch"
+BLE_WATCH="${AIRDROP_BLE_WATCH:-/usr/local/bin/airdrop-ble-watch}"
+[ -x "$BLE_WATCH" ] || BLE_WATCH="$HERE/ble-watch"
 CONFIRM="${AIRDROP_CONFIRM:-$HERE/airdrop-confirm}"
 OWL_DIR="${OWL_DIR:-$HOME/owl}"
 OWL="${OWL:-$OWL_DIR/build/daemon/owl}"

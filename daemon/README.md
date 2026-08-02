@@ -57,11 +57,21 @@ Two things need root. Everything else runs as you.
 NOPASSWD on `tcpdump` is indistinguishable from NOPASSWD on everything. `iw` and
 `ip` are nearly as bad. The wrapper takes a fixed verb and accepts no paths.
 
+Both privileged programs must be installed **root-owned, outside the repo**:
+
 ```sh
 sudo install -o root -g root -m 755 daemon/airdrop-helper /usr/local/bin/airdrop-helper
+sudo install -o root -g root -m 755 daemon/ble-watch     /usr/local/bin/airdrop-ble-watch
 ```
 
-**2. Passwordless sudo for it.** Required because **waybar has no tty** — a
+**Never point the sudoers rule at the copies in this repo.** The repo lives
+under your home / `/mnt/shared/projects` and is writable by you, and NOPASSWD on
+a script you can edit is a straight privilege escalation to root — anyone who
+can write the file, or any process running as you, gains root by rewriting it.
+The whole point of a narrow wrapper is lost if the wrapper is user-writable.
+Re-run the two `install` commands after `git pull` to pick up changes.
+
+**2. Passwordless sudo for them.** Required because **waybar has no tty** — a
 `sudo` that wants a password simply hangs there. Same pattern as the existing
 `/etc/sudoers.d/zzz-swaylock-fp-restart` on this box.
 
@@ -70,8 +80,10 @@ out of `sudo` entirely, so never write one without `visudo -c` first:
 
 ```sh
 TMP=$(mktemp)
-printf 'jed ALL=(root) NOPASSWD: /usr/local/bin/airdrop-helper\n' > "$TMP"
-printf 'jed ALL=(root) NOPASSWD: %s/daemon/ble-watch\n' "$PWD" >> "$TMP"
+cat > "$TMP" <<'RULES'
+jed ALL=(root) NOPASSWD: /usr/local/bin/airdrop-helper
+jed ALL=(root) NOPASSWD: /usr/local/bin/airdrop-ble-watch
+RULES
 sudo visudo -cf "$TMP" && sudo install -o root -g root -m 440 "$TMP" /etc/sudoers.d/zz-airdrop
 rm -f "$TMP"
 sudo visudo -c        # confirm the whole config is still valid
