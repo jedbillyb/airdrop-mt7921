@@ -2572,3 +2572,66 @@ it accepted.
 Laptop -> iPhone AirDrop over an MT7921 is now end-to-end complete:
 link-layer sync (OWL) -> IPv6 over awdl0 -> BLE wake -> /Discover -> /Ask ->
 /Upload 200.
+
+## §38 Wi-Fi and AirDrop at the same time: coexistence is free, the channel is not (2026-08-02)
+
+**Question:** must `airdrop.sh` take the card exclusively, or can the machine stay
+on Wi-Fi while AWDL runs?
+
+**Measured, against a live association** (`2142-WiFi`, ch36/5180, mt7921):
+
+| step | result |
+|---|---|
+| `iw phy phy0 interface add mon0 type monitor` with `wlp2s0` UP and associated | **OK** |
+| managed link after adding mon0 | Connected, -67 dBm, `ping 1.1.1.1` **0% loss** |
+| `iw phy phy0 interface add mon1 type monitor flags active` alongside | **OK**, link still up |
+| `echo 0 > mt76/runtime-pm`, `deep-sleep` | link unaffected, 3/3 ping |
+| `iw dev mon0 set freq 5745` | **EBUSY (-16), REJECTED** |
+| radiotap ground truth on mon0 | 19/20 frames at **5180** = the AP's frequency |
+
+So the `ip link set $IFACE down` at layer 1 was **never about interface
+coexistence**. mac80211 creates the monitor vifs happily alongside an associated
+managed vif - note that `iw phy phy0 info` lists **no monitor entry at all** in
+its interface combinations (`managed/P2P` only, `#channels <= 2`), because
+monitor vifs are not counted against them. The teardown was only ever about
+freeing the *channel*.
+
+**The real constraint: the monitor vif has no channel context of its own and is
+locked to the AP's.** Note this is a *rejected* retune, not the silent-ignore of
+§24 where mon1's retunes were accepted and dropped on the floor - here the
+kernel says EBUSY out loud.
+
+**Why that is survivable:** §24 already established that OWL's channel hopping
+was fiction in every working transfer. mon0 owned the channel context, mon1's
+retunes were accepted and ignored, and all four bisect builds transmitted on 149
+to a phone on 149. The radio has always been effectively pinned to one channel;
+KEEP_WIFI only changes *who picks it*. And `set_channel()` is async with errors
+deliberately unreported (`daemon/netutils.h:53`), so OWL swallows the EBUSY.
+
+**Therefore the condition is: the AP must sit on a channel the phone's AWDL
+sequence uses.** Not hypothetical - the §"PIN channel-picker" capture had the
+phone advertising `36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36`, ch36 dominant at
+**6/16 slots**, and this AP is on ch36. `KEEP_WIFI=1` refuses outright if the AP
+is on a non-social channel, because every downstream symptom would look like
+anything but the real cause.
+
+**Implemented as `KEEP_WIFI=1`.** It leaves NetworkManager, wpa_supplicant and
+the regulatory domain alone, borrows the AP's channel, skips the sweep (which is
+impossible, not merely unwise - it works by retuning), replaces it with a single
+dwell on the AP's channel, and - importantly - does **not** bounce the interface
+during restore. Verified end to end with a concurrent `ping`: **13/13 replies, 0%
+loss across a full run**, association held, no leftover vifs afterwards.
+
+**STILL UNPROVEN: that a transfer completes in this mode.** Coexistence is
+measured; the transfer is not. It needs a phone and a share sheet:
+
+```sh
+KEEP_WIFI=1 ACTIVE=1 ./airdrop.sh receive
+```
+
+**VOID CONDITION:** if the layer-0 dwell reports 0 frames the run says nothing -
+re-run without `KEEP_WIFI` so the sweep can distinguish "phone asleep" from
+"phone on another channel".
+
+**Unconditional fallback:** give AWDL its own radio (the AR9271). Two phys, no
+shared channel context, no condition to satisfy.

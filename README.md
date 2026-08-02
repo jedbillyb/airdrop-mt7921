@@ -215,10 +215,36 @@ once contradicted by their own logs.
 
 ## Safety
 
-`airdrop.sh` takes the Wi-Fi card exclusively - **you have no internet while it
-runs**. It restores NetworkManager on exit via a bash trap *and* a
+By default `airdrop.sh` takes the Wi-Fi card exclusively - **you have no internet
+while it runs**. It restores NetworkManager on exit via a bash trap *and* a
 `setsid`-detached watchdog, so networking comes back even if the script is
 `kill -9`ed or hangs. Init system is detected (runit or systemd).
+
+### Keeping your internet: `KEEP_WIFI=1`
+
+```sh
+KEEP_WIFI=1 ACTIVE=1 ./airdrop.sh receive
+```
+
+The monitor vifs coexist with an associated managed vif perfectly well - that
+was measured, with a concurrent ping at 0% loss across a full run (FINDINGS
+§38). The exclusive-card rule was never about the interfaces; it was about the
+channel.
+
+The catch is that the monitor vif then gets **no channel of its own** and is
+locked to whatever channel your AP is on (`iw dev mon0 set freq` returns EBUSY).
+So this mode only works when **your AP happens to be parked on a channel the
+phone's AWDL sequence uses** - 36, 44, 149 or 6. It refuses up front if your AP
+is somewhere else, rather than failing later in a way that looks like a dozen
+other problems.
+
+That is less alarming than it sounds: OWL's channel hopping was already fiction
+in every working transfer (§24), so the radio has always been effectively pinned
+to one channel. `KEEP_WIFI` only changes who chooses it.
+
+**Not yet proven to complete a transfer** - only to coexist. If you want Wi-Fi
+and AirDrop simultaneously with no conditions attached, give AWDL its own radio
+(an AR9271 on USB): two phys, no shared channel context.
 
 ## Two mt7921 driver bugs you will hit
 

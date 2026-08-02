@@ -6,6 +6,8 @@
 #   ./airdrop.sh receive         # advertise this box as an AirDrop target
 #   ./airdrop.sh send <file>     # discover, then try to send <file>
 #
+#   KEEP_WIFI=1 ACTIVE=1 ./airdrop.sh receive   # keep the internet up (§38)
+#
 # Layers, and where each one comes from:
 #   1. AWDL link sync          - OWL on a dedicated mon0 vif with PM off
 #   2. awdl0 + IPv6 link-local - OWL creates this automatically
@@ -32,7 +34,9 @@
 # Throughput is ~40-45 kB/s: each AWDL availability window delivers ~22-25 kB and
 # we get ~1.8 of them a second. Not TCP, not the PHY - see docs/FINDINGS.md §18.
 #
-# NOTE: this takes the Wi-Fi card exclusively - no internet while it runs.
+# NOTE: by default this takes the Wi-Fi card exclusively - no internet while it
+# runs. KEEP_WIFI=1 stays associated instead, at the cost of being locked to the
+# AP's channel; see the KEEP_WIFI block below and FINDINGS §38.
 #
 # SAFETY: bash trap + setsid-detached watchdog restores networking even on
 # kill -9 or hang.
@@ -61,6 +65,60 @@ PHY=$(basename "$(readlink -f "/sys/class/net/$IFACE/phy80211")" 2>/dev/null)
 MON=mon0              # plain vif: owns and steers the channel
 MONA=mon1             # active vif (ACTIVE=1 only): ACKs, rides mon0's channel
 AWDL=awdl0
+
+# ---------- KEEP_WIFI: run AirDrop without giving up the internet ----------
+# FINDINGS §38 (2026-08-02). Measured on a live association: adding mon0, and a
+# second `flags active` vif alongside it, does NOT disturb an associated managed
+# vif. Link stayed up, ping stayed at 0% loss, both vifs came up clean. So the
+# `ip link set $IFACE down` in the normal path was never about coexistence.
+#
+# What it WAS about is the channel. With the managed vif associated, the monitor
+# vif gets no channel context of its own and `iw dev mon0 set freq` is refused
+# with EBUSY (-16) - REJECTED, not silently ignored the way mon1's retunes are
+# when mon0 owns the context. Radiotap confirms it: every frame arrives on the
+# AP's frequency. So in this mode we do not choose the channel, the AP does.
+#
+# That is survivable only because §24 established OWL's hopping was already
+# fiction - in every working transfer mon1's retunes were accepted and ignored
+# and all four bisect builds transmitted on one channel to a phone on the same
+# one. set_channel() is async and deliberately does not report errors
+# (daemon/netutils.h:53), so OWL swallows the EBUSY and runs on regardless.
+#
+# The condition is therefore: the AP must be parked on a channel the phone's
+# AWDL sequence actually uses. Refuse loudly if it is not, because everything
+# downstream would fail for a reason that looks like anything but this.
+#
+#   KEEP_WIFI=1 ACTIVE=1 ./airdrop.sh receive
+#
+# UNPROVEN as of 2026-08-02: that a transfer completes in this configuration.
+# Coexistence is measured; the transfer is not. This flag exists to test it.
+KEEP_WIFI="${KEEP_WIFI:-0}"
+if [ "$KEEP_WIFI" = "1" ]; then
+  AP_CHAN=$(iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+')
+  if [ -z "${AP_CHAN:-}" ]; then
+    echo "REFUSING: KEEP_WIFI=1 but $IFACE is not associated - it has no channel"
+    echo "  to borrow. Connect to Wi-Fi first, or drop KEEP_WIFI and let the"
+    echo "  script take the card exclusively."
+    exit 1
+  fi
+  case "$AP_CHAN" in
+    6|36|44|132|149) ;;
+    *)
+      echo "REFUSING: your AP is on channel $AP_CHAN, which is not an AWDL social"
+      echo "  channel (6, 36, 44, 132, 149). With KEEP_WIFI=1 the monitor vif is"
+      echo "  locked to the AP's channel - the retune is EBUSY - so there is no"
+      echo "  way to reach the phone from here. Options:"
+      echo "    - move the AP to 36, 44, 149 or 6"
+      echo "    - drop KEEP_WIFI and let the script take the card (default)"
+      echo "    - give AWDL its own radio (the AR9271: IFACE=... PHY=...)"
+      exit 1 ;;
+  esac
+  if [ -n "${CHAN:-}" ] && [ "$CHAN" != "$AP_CHAN" ]; then
+    echo "note: CHAN=$CHAN ignored - KEEP_WIFI=1 borrows the AP's channel"
+    echo "      ($AP_CHAN) and cannot retune away from it."
+  fi
+  CHAN="$AP_CHAN"
+fi
 # Channel. Default 36: an iPhone was observed on 2026-07-30 advertising
 # 36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36 - six slots on 36 against two on
 # 149, so 149 is its MINORITY channel and sitting there misses most of its
@@ -70,6 +128,10 @@ AWDL=awdl0
 # sweep ranks channels by raw frame count, which is NOT the same as where the
 # peer spends its slots, and it has picked the phone's worst channel more than
 # once (ch6 at 1 slot of 16 over ch36 at 6 -- see FINDINGS §22).
+# KEEP_WIFI pins it just as firmly, only the AP does the naming rather than the
+# operator, and the sweep is not merely unwise there but impossible: it works by
+# retuning mon0, and every retune is EBUSY while the managed vif holds the
+# channel context.
 CHAN_PINNED=0
 [ -n "${CHAN:-}" ] && CHAN_PINNED=1
 CHAN="${CHAN:-36}"
@@ -180,6 +242,7 @@ else
   AVAHI_STOP='true'
 fi
 
+# Common half: undo what we created, in both modes.
 RESTORE_CMDS='
   '"$AVAHI_RESTORE"' 2>/dev/null || true
   sudo pkill -x owl 2>/dev/null || true
@@ -189,11 +252,19 @@ RESTORE_CMDS='
   sudo iw dev '"$MON"' del 2>/dev/null || true
   sudo sh -c "echo 1 > '"$MT76"'/runtime-pm" 2>/dev/null || true
   sudo sh -c "echo 1 > '"$MT76"'/deep-sleep" 2>/dev/null || true
+'
+# Under KEEP_WIFI the association was never touched, so restore must not touch
+# it either. Bouncing the interface and restarting NetworkManager here would
+# take down a working connection that the run had left alone the whole time -
+# turning "no harm done" into exactly the outage this mode exists to avoid.
+if [ "$KEEP_WIFI" != "1" ]; then
+  RESTORE_CMDS="$RESTORE_CMDS"'
   sudo ip link set '"$IFACE"' down 2>/dev/null || true
   sudo iw dev '"$IFACE"' set type managed 2>/dev/null || true
   sudo ip link set '"$IFACE"' up 2>/dev/null || true
   '"$NM_UP"' 2>/dev/null || true
 '
+fi
 setsid nohup bash -c "sleep $WATCHDOG_TIMEOUT; $RESTORE_CMDS" >/dev/null 2>&1 &
 WATCHDOG_PID=$!
 echo "watchdog armed (pid $WATCHDOG_PID, fires in ${WATCHDOG_TIMEOUT}s)"
@@ -223,12 +294,24 @@ trap restore EXIT
 # ---------- layer 1: AWDL link ----------
 echo ""
 echo "### layer 1: AWDL link on $MON"
-$NM_DOWN
+if [ "$KEEP_WIFI" = "1" ]; then
+  echo "  KEEP_WIFI=1: leaving $IFACE associated on ch $CHAN."
+  echo "  NetworkManager, wpa_supplicant and the regulatory domain are all left"
+  echo "  alone - stopping them is what would drop the connection, and none of"
+  echo "  it is needed to create a monitor vif (§38)."
+else
+  $NM_DOWN
+fi
 eval "$AVAHI_STOP"
 [ -n "$AVAHI_WAS" ] && echo "  avahi-daemon stopped for this run (restored on exit)"
-sudo pkill -x wpa_supplicant 2>/dev/null; sudo pkill -x dhcpcd 2>/dev/null; sleep 1
-sudo iw reg set "$REG"
-sudo ip link set $IFACE down
+if [ "$KEEP_WIFI" != "1" ]; then
+  sudo pkill -x wpa_supplicant 2>/dev/null; sudo pkill -x dhcpcd 2>/dev/null; sleep 1
+  # Skipped under KEEP_WIFI: a regulatory change while associated is at best
+  # overridden by the AP's own country IE and at worst disrupts the link, and we
+  # are not choosing the channel in that mode anyway.
+  sudo iw reg set "$REG"
+  sudo ip link set $IFACE down
+fi
 sudo iw dev $MONA del 2>/dev/null
 sudo iw dev $MON del 2>/dev/null
 # Monitor vif setup. THE PAIR (activelate2.sh/activelate3.sh, 2026-07-31).
@@ -264,7 +347,13 @@ sudo iw phy $PHY interface add $MON type monitor \
 sudo ip link set $MON up
 sudo sh -c "echo 0 > $MT76/runtime-pm"
 sudo sh -c "echo 0 > $MT76/deep-sleep"
-sudo iw dev $MON set freq $CHAN_MHZ
+# Under KEEP_WIFI this retune is EBUSY by construction - the managed vif owns
+# the channel context - and mon0 is already sitting on the AP's channel, which
+# is the one we want. Attempting it only prints an alarming error for a
+# non-event, so don't.
+if [ "$KEEP_WIFI" != "1" ]; then
+  sudo iw dev $MON set freq $CHAN_MHZ
+fi
 OWL_IF=$MON
 if [ "${ACTIVE:-0}" = "1" ]; then
   # order matters: the plain vif must exist and be tuned FIRST
@@ -281,12 +370,18 @@ if [ "${ACTIVE:-0}" = "1" ]; then
   fi
 fi
 sleep 2
-echo "  PM off, $MON on $(iw dev $MON info 2>/dev/null | grep -oP 'channel \K[0-9]+') (requested $CHAN / $CHAN_MHZ MHz)"
+# Which vif to ASK about the channel. Under KEEP_WIFI mon0 has no channel of its
+# own to report - it rides the managed vif's context - so `iw dev mon0 info`
+# prints nothing and both the line below and the poller would read a blank as
+# "NA", which looks like a broken radio rather than a shared one.
+if [ "$KEEP_WIFI" = "1" ]; then CHAN_VIF=$IFACE; else CHAN_VIF=$MON; fi
+echo "  PM off, $MON on $(iw dev $CHAN_VIF info 2>/dev/null | grep -oP 'channel \K[0-9]+') (requested $CHAN / $CHAN_MHZ MHz)"
+[ "$KEEP_WIFI" = "1" ] && echo "  (channel read from $IFACE - $MON shares its context and reports none)"
 
 # independent radio poller - confirms OWL really hops, without trusting its logs
 ( while :; do
     printf '%s %s\n' "$(date +%s.%N)" \
-      "$(iw dev $MON info 2>/dev/null | grep -oP 'channel \K[0-9]+' || echo NA)"
+      "$(iw dev $CHAN_VIF info 2>/dev/null | grep -oP 'channel \K[0-9]+' || echo NA)"
     sleep 0.05
   done ) > "$OUT/radio.log" &
 POLL_PID=$!
@@ -304,7 +399,39 @@ echo ""
 echo "### layer 0: locating the phone (AWDL BSSID 00:25:00:ff:94:73)"
 AWDL_BSSID="00:25:00:ff:94:73"
 
-if [ "$CHAN_PINNED" = "1" ]; then
+if [ "$KEEP_WIFI" = "1" ]; then
+  # No sweep is POSSIBLE here: it works by retuning mon0 and every retune is
+  # EBUSY. But a single dwell on the AP's channel is still worth 6 seconds,
+  # because it answers the one question this mode can actually fail on - is the
+  # phone on the channel our AP happens to occupy? A "no" here is categorical
+  # and worth reporting as such, rather than letting it surface 45 s later as a
+  # generic "no AWDL peer found".
+  echo "  KEEP_WIFI=1: cannot sweep (retunes are EBUSY). Checking ch $CHAN only."
+  sudo rm -f "$OUT/scan-$CHAN.pcap"
+  sudo timeout 7 tcpdump -i $MON -w "$OUT/scan-$CHAN.pcap" -c 300 \
+       "wlan addr3 $AWDL_BSSID" >/dev/null 2>&1 &
+  sleep 5
+  sudo pkill -x tcpdump 2>/dev/null || true
+  sleep 1
+  BEST_N=$(sudo tcpdump -r "$OUT/scan-$CHAN.pcap" 2>/dev/null | wc -l)
+  BEST_N=${BEST_N:-0}
+  BEST_CHAN=$CHAN
+  printf '  ch %-4s AWDL frames: %s\n' "$CHAN" "$BEST_N"
+  if [ "$BEST_N" -eq 0 ]; then
+    echo ""
+    echo "  No AWDL frames on ch $CHAN, and this mode cannot look anywhere else."
+    echo "  Two different failures look identical from here:"
+    echo "    a) the phone is asleep / not advertising  -> unlock it, set AirDrop"
+    echo "       to 'Everyone for 10 Minutes' (it EXPIRES), open the share sheet"
+    echo "    b) the phone IS awake but on another social channel -> your AP's"
+    echo "       channel ($CHAN) is simply the wrong place to be sitting"
+    echo "  To tell them apart, re-run WITHOUT KEEP_WIFI: the sweep can then"
+    echo "  visit every social channel and will say which case this is."
+    exit 1
+  fi
+  echo "  --> phone is present on the AP's channel; KEEP_WIFI is viable this run"
+  SKIP_SWEEP=1
+elif [ "$CHAN_PINNED" = "1" ]; then
   echo "  CHAN=$CHAN was given explicitly - skipping the sweep."
   echo "  (unset CHAN to let it search; with -S pin OWL will move to the peer's"
   echo "   dominant channel by itself once it sees a sequence)"
