@@ -2950,3 +2950,52 @@ cheaper and more direct.
 
 Built and verified: `cfg80211.ko`, vermagic `6.18.33_1`, exposing
 `monitor_any_chan`. Not yet loaded — loading drops the link.
+
+## §44 — one chip cannot do both. The firmware is the wall.
+
+Kernel work done in `/mnt/shared/projects/mt7921-awdl-kernel`. **Negative
+result, verified end to end.**
+
+Three separate gates block monitoring an AWDL social channel while associated.
+Each was found only by patching the one above it, because **every one of them
+fails by succeeding** — no error, no log, the call returns 0.
+
+| # | layer | gate | patch |
+|---|---|---|---|
+| 1 | cfg80211 | `cfg80211_has_monitors_only()` (`chan.c:1550`) | `monitor_any_chan` |
+| 2 | mac80211 | virtual monitor created only when `open_count == 0` (`iface.c:1403`) | `monitor_concurrent` |
+| 3 | mt7921 | `mcu_config_sniffer()` reachable only from `->change_chanctx` | call on `->assign_vif_chanctx` |
+
+After gate 1, `iw set freq` returned 0 instead of EBUSY — and ftrace showed **no
+driver function ran at all**. That was gate 2: with no `monitor_sdata`,
+`ieee80211_set_monitor_channel()` takes `goto done`, records the channel and
+returns success without touching hardware.
+
+With all three patched, ftrace confirms the whole chain runs:
+
+```
+ieee80211_set_monitor_channel <-cfg80211_set_monitor_channel
+ieee80211_new_chanctx         <-_ieee80211_link_use_channel
+mt7921_add_chanctx            <-ieee80211_add_chanctx
+mt7921_assign_vif_chanctx     <-drv_assign_vif_chanctx
+mt7921_mcu_config_sniffer     <-mt7921_assign_vif_chanctx
+```
+
+`MCU_UNI_CMD(SNIFFER)` **returns success**. The radio does not move.
+
+**Measured:** associated on ch2 (2417 MHz), monitor requested on ch149 (5745
+MHz). **593 of 593 captured frames were 2417 MHz, zero on 5745.** Association
+survived throughout at 0% packet loss.
+
+### Conclusion
+
+The mt7921 firmware's sniffer channel is not independent of the associated BSS
+channel, so gate 4 is the firmware and no kernel patch reaches it. This closes
+"one chip, both at once" — the §42 plan and everything after it.
+
+What remains true and working is the existing userspace path: AirDrop succeeds
+when the phone's AWDL lands on the channel the AP already uses. The options are
+unchanged from §38 — accept that constraint, drop the association for the
+duration of a transfer, or add a second radio.
+
+Stock stack restored on the box; nothing was written to `/lib/modules`.
