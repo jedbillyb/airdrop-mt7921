@@ -2999,3 +2999,58 @@ unchanged from §38 — accept that constraint, drop the association for the
 duration of a transfer, or add a second radio.
 
 Stock stack restored on the box; nothing was written to `/lib/modules`.
+
+## §45 — the firmware CAN time-slice two channels; the sniffer just isn't wired to it
+
+Analysis of `/lib/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin.zst` (792 KB
+decompressed). This refines §44's conclusion in an important way.
+
+- **Not encrypted.** Debug strings, format strings and MediaTek's internal build
+  paths are readable, e.g.
+  `build/csp/7961/asic2.0/projects/wifi_mobile_ram_ccn16/.../hal_cal_flow.c`.
+- **RAM code, re-uploaded from disk every boot.** Nothing is flashed, so a bad
+  firmware patch **cannot brick the card**: the driver fails to init and
+  restoring the file fixes it. The risk here is low; the *effort* is the
+  problem.
+- Trailer: `____010000` + build date `20260224110949` + 4-byte CRC
+  (`8a a4 75 57`), matching the driver's probe output. A CRC, not obviously a
+  cryptographic signature. Whether the ROM enforces one is untested.
+
+The decisive strings are a **channel manager with time-slicing**:
+
+```
+CnmFastChReqQuotaInUs      CnmGOAbsenceMarginInUs
+EnCnmDoubleWFDCHtime       EnCnmSyncTBTT
+fgCnmForceEarlyAbortCH     Check CNM minimum quota time:
+```
+
+Quota, absence margin, TBTT sync, early channel abort — and the `GO`/`WFD`
+naming ties it to P2P Group Owner and Wi-Fi Direct, i.e. precisely the driver's
+advertised `#{managed} + #{P2P-GO}, #channels <= 2`.
+
+There are **zero sniffer strings** in the firmware.
+
+So §44's "one chip cannot do both" is too broad. Correctly stated: **the chip
+can service two channels, but the sniffer is not a client of the scheduler that
+does it.** That is why `mt7921_mcu_config_sniffer()` returned success and
+changed nothing — there was never a code path to honour it.
+
+Note `DBDC band :%d not support in MT7961` also appears. That rules out two
+*bands* at once (two RF chains), not CNM time-slicing on one chain.
+
+### Next avenue (not started)
+
+Put AWDL on a vif CNM will schedule — a **P2P-GO** — instead of a monitor vif.
+No firmware work required. Experiment: P2P-GO beaconing on ch149 while
+associated on ch36, confirmed by capture that both channels are really serviced.
+Needs `hostapd` or a P2P-capable `wpa_supplicant` (this box's daemon has no P2P;
+`p2p_group_add` exists only in `wpa_cli`).
+
+**Caveat:** even if CNM services ch149, OWL still needs raw injection and
+reception there, and a monitor vif follows the sniffer channel — the thing §44
+proved is tied to the BSS. That gap is a second unknown. Maybe-promising, not
+likely.
+
+This is the experiment §42 proposed and §43 cancelled. §43's reasoning (the
+interface-combination table is not consulted for monitor vifs) was correct but
+beside the point: the blocker is the unwired sniffer, not the combination table.
