@@ -2881,3 +2881,72 @@ serviced. Needs a P2P-capable `wpa_supplicant` (this box's has no
 - `flex` and `bison` are **missing**; `gcc` and `make` are present.
 - mac80211 and mt76 are both modules, so an out-of-tree rebuild of just those
   two is viable and avoids rebuilding the whole kernel.
+
+## §43 — the EBUSY is in cfg80211, and §42's plan was wrong on every point
+
+Kernel work now lives in its own repo: `/mnt/shared/projects/mt7921-awdl-kernel`.
+
+§42 scoped a two-part patch to mt76 and mac80211. Reading the actual 6.18.33
+source shows **both parts were unnecessary and neither was the blocker.**
+
+- **Not the interface-combination table.** `mac80211/main.c:1354` puts monitor
+  in `wiphy->software_iftypes`, and `ieee80211_check_combinations()` returns 0
+  early for software iftypes (`util.c:4186`). mt7921 does not set
+  `NO_VIRTUAL_MONITOR` — only mt7996 does. The `#channels <= 2` line is never
+  consulted for a monitor vif, so "add monitor to the combination" was moot.
+- **Not `ieee80211_set_monitor_channel()`.** The `open_count != monitors` gate
+  I remembered is from older kernels. In 6.18 the function calls
+  `ieee80211_link_use_channel()` directly.
+- **Not the driver.** `mt7921_add_chanctx()` is `dev->new_ctx = ctx; return 0;`
+  and `mt792x_assign_vif_chanctx()` is bookkeeping. Neither can fail.
+
+It is **`cfg80211_set_monitor_channel()`**, `net/wireless/chan.c:1550`, calling
+`cfg80211_has_monitors_only()` (`core.h:252`):
+
+```c
+return rdev->num_running_ifaces == rdev->num_running_monitor_ifaces &&
+       rdev->num_running_ifaces > 0;
+```
+
+A third module, cfg80211.ko, and a one-line change.
+
+### Why the fix may still not work
+
+mt7921 has one hardware channel: `mt7921_config()` handles
+`CONF_CHANGE_CHANNEL` via `mt76_update_channel()`, which programs the whole
+PHY. And mt76's generic chanctx code is openly single-channel
+(`mt76/channel.c:47`) — if a chanctx already exists it **returns 0 and does
+nothing**. Accepting a second chanctx and ignoring it is exactly the silent
+failure this chip specialises in.
+
+The one hopeful sign: `mt7921_change_chanctx()` special-cases monitor vifs to
+`mt7921_mcu_config_sniffer()` (`mt7921/mcu.c:1161`), which sends the firmware a
+sniffer band/bw/control-ch/center-ch of its own, separate from the BSS channel.
+Whether that is an independent receive context or just another route to the
+global channel is the open question. Note it is reached only from
+`change_chanctx`, never from `add_chanctx`/`assign_vif_chanctx`.
+
+### The MCC pre-experiment from §42 is cancelled
+
+It was going to prove firmware MCC via a P2P-GO on 149. Unnecessary: the
+combination table is not consulted for monitor, so what P2P-GO can do says
+nothing about what a monitor vif can do. It also could not have run — this
+box's `wpa_supplicant` has no P2P compiled in (`p2p_group_add` is absent from
+the daemon, present only in `wpa_cli`). Testing the patch directly is both
+cheaper and more direct.
+
+### Build facts (correcting §42)
+
+- Running kernel is **6.18.33_1** but installed headers are **6.18.40_1** —
+  mismatched. Irrelevant now: we build from a kernel.org 6.18.33 tarball, and
+  `CONFIG_LOCALVERSION="_1"` from `/proc/config.gz` makes `make kernelrelease`
+  print `6.18.33_1` exactly. No kernel upgrade, no reboot.
+- `CONFIG_MODVERSIONS` is **off** → no symbol CRCs, vermagic match is enough.
+- `CONFIG_MODULE_SIG_FORCE` is **off** → unsigned modules load, taint only.
+- Therefore `KBUILD_MODPOST_WARN=1` is safe: there is no `Module.symvers`
+  without a vmlinux build, and the loader resolves the symbols at insert time.
+- `/` is at **95%** (2.7 G free). All kernel work goes on `/mnt/shared`.
+- `flex`, `bison`, `zstd`, `elfutils-devel` now installed.
+
+Built and verified: `cfg80211.ko`, vermagic `6.18.33_1`, exposing
+`monitor_any_chan`. Not yet loaded — loading drops the link.
