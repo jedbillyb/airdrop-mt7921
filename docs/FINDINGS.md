@@ -2750,3 +2750,25 @@ common one. NOT YET IMPLEMENTED.
 Also confirmed en route: **avahi is NOT the problem.** avahi and opendrop hold
 UDP 5353 concurrently without conflict, and opendrop announced normally
 (`port 8771`). The earlier suspicion was wrong; do not stop avahi for this.
+
+### §40b The fix for "keep Wi-Fi up always": move the AP to ch149
+
+The canonical AWDL social channels are **6, 44 and 149**. Channel 36 is not one
+of them. §38 accepted 36 because an iPhone had once been seen advertising a
+36-heavy sequence, and §40 shows what betting on that costs.
+
+**NZ regulatory permits 149.** The full `iw reg get` for NZ includes
+`(5725 - 5875 @ 80), (N/A, 36), (N/A)` — 36 dBm, **no DFS**, i.e. *more* power
+and fewer dropouts than ch36 (`5150-5250 @ 80`, 30 dBm). An earlier reading of
+these rules that stopped at `5470-5730` and concluded 149 was disallowed was
+simply a truncated grep.
+
+So on this network the answer to "can I keep Wi-Fi up permanently?" is **yes,
+move the AP's 5 GHz radio from 36 to 149.** Then the AP's channel — which
+KEEP_WIFI locks the monitor vifs to — is the phone's own dominant AWDL channel,
+which in §40 offered up to **15 of 16 slots** (better than the 11.7% duty cycle
+the exclusive run actually achieved). No fallback, no dropped association.
+
+The AP (`2142-WiFi`) has two BSSes: `…:4a` on ch2 and `…:4b` on ch36. Note the
+laptop reassociated to the **2.4 GHz** BSS after an `airdrop.sh` restore, so
+confirm which BSS you are on before reading anything into the AP channel.

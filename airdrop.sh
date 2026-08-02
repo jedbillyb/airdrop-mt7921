@@ -101,8 +101,22 @@ if [ "$KEEP_WIFI" = "1" ]; then
     echo "  script take the card exclusively."
     exit 1
   fi
+  # The CANONICAL AWDL social channels are 6, 44 and 149. 36 and 132 are
+  # accepted here because an iPhone was once observed advertising a 36-heavy
+  # sequence, but that is not what iOS normally does and betting on it cost a
+  # live test (§40): the AP sat on 36 while the phone ran a 149-dominant
+  # sequence offering up to 15 of 16 slots, so we saw zero AWDL frames and zero
+  # peers while its BLE advert was live at -26 dBm. If your AP is movable, put
+  # it on 149 - it is the primary 5 GHz social channel, and under NZ rules
+  # 5725-5875 is 36 dBm with no DFS, so it is a better Wi-Fi channel than 36 too.
   case "$AP_CHAN" in
-    6|36|44|132|149) ;;
+    6|44|149) ;;
+    36|132)
+      echo "note: AP is on ch$AP_CHAN, which is NOT a canonical AWDL social"
+      echo "      channel (6, 44, 149). This can work - an iPhone was once seen"
+      echo "      favouring 36 - but §40 measured a phone 149-dominant while we"
+      echo "      sat on 36 and saw nothing at all. If discovery fails, move the"
+      echo "      AP to 149 rather than debugging anything else." ;;
     *)
       echo "REFUSING: your AP is on channel $AP_CHAN, which is not an AWDL social"
       echo "  channel (6, 36, 44, 132, 149). With KEEP_WIFI=1 the monitor vif is"
