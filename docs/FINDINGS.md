@@ -2772,3 +2772,49 @@ the exclusive run actually achieved). No fallback, no dropped association.
 The AP (`2142-WiFi`) has two BSSes: `…:4a` on ch2 and `…:4b` on ch36. Note the
 laptop reassociated to the **2.4 GHz** BSS after an `airdrop.sh` restore, so
 confirm which BSS you are on before reading anything into the AP channel.
+
+## §41 Why a Mac needs no router config and we do — measured, not assumed (2026-08-02)
+
+Asked whether AirDrop can work alongside Wi-Fi on any channel, the way macOS
+manages it, without touching the AP.
+
+**The mechanism macOS uses:** Apple's driver implements AWDL natively. It
+time-shares the one radio — announces power-save to the AP so it buffers, hops
+to the social channel for the availability window, and returns. That scheduler
+lives in the driver.
+
+**Why we cannot copy it on mt7921/mac80211, measured:**
+
+| test | result |
+|---|---|
+| `iw phy phy0 info` interface combinations | `#{managed,P2P-client} <= 2, #{AP} <= 1, #{P2P-device} <= 1, #channels <= 2` — **monitor appears in NO combination** |
+| create `__ap` vif, `set freq 5745` while associated | vif created, **no channel** (an AP vif claims a context only once hostapd starts it) |
+| monitor vif `set freq 5745` with that vif present | **EBUSY (-16)** |
+| `remain_on_channel` / `frame` in supported commands | **present** |
+| `iw dev wlp2s0 offchannel 5745 2000` while associated | **failed, ETIMEDOUT (-110)** |
+
+The card really does support two channel contexts — that is how Wi-Fi Direct
+runs alongside infra — but **a monitor vif can never own one**; it always rides
+whatever context exists. Linux has no AWDL interface type, so OWL must use
+monitor mode, and that is the whole gap.
+
+**Remain-on-channel is not a way out even if it worked.** ROC grants a window
+for `NL80211_CMD_FRAME`, i.e. *action* frames. AWDL sync and discovery are
+action frames, so ROC could in principle carry those — but the actual transfer
+is TCP in AWDL **data** frames, which cannot be sent that way. ROC would buy
+discovery and not the payload.
+
+**So there are exactly three ways to have AirDrop and Wi-Fi at once:**
+
+1. **AP on a social channel (6/44/149).** Free, five minutes, works permanently,
+   and 149 in NZ is 36 dBm with no DFS — a better Wi-Fi channel than 36 anyway.
+   Requires router config.
+2. **A second radio.** Config-free, but must do **5 GHz** active monitor to reach
+   149. The AR9271 cannot: `ath9k_htc` is 2.4 GHz-only, so it could only ever sit
+   on ch6, which the observed phone offered in **1 of 16 slots**.
+3. **Driver work** — give monitor vifs their own chanctx, or implement AWDL
+   properly with PS signalling. This is the real answer to "how do Macs do it"
+   and nobody has it on Linux. It is also the genuinely publishable piece.
+
+There is no fourth option that is only configuration on our side. Upstream OWL's
+"you need a specific adapter" requirement is a symptom of exactly this.
