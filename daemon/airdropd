@@ -66,7 +66,7 @@ set_state() {
 }
 
 teardown() {
-  [ -n "${OWL_PID:-}" ] && kill "$OWL_PID" 2>/dev/null
+  sudo -n "$HELPER" owl-stop >/dev/null 2>&1
   [ -n "${OD_PID:-}" ] && kill "$OD_PID" 2>/dev/null
   sudo -n "$HELPER" down >/dev/null 2>&1
   log "stack down"
@@ -97,22 +97,17 @@ serve_window() {
   chan=$(printf '%s' "$up" | grep -oP '"chan":\K[0-9]+')
   log "stack up on ch ${chan:-?}"
 
-  "$OWL" -i mon1 -c "${chan:-36}" -N -S verbatim -vv >> "$LOG" 2>&1 &
-  OWL_PID=$!
-  # awdl0 appears within ~0.02 s in practice; allow far more and fail fast
-  # rather than assuming.
-  local i
-  for i in $(seq 50); do
-    ip link show awdl0 >/dev/null 2>&1 && break
-    sleep 0.1
-  done
-  if ! ip link show awdl0 >/dev/null 2>&1; then
-    log "awdl0 never appeared"
+  # OWL is started BY THE HELPER, as root. It creates the awdl0 tun interface
+  # and cannot do that unprivileged - run as the user it starts, prints its
+  # banner, and simply never produces awdl0, which reads as "awdl0 never
+  # appeared" rather than as the permission problem it is. That cost one live
+  # run against a real phone with the share sheet open.
+  if ! sudo -n "$HELPER" owl-start "${chan:-36}" >/dev/null 2>&1; then
+    log "owl-start failed - awdl0 never appeared (see /run/airdrop-owl.log)"
     set_state error "awdl0 failed"
     teardown
     return 1
   fi
-  sudo -n ip link set awdl0 up 2>/dev/null
 
   set_state armed "ch ${chan:-?}"
   log "advertising for ${WINDOW}s"

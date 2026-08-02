@@ -2698,3 +2698,55 @@ unaskable question is not consent.
 **NOT YET PROVEN: an end-to-end transfer through `airdropd`.** Needs a phone. The
 trigger has never seen a real iPhone share-sheet advert, only our own — which it
 is designed to ignore.
+
+## §40 First live test of `airdropd`: BLE trigger PROVEN, blocked by the channel lock (2026-08-02)
+
+Against a real iPhone, share sheet open.
+
+**The BLE trigger works.** 297 Continuity type-`0x05` adverts detected the moment
+the share sheet opened, at -26 dBm; `airdropd` fired at **5 s**. Everything §39
+predicted about detection holds. Zero type-5 adverts in a 4-minute control run
+with the sheet closed, so the discriminator is clean.
+
+**Bug found and fixed: OWL was started unprivileged.** It creates the `awdl0`
+tun and cannot do that as the user, so it printed its banner and simply never
+produced an interface - surfacing as `awdl0 never appeared`, which reads like a
+radio problem rather than the permission problem it is. `airdrop.sh` has
+`sudo stdbuf -oL owl`; `airdropd` had dropped the sudo. Fixed by moving OWL
+behind `airdrop-helper owl-start`, running a **root-owned copy at a fixed path**
+(`/usr/local/bin/airdrop-owl`) - running the user-writable `$OWL_DIR/build/...`
+as root would be the same escalation the sudoers rule already avoids.
+
+**THE REAL BLOCKER: the phone's AWDL was on ch149; our AP is on ch36.**
+
+- `add peer` events: **0**. AWDL frames captured on ch36: **0**.
+- BLE advert simultaneously live at -26 dBm, so the phone was awake and willing.
+- `slotmap.py` on the subsequent exclusive run: every sequence the peer
+  advertised was **149**-dominant (`149,149,149,...,6,...`), offering 2-15 of 16.
+
+So §38's condition is sharper than "the AP must be on a social channel". It is
+**"the phone must be on the AP's channel"** - and that is not knowable in
+advance, not controllable, and observed to drift (6, 36, 149 all seen across
+sessions). An AP parked on 36 is no help when the phone picks 149.
+
+**The exclusive path still works end to end.** `ACTIVE=1 ./airdrop.sh receive`
+swept to 149, synced, and received **IMG_8263.PNG, 282806 bytes** (matching the
+`TotalBytes` header exactly), `/Upload -> 200`. 717 packets from the peer,
+45.7 kB/s, duty cycle 11.7%. Note the file's mtime is the PHOTO's, not the
+receive time - `find -newermt` will not find it; use `ls -lat`.
+
+**Operator-observed: ~40 s from launch to appearing in the share sheet** on the
+exclusive path, dominated by the channel sweep.
+
+### What this means for the on-demand design
+
+Channel-locked operation cannot be the only mode. The per-transfer decision has
+to be made from evidence, not from configuration: on a trigger, bring the stack
+up on the AP's channel, look for AWDL frames for a second or two, and **fall
+back to taking the card exclusively (sweep, transfer, restore) when the phone is
+not there**. That keeps the internet up in the lucky case and still works in the
+common one. NOT YET IMPLEMENTED.
+
+Also confirmed en route: **avahi is NOT the problem.** avahi and opendrop hold
+UDP 5353 concurrently without conflict, and opendrop announced normally
+(`port 8771`). The earlier suspicion was wrong; do not stop avahi for this.

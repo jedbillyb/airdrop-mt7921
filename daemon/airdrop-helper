@@ -100,7 +100,57 @@ case "${1:-}" in
       "$(ap_channel || echo null)"
     ;;
 
+  owl-start)
+    # OWL must run as root: it creates the awdl0 tun interface, and without
+    # privilege it starts, prints its banner and never produces one - which
+    # surfaces confusingly as "awdl0 never appeared" rather than as a
+    # permission error.
+    #
+    # It is run from a FIXED ROOT-OWNED PATH, never from $OWL_DIR. Running a
+    # user-writable binary as root is the same privilege escalation that keeps
+    # the sudoers rule off this repo: anything able to write the binary would
+    # get root. Install it with:
+    #   sudo install -o root -g root -m 755 ~/owl/build/daemon/owl \
+    #        /usr/local/bin/airdrop-owl
+    OWL_BIN=/usr/local/bin/airdrop-owl
+    if [ ! -x "$OWL_BIN" ]; then
+      echo "airdrop-helper: $OWL_BIN missing - see daemon/README.md" >&2
+      exit 1
+    fi
+    owner=$(stat -c '%U' "$OWL_BIN")
+    if [ "$owner" != "root" ]; then
+      echo "airdrop-helper: $OWL_BIN must be root-owned (is $owner)" >&2
+      exit 1
+    fi
+    chan="${2:-36}"
+    case "$chan" in
+      6|36|44|132|149) ;;
+      *) echo "airdrop-helper: bad channel $chan" >&2; exit 1 ;;
+    esac
+    pkill -x airdrop-owl 2>/dev/null
+    # stdbuf -oL so the log is readable live rather than in 4 KiB bursts.
+    setsid stdbuf -oL "$OWL_BIN" -i $MONA -c "$chan" -N -S verbatim -vv \
+      >> /run/airdrop-owl.log 2>&1 &
+    for _ in $(seq 60); do
+      ip link show awdl0 >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    if ip link show awdl0 >/dev/null 2>&1; then
+      ip link set awdl0 up 2>/dev/null
+      echo '{"awdl0":true}'
+    else
+      echo '{"awdl0":false}'
+      exit 1
+    fi
+    ;;
+
+  owl-stop)
+    pkill -x airdrop-owl 2>/dev/null
+    echo '{"ok":true}'
+    ;;
+
   down)
+    pkill -x airdrop-owl 2>/dev/null
     ip link set $MONA down 2>/dev/null
     iw dev $MONA del 2>/dev/null
     ip link set $MON down 2>/dev/null
