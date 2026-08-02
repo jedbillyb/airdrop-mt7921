@@ -3054,3 +3054,76 @@ likely.
 This is the experiment §42 proposed and §43 cancelled. §43's reasoning (the
 interface-combination table is not consulted for monitor vifs) was correct but
 beside the point: the blocker is the unwired sniffer, not the combination table.
+
+## §46 — SOLVED: Wi-Fi + AWDL on one MT7921, stock kernel, via a P2P-GO chanctx (2026-08-03)
+
+**§38's "the AP owns the channel" and §40b's "move the router to ch149" are both
+obsolete.** A P2P-GO vif holds a real channel context on a channel *we* choose,
+while the station stays associated elsewhere. Measured on ch149 (5745) while
+associated on ch52 (5260), 0% uplink packet loss throughout:
+
+| | monitor vif (§43-§45) | P2P-GO vif |
+|---|---|---|
+| radio actually moves | **no** — 593/593 on the AP's chan | **yes** |
+| RX on 149 | 0 | **222 frames, 75 from external devices** |
+| TX on 149 | never reached | **82 solicited probe responses, 5 APs** |
+| AWDL | — | **4 peers, sync locked; iPhone replied to ping6 (460 ms)** |
+
+The ping6 reply is an ICMPv6 packet over `awdl0`, i.e. an 802.11 **data** frame
+with the AWDL header — so the data path, not just management, is proven.
+
+### Two mechanisms (kernel work in /mnt/shared/projects/mt7921-awdl-kernel)
+
+1. **`#channels <= 2` is offered ONLY in the P2P-GO interface combination**;
+   plain AP is `#channels <= 1`. hostapd unconditionally forces iftype AP, so
+   stock hostapd fails with `nl80211: Beacon set failed: -16`. A one-line
+   env-gated patch (`HOSTAPD_P2P_GO=1`) keeps the iftype as P2P-GO.
+   `is_ap_interface()` already accepts P2P_GO, so nothing else changes.
+2. **Monitor TX borrows another vif's chanctx by MAC.**
+   `ieee80211_monitor_start_xmit()` (`net/mac80211/tx.c:~2377`) matches an
+   injected frame's `addr2` against running **non-monitor** vifs and uses that
+   sdata's chanctx. Monitor vifs are skipped by the loop, so **aliasing mon0's
+   MAC to the GO's is the whole integration trick** — that is how OWL's frames
+   reach ch149.
+
+### THE SILENT-DROP TRAP
+
+While associated, monitor-vif injection is dropped inside mac80211 with
+`tx_packets`, `tx_dropped` **and** `tx_errors` all staying 0 and `send()`
+returning success. The first TX test read as "MCC TX doesn't work"; the
+**no-GO control also gave zero**, which is what identified the monitor-TX path
+rather than MCC as the fault. Injecting with the GO's MAC then gave 82
+responses vs **0** for an invented MAC. Run the control first.
+
+### THE COST — the remaining design problem
+
+Uplink to the gateway: **~2.6 ms avg baseline → ~40 ms median, 280-590 ms max**
+while the GO holds a second channel. 0% loss, pure latency. Fine for browsing,
+bad for VC/gaming. macOS pays the same cost (one radio, same physics) and hides
+it by not keeping AWDL up — which is exactly §39's BLE-triggered model.
+
+**Zero-cost plan, NOT yet tested:** if the GO sits on the *AP's own* channel
+there is no time-slicing at all. Enabling fact from our own captures — **slot 8
+is always the 2.4 GHz social slot**:
+
+```
+112,112,149,0,0,0,0,112,6,112,149,112,0,0,0,112
+ 36, 36,149,0,0,0,0, 36,6, 36,149, 36,0,0,0, 36
+```
+
+So park the GO on ch6 with the AP's 2.4 GHz BSS also on ch6: zero cost, AWDL up
+24/7, but only 1/16 slots (~6% duty, ~22 kB/s extrapolated). Then use hostapd
+`chan_switch` (CSA) to hop to the phone's dominant channel for the duration of
+a real transfer. CSA on a GO is untested on this chip.
+
+### Still open
+
+- **No file transfer has been done in GO mode.** ping6 was 1/5 (categorical PASS
+  per §23/§26, but ping6 cannot size an effect). The 80% loss is explained: the
+  phone offered ch149 only 2/16 slots that run (112 was dominant at 6/16).
+- `.venv-opendrop` is missing from this repo and must be rebuilt with the three
+  patches before any transfer test.
+- **`handle_ask` still unconditionally accepts** (§39) — blocks anything
+  always-on. `patches/opendrop-ask-confirm.patch` is not applied.
+- Active-monitor ACKs against a GO-held chanctx: untested. If unicast fails,
+  try the §14 PAIR with both vifs MAC-aliased.
