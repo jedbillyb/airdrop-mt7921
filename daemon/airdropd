@@ -69,6 +69,14 @@ DUALCHAN="${AIRDROP_DUALCHAN:-0}"
 # wrong for the same reason - it was right for one phone state, not for the
 # phone.
 GO_CHAN="${AIRDROP_GO_CHAN:-auto}"
+# The channels a GO can actually be built on. THREE PLACES MUST AGREE: this
+# list, daemon/airdrop-helper (the `go-up` and `owl-start` cases), and owl's own
+# switch in daemon/owl.c. They did not: the helper accepted 132 and owl rejects
+# it, so a station on ch132 built a GO fine and then owl exited, which surfaces
+# as the unrelated-looking "awdl0 never appeared". Validating here as well means
+# an unbuildable channel is refused before anything is torn down, with a message
+# that says which channel and why.
+GO_CHANNELS="6 36 44 149"
 # Where owl writes its log; the wrong-channel watch reads NO OVERLAP from it.
 OWL_LOG="${AIRDROP_OWL_LOG:-/run/airdrop-owl.log}"
 # Rebuild the GO on the peer's channel when ours stops overlapping it at all.
@@ -100,6 +108,39 @@ ALWAYS="${AIRDROP_ALWAYS:-0}"
 REANNOUNCE="${AIRDROP_REANNOUNCE:-5}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
+
+# Is this a channel we can build a GO on? See GO_CHANNELS.
+chan_supported() {
+  case " $GO_CHANNELS " in *" ${1:-} "*) return 0 ;; esac
+  return 1
+}
+
+# GO_CHAN above is POLICY and never changes for the life of the daemon: it is
+# either "auto" or an explicit operator override, and both have to survive
+# every rebuild. What the GO is actually built on right now is a different fact
+# and lives here. Conflating the two is how auto mode died after one correction
+# - the first time the wrong-channel watch fired it wrote the peer's channel
+# into GO_CHAN, and from then on every bring-up reused that one number and the
+# station was never consulted again.
+BUILT_CHAN=""
+# The managed (station) vif. Resolved once - it does not get renamed while we
+# run - and cached at script scope so the health watch can read the station's
+# channel every tick without repeating the lookup.
+STA=""
+
+sta_iface() {
+  [ -n "$STA" ] || STA=$(iw dev 2>/dev/null \
+    | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
+  printf '%s' "$STA"
+}
+
+# The station's CURRENT channel, read live every time. Empty if there is no
+# managed vif or it is not associated.
+sta_channel() {
+  local s; s=$(sta_iface)
+  [ -n "$s" ] || return 1
+  iw dev "$s" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
+}
 
 # State is written for waybar to read. Keep it a single line and always
 # rewrite atomically: waybar polls on its own schedule and a half-written file
@@ -156,11 +197,18 @@ cleanup() {
 # One transfer window: bring the stack up, advertise, wait, tear down.
 # Everything here is bounded - a bar toggle that can wedge is worse than one
 # that occasionally misses a transfer.
-# Bring the radio stack up and leave awdl0 ready. Sets CHAN on success.
+# Bring the radio stack up and leave awdl0 ready. Sets BUILT_CHAN on success.
 # Shared by the BLE-triggered window and the always-on switch so the two
 # cannot drift apart - the P2P-GO bring-up is the fiddly part and there must
 # only ever be one copy of it.
+#
+#   stack_up [peer_chan]
+#
+# peer_chan is what the peer's sequence says it wants, when we have that. It is
+# a hint for this bring-up only and is deliberately NOT remembered anywhere: the
+# next bring-up resolves the channel again from scratch.
 stack_up() {
+  local peer_hint="${1:-}"
   local up chan owlargs
 
   # The whole point of P2P-GO mode is keeping the internet, so refuse the
@@ -179,9 +227,11 @@ stack_up() {
   # that declines to turn on and says why.
   local go_chan="$GO_CHAN"
   if [ "$DUALCHAN" = 1 ]; then
-    local sta sta_chan
-    sta=$(iw dev 2>/dev/null | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
-    sta_chan=$(iw dev "${sta:-none}" info 2>/dev/null | grep -oP 'channel \K[0-9]+')
+    # Read the station LIVE, on every single bring-up. Not once at startup and
+    # not carried over from the last one: a rebuild exists precisely because
+    # something moved, and the station is the thing most likely to have moved.
+    local sta_chan
+    sta_chan=$(sta_channel)
     if [ -n "$sta_chan" ] && [ "$sta_chan" -le 14 ]; then
       log "REFUSING: STA on 2.4GHz ch$sta_chan - a GO alongside it drops the link"
       set_state error "Wi-Fi is on 2.4GHz (ch$sta_chan); AirDrop needs a 5GHz AP"
@@ -199,8 +249,8 @@ stack_up() {
     # somewhere by definition; the STA's channel tracks it for free and is
     # also the pairing measured to hold the association (ch36+ch36 above).
     if [ "$go_chan" = auto ]; then
-      go_chan="${sta_chan:-149}"
-      log "GO channel auto -> ch$go_chan (following STA${sta:+ $sta})"
+      go_chan="${peer_hint:-${sta_chan:-149}}"
+      log "GO channel auto -> ch$go_chan (peer hint ${peer_hint:-none}, STA ${sta_chan:-?} on ${STA:-?})"
     fi
   fi
   if [ "$DUALCHAN" = 1 ]; then
@@ -256,7 +306,32 @@ stack_up() {
   done
   log "awdl0 link-local ready after $((i*250))ms"
 
-  CHAN="${chan:-?}"
+  BUILT_CHAN="${chan:-?}"
+  return 0
+}
+
+# stack_up, but it does not give up. A failed bring-up used to `break` out of
+# serve_forever, which ended the daemon: the bar's switch went back to "drop
+# off" and whatever went wrong - a momentary hostapd failure, the AP briefly
+# on a band we cannot join - became permanent until someone clicked it again.
+# An always-on switch that is on must keep trying, so the recoverable failures
+# recover by themselves.
+#
+# stack_up has already written a specific state (and reason) for whatever it
+# refused or failed on, so this deliberately does not overwrite it - it only
+# says how long until the next attempt. Backoff caps at a minute: past that
+# the cost of retrying is nil and the value of noticing quickly is not.
+stack_up_retry() {
+  local delay=5 tries=0
+  until stack_up "$@"; do
+    tries=$((tries + 1))
+    log "bring-up attempt $tries failed - retrying in ${delay}s"
+    sleep "$delay"
+    [ "$delay" -lt 60 ] && delay=$((delay * 2))
+    [ "$delay" -gt 60 ] && delay=60
+  done
+  set_state armed "ch $BUILT_CHAN"
+  log "advertising on ch $BUILT_CHAN until stopped"
   return 0
 }
 
@@ -267,7 +342,7 @@ serve_window() {
 
   stack_up || return 1
 
-  set_state armed "ch $CHAN"
+  set_state armed "ch $BUILT_CHAN"
   log "advertising for ${WINDOW}s"
   mkdir -p "$RECV_DIR"
   # AIRDROP_CONFIRM is what makes the patched handle_ask prompt. Without it
@@ -294,10 +369,8 @@ serve_forever() {
   set_state waking "switch"
 
   avahi_stop
-  stack_up || { avahi_restore; return 1; }
+  stack_up_retry
 
-  set_state armed "ch $CHAN"
-  log "advertising on ch $CHAN until stopped"
   mkdir -p "$RECV_DIR"
 
   # opendrop's HTTP server is single-threaded, so anything slow inside a
@@ -366,17 +439,23 @@ serve_forever() {
           want=$(printf '%s' "$last_none" | grep -oP 'peer wants ch \K[0-9]+')
           if [ -n "$last_none" ] \
              && [ "${last_none%% *}" \> "${last_over%% *}" ] \
-             && [ -n "$want" ] && [ "$want" != "0" ] && [ "$want" != "$CHAN" ]; then
+             && [ -n "$want" ] && [ "$want" != "0" ] && [ "$want" != "$BUILT_CHAN" ]; then
             no_overlap=$((no_overlap + 5))
           else
             no_overlap=0
+            # A refusal leaves "unreachable" on the bar. The phone coming back
+            # onto our channel has to clear it, or the switch stays red while
+            # it is in fact receiving - the same class of lie as claiming to be
+            # on when the stack is dead. Only rewrite when it is actually wrong.
+            grep -q '"state":"armed"' "$STATE" 2>/dev/null \
+              || set_state armed "ch $BUILT_CHAN"
           fi
           # Hysteresis: the phone reshuffles its sequence every few seconds and
           # a momentary gap is normal. Only act once it has been unreachable
           # for a sustained stretch.
           if [ "$no_overlap" -ge "$WRONGCHAN_AFTER" ]; then
             if [ "$GO_FOLLOW" = 1 ] && [ "$DUALCHAN" = 1 ]; then
-              log "WRONG CHANNEL: on ch $CHAN, phone wants ch $want - rebuilding GO"
+              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want - rebuilding GO"
               set_state waking "moving to ch $want"
               # The GO cannot retune in place: hostapd chan_switch returns FAIL
               # for every parameter form, including a same-subband 149->153 hop,
@@ -388,8 +467,8 @@ serve_forever() {
               kill "$OD_PID" 2>/dev/null
               break
             else
-              log "WRONG CHANNEL: on ch $CHAN, phone wants ch $want (not following)"
-              set_state error "wrong channel: phone is on ch $want, we are on ch $CHAN"
+              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want (not following)"
+              set_state error "wrong channel: phone is on ch $want, we are on ch $BUILT_CHAN"
             fi
             no_overlap=0
           fi
@@ -407,18 +486,23 @@ serve_forever() {
     # the single-channel path owl retunes itself and there is nothing to rebuild.
     if [ -s "$RUNDIR/want_chan" ]; then
       want_chan=$(cat "$RUNDIR/want_chan"); rm -f "$RUNDIR/want_chan"
-      if [ "$want_chan" != "$CHAN" ]; then
-        log "rebuilding stack on ch $want_chan (was ch $CHAN)"
+      # VALIDATE BEFORE TEARING ANYTHING DOWN. The peer's channel is whatever
+      # the phone happens to be on, which is frequently a channel no GO can be
+      # built on here (anything outside GO_CHANNELS). Tearing the stack down
+      # first and discovering that afterwards traded a working receiver on the
+      # wrong channel for no receiver at all - and then exited. A refusal has
+      # to be free: log it, say so on the bar, leave the radio exactly as it is.
+      if ! chan_supported "$want_chan"; then
+        log "CANNOT FOLLOW to ch$want_chan: not one of $GO_CHANNELS - staying on ch $BUILT_CHAN"
+        set_state unreachable "cannot follow to ch$want_chan; still on ch $BUILT_CHAN"
+      elif [ "$want_chan" != "$BUILT_CHAN" ]; then
+        log "rebuilding stack on ch $want_chan (was ch $BUILT_CHAN)"
         sudo -n "$HELPER" owl-stop >/dev/null 2>&1
         sudo -n "$HELPER" go-down >/dev/null 2>&1
-        GO_CHAN="$want_chan"
-        if stack_up; then
-          set_state armed "ch $CHAN"
-          log "advertising on ch $CHAN until stopped"
-        else
-          log "rebuild on ch $want_chan FAILED - stack is down"
-          break
-        fi
+        # The peer's channel is passed in for THIS bring-up only. It used to be
+        # written into GO_CHAN, which permanently replaced "auto" with one
+        # number and stopped the station from ever being read again.
+        stack_up_retry "$want_chan"
       fi
     fi
     HEALTH_PID=""
