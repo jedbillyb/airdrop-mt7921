@@ -63,8 +63,8 @@ usage: airdrop-helper <verb> [chan]
   up            create the monitor pair, disable runtime PM, report the channel
   down          remove the monitor vifs and restore runtime PM
   go-up <chan>  P2P-GO mode: bring up go0 on <chan>, alias mon0 to its MAC -
-                gets AWDL its own channel independent of the AP's (6/36/44/
-                132/149 only; see mt7921-dual-channel)
+                gets AWDL its own channel independent of the AP's (6/36/44/149
+                only - the set owl itself accepts; see mt7921-dual-channel)
   go-down       tear down go0/hostapd/mon0 from go-up, restore runtime PM
   wifi-reset    down + go-down, PLUS rfkill-unblock and bring the managed
                 interface back up. For manual "THE WORKING RECIPE" testing
@@ -122,10 +122,15 @@ case "${1:-}" in
     # real file transfer or for active-monitor ACKs against a GO chanctx -
     # this is the newer, less-tested mode; `up`/`down` remain the default.
     chan="${2:-}"
+    # THE CHANNEL SET, PLACE 1 OF 3. It must match `owl-start` below and owl's
+    # own switch in owl's daemon/owl.c - keep the three in step. 132 used to be
+    # here and owl does not support it, so asking for it built a GO fine and
+    # then owl exited immediately, surfacing as the unrelated-sounding "awdl0
+    # never appeared". Nothing gets widened here without widening all three.
     case "$chan" in
       6) hw=g ;;
-      36|44|132|149) hw=a ;;
-      *) echo "airdrop-helper: bad channel $chan (want 6/36/44/132/149)" >&2; exit 1 ;;
+      36|44|149) hw=a ;;
+      *) echo "airdrop-helper: cannot follow to ch$chan (buildable: 6/36/44/149)" >&2; exit 1 ;;
     esac
     if [ ! -x "$GO_HOSTAPD" ]; then
       echo "airdrop-helper: $GO_HOSTAPD missing - see daemon/README.md" >&2
@@ -287,9 +292,13 @@ EOF
       exit 1
     fi
     chan="${2:-36}"
+    # THE CHANNEL SET, PLACE 2 OF 3 - `go-up` above, and owl's own switch in
+    # its daemon/owl.c, which is the one that has the final say. Rejecting it
+    # here rather than letting owl reject it turns a silent exit-after-banner
+    # into a message that names the channel.
     case "$chan" in
-      6|36|44|132|149) ;;
-      *) echo "airdrop-helper: bad channel $chan" >&2; exit 1 ;;
+      6|36|44|149) ;;
+      *) echo "airdrop-helper: owl cannot run on ch$chan (buildable: 6/36/44/149)" >&2; exit 1 ;;
     esac
     # go-up's mon0 is a single MAC-aliased vif (no ACK-tuned pair needed - it
     # rides go0's own chanctx); up's default pair uses mon1, the `flags
