@@ -1,0 +1,76 @@
+--- a/opendrop/server.py
++++ b/opendrop/server.py
+@@ -24,6 +24,7 @@
+ import plistlib
+ import socket
+ import struct
++import threading
+ import time
+ import zlib
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+@@ -31,7 +32,7 @@
+ import libarchive
+ import libarchive.extract
+ import libarchive.read
+-from zeroconf import IPVersion, ServiceInfo, Zeroconf
++from zeroconf import DNSOutgoing, IPVersion, ServiceInfo, Zeroconf, const
+ 
+ from .util import AirDropUtil
+ 
+@@ -95,6 +96,56 @@
+             f"Announcing service: host {self.config.host_name}, address {self.ip_addr}, port {self.config.port}"
+         )
+         self.zeroconf.register_service(self.service_info)
++        self._start_repeat_announce()
++
++    def _start_repeat_announce(self):
++        """
++        Re-send the unsolicited announcement at a fixed interval.
++
++        python-zeroconf announces at registration and then goes quiet, and the
++        iPhone does not poll for AirDrop receivers - it only ever learns we
++        exist by catching an announce burst. Over AWDL that burst also has to
++        survive a link we are only co-channel on for a fraction of each 1.048 s
++        sequence, so a single burst at startup is routinely missed outright.
++
++        The daemon used to get this effect by killing opendrop every 30 s and
++        letting it re-register, which deregistered the service and dropped the
++        HTTPS server for ~1.5 s each cycle - the receiver visibly appeared and
++        vanished on the phone's share sheet on a 30 s period, and any transfer
++        starting near the boundary lost its socket. Re-sending the records here
++        keeps both the registration and the listener up the whole time.
++        """
++        interval = float(os.environ.get("OPENDROP_ANNOUNCE_INTERVAL", "5"))
++        if interval <= 0:
++            return
++        self._announce_stop = threading.Event()
++
++        def loop():
++            while not self._announce_stop.wait(interval):
++                try:
++                    info = self.service_info
++                    out = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
++                    for record in (
++                        [info.dns_pointer(), info.dns_service(), info.dns_text()]
++                        + list(info.dns_addresses())
++                    ):
++                        out.add_answer_at_time(record, 0)
++                    self.zeroconf.send(out)
++                except Exception as e:  # a failed burst must not end the loop
++                    logger.debug(f"repeat announce failed: {e}")
++
++        self._announce_thread = threading.Thread(
++            target=loop, name="airdrop-repeat-announce", daemon=True
++        )
++        self._announce_thread.start()
++        logger.debug(f"re-announcing _airdrop._tcp every {interval}s")
++
++    def stop_repeat_announce(self):
++        stop = getattr(self, "_announce_stop", None)
++        if stop is not None:
++            stop.set()
++            self._announce_stop = None
++
+     def _init_server(self):
+         try:
+             httpd = self.ServerClass(self.serveraddress, self.Handler)

@@ -71,11 +71,15 @@ GO_CHAN="${AIRDROP_GO_CHAN:-auto}"
 # association, which is a trade worth making for a switch that just works.
 ALWAYS="${AIRDROP_ALWAYS:-0}"
 
-# How often to re-announce the mDNS service while armed. The iPhone does not
-# poll for AirDrop receivers; it only picks us up from an announce burst, so a
-# receiver that announces once is invisible for all but the first few seconds
-# of being on. 30s keeps us discoverable without churning the HTTPS server.
-REANNOUNCE="${AIRDROP_REANNOUNCE:-30}"
+# How often opendrop re-sends its mDNS announcement while armed. The iPhone
+# does not poll for AirDrop receivers; it only picks us up from an announce
+# burst, so a receiver that announces once is invisible for all but the first
+# few seconds of being on. Handled in-process by
+# patches/opendrop-mdns-reannounce.patch and passed through as
+# OPENDROP_ANNOUNCE_INTERVAL - it no longer costs a restart, so it can be
+# frequent. 5s gives the phone a burst to catch well within the time it takes
+# to open the share sheet.
+REANNOUNCE="${AIRDROP_REANNOUNCE:-5}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
 
@@ -295,6 +299,7 @@ serve_forever() {
     # the lines reach the log file as they happen rather than sitting in an
     # 8 KiB block buffer, which matters when reading it live during a transfer.
     ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" PYTHONUNBUFFERED=1 \
+        OPENDROP_ANNOUNCE_INTERVAL="$REANNOUNCE" \
         "$OPENDROP" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
     OD_PID=$!
 
@@ -313,31 +318,15 @@ serve_forever() {
           log "HEALTH: awdl0 or owl vanished while armed"
           break
         fi
-        # Re-announce. python-zeroconf announces ONCE at registration and the
-        # iPhone does not poll - it only learns we exist by catching that
-        # burst. Measured repeatedly: the phone connects within seconds of an
-        # opendrop restart and is blind to us otherwise, which is why the
-        # receiver looked like it "worked then vanished". Restarting opendrop
-        # is the only re-announce hook available from out here.
-        #
-        # Never do it mid-transfer: an ESTABLISHED socket on the data port
-        # means a file is moving, so hold off and try again next tick.
-        if [ "$elapsed" -ge "$REANNOUNCE" ]; then
-          # -H matters: without it ss prints its column header even when
-          # nothing matches, so `grep -q .` always succeeded and the
-          # re-announce was deferred forever - i.e. permanently invisible
-          # to the phone after the first burst, the exact bug re-announcing
-          # exists to fix.
-          if ss -Htn state established "( sport = :8771 or sport = :8772 )" \
-               2>/dev/null | grep -q .; then
-            log "re-announce deferred - transfer in flight"
-          else
-            log "re-announcing (${REANNOUNCE}s since last)"
-            kill "$OD_PID" 2>/dev/null
-            break
-          fi
-          elapsed=0
-        fi
+        # Re-announcing lives INSIDE opendrop now (patches/opendrop-mdns-
+        # reannounce.patch), which is the whole reason this loop no longer
+        # kills it. Doing it from out here meant killing the process and
+        # letting it re-register: that deregistered the service and dropped
+        # the HTTPS listener for ~1.5s every REANNOUNCE seconds, so the
+        # receiver appeared and vanished on the phone's share sheet on a
+        # 30s period. The in-process version re-sends the records without
+        # ever taking the registration or the listener down, so it also does
+        # not need the mid-transfer guard this loop used to carry.
       done ) &
     HEALTH_PID=$!
 

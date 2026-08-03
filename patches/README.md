@@ -12,6 +12,28 @@ git apply /path/to/airdrop-mt7921/patches/opendrop-ios26-airdrop.patch
 (Void has no `patch(1)` installed; `git apply` works and the patch is verified
 against it.)
 
+## opendrop-mdns-reannounce.patch
+
+Re-sends the receiver's mDNS announcement every
+`OPENDROP_ANNOUNCE_INTERVAL` seconds (default 5) from a daemon thread, without
+touching the registration or the HTTPS listener.
+
+python-zeroconf announces at registration and then goes quiet, and the iPhone
+does not poll for AirDrop receivers - it only ever learns we exist by catching
+an announce burst. Over AWDL that burst also has to survive a link we are only
+co-channel on for a fraction of each 1.048 s sequence, so a single burst at
+startup is routinely missed outright.
+
+`airdropd` used to get the same effect by killing opendrop every 30 s and
+letting it re-register. That deregistered the service and dropped the listener
+for ~1.5 s per cycle, so the receiver visibly appeared and vanished on the
+phone's share sheet on a 30 s period, and a transfer starting near the boundary
+lost its socket. The kill loop is gone; `airdropd` now just passes the interval
+through.
+
+Note this is the receiving side. `opendrop-mdns-repeat.patch` is the sending
+side - it repeats the PTR *query* while browsing, for the same reason.
+
 ## opendrop-ios26-airdrop.patch
 
 Three fixes, all needed before an iPhone on iOS 26 can complete a transfer.
