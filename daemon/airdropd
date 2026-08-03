@@ -306,7 +306,12 @@ serve_forever() {
         # Never do it mid-transfer: an ESTABLISHED socket on the data port
         # means a file is moving, so hold off and try again next tick.
         if [ "$elapsed" -ge "$REANNOUNCE" ]; then
-          if ss -tn state established "( sport = :8771 or sport = :8772 )" \
+          # -H matters: without it ss prints its column header even when
+          # nothing matches, so `grep -q .` always succeeded and the
+          # re-announce was deferred forever - i.e. permanently invisible
+          # to the phone after the first burst, the exact bug re-announcing
+          # exists to fix.
+          if ss -Htn state established "( sport = :8771 or sport = :8772 )" \
                2>/dev/null | grep -q .; then
             log "re-announce deferred - transfer in flight"
           else
@@ -392,7 +397,18 @@ cmd_run() {
 }
 
 cmd_status() {
-  if [ -r "$STATE" ]; then cat "$STATE"; else echo '{"state":"off"}'; fi
+  if [ ! -r "$STATE" ]; then echo '{"state":"off"}'; return 0; fi
+  # The state file outlives the daemon, so on its own it can lie. It lies in
+  # exactly one way that matters: a toggle nudges "waking" and then the launch
+  # loses the flock race against the previous instance's cleanup, so the click
+  # is swallowed and the bar sits on "drop on" forever with nothing running.
+  # If the lock is free, nothing is running, whatever the file says.
+  if ! grep -q '"state":"off"' "$STATE" 2>/dev/null \
+     && flock -n 8 8>>"$LOCK" 2>/dev/null; then
+    echo '{"state":"off"}'
+    return 0
+  fi
+  cat "$STATE"
 }
 
 cmd_stop() {
