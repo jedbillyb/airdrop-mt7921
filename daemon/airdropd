@@ -121,23 +121,41 @@ chan_supported() {
 # into GO_CHAN, and from then on every bring-up reused that one number and the
 # station was never consulted again.
 BUILT_CHAN=""
-# The managed (station) vif. Resolved once - it does not get renamed while we
-# run - and cached at script scope so the health watch can read the station's
-# channel every tick without repeating the lookup.
+# The managed (station) vif. Cached at script scope so the health watch can read
+# the station's channel every tick without repeating the lookup, and invalidated
+# by sta_channel() whenever a read comes back empty - the name is stable in
+# normal operation but not across a driver reset.
 STA=""
+# The station's channel as of the last sta_channel() call; empty when unknown.
+STA_CHAN=""
 
+# BOTH OF THESE ASSIGN RATHER THAN PRINT, which is not a style choice: a
+# caller writing ch=$(sta_channel) runs the whole thing in a subshell, so the
+# interface name resolved inside it is discarded the moment it returns. The
+# cache would never be warm, every tick would re-run the full `iw dev` scan,
+# and - worse - invalidating the cache on a failed read would be a no-op,
+# because there is nothing in this shell left to invalidate.
 sta_iface() {
   [ -n "$STA" ] || STA=$(iw dev 2>/dev/null \
     | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
-  printf '%s' "$STA"
+  [ -n "$STA" ]
 }
 
-# The station's CURRENT channel, read live every time. Empty if there is no
-# managed vif or it is not associated.
+# Read the station's CURRENT channel into STA_CHAN. Returns 1, with STA_CHAN
+# empty, when there is no managed vif or it is not associated.
 sta_channel() {
-  local s; s=$(sta_iface)
-  [ -n "$s" ] || return 1
-  iw dev "$s" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
+  STA_CHAN=""
+  sta_iface || return 1
+  STA_CHAN=$(iw dev "$STA" info 2>/dev/null | grep -oP 'channel \K[0-9]+')
+  [ -n "$STA_CHAN" ] && return 0
+  # Drop the cached name on any failed read. It may simply be unassociated, in
+  # which case re-resolving costs one extra `iw dev` per tick while it is down
+  # - but it may also have been renamed or removed by a driver reset, and a
+  # cache that never expires turns that into a permanently empty channel: the
+  # station silently stops being consulted and go_target falls through to the
+  # peer fallback forever.
+  STA=""
+  return 1
 }
 
 # Which channel should the GO be built on, and why? Sets GO_TARGET, GO_REASON,
@@ -161,7 +179,8 @@ go_target() {
   local peer="${1:-}" sta_chan
   GO_TARGET=""; GO_REASON=""; GO_FAIL=""
 
-  sta_chan=$(sta_channel)
+  sta_channel
+  sta_chan="$STA_CHAN"
 
   # The whole point of P2P-GO mode is keeping the internet, so refuse the
   # combination that provably cannot hold it. Measured 2026-08-03, one evening,
@@ -371,6 +390,27 @@ stack_up() {
   return 0
 }
 
+# Block until the station is associated on 5GHz again. Used after the 2.4GHz
+# guard has torn the GO down: there is no point retrying a bring-up, because
+# go_target would refuse on the same rule every time and each attempt would only
+# add a log line. Waiting costs nothing and re-arms by itself the moment the
+# station is somewhere a GO can coexist with it.
+#
+# Deliberately does NOT re-arm on an unreadable channel. Empty means no
+# association at all, and coming back up on the last-resort ch149 against an
+# unknown station is exactly the gamble this guard exists to stop taking.
+wait_for_5ghz() {
+  log "holding off until the station is back on 5GHz"
+  while :; do
+    sleep 5
+    sta_channel
+    if [ -n "$STA_CHAN" ] && [ "$STA_CHAN" -gt 14 ]; then
+      log "station back on 5GHz ch$STA_CHAN - re-arming"
+      return 0
+    fi
+  done
+}
+
 # stack_up, but it does not give up. A failed bring-up used to `break` out of
 # serve_forever, which ended the daemon: the bar's switch went back to "drop
 # off" and whatever went wrong - a momentary hostapd failure, the AP briefly
@@ -465,6 +505,32 @@ serve_forever() {
       while kill -0 "$OD_PID" 2>/dev/null; do
         sleep 5
         elapsed=$((elapsed + 5))
+        sta_channel; sta_now="$STA_CHAN"
+
+        # 2.4GHz GUARD. The measurement behind go_target's bring-up refusal is
+        # not a property of the moment we start: a 2.4GHz station cannot hold
+        # its association alongside a second chanctx AT ALL, whenever the two
+        # come to coexist. Until now the rule ran once, at bring-up, so a
+        # station that roamed onto 2.4GHz while the GO was up walked straight
+        # into the configuration the refusal exists to prevent - and the first
+        # symptom is the network dropping, not AirDrop failing.
+        #
+        # So this is checked first, before liveness and before the channel
+        # watch, and it is acted on here rather than signalled to the parent:
+        # every tick of delay is a tick of "Connection to AP lost". Protecting
+        # the Wi-Fi outranks keeping AirDrop up, so the GO goes down now and
+        # argues later. No retry - a bring-up would only refuse on the same
+        # rule - just a wait for the station to come back to 5GHz.
+        if [ -n "$sta_now" ] && [ "$sta_now" -le 14 ]; then
+          log "STATION ON 2.4GHz ch$sta_now - tearing the GO down to protect the association"
+          sudo -n "$HELPER" owl-stop >/dev/null 2>&1
+          sudo -n "$HELPER" go-down >/dev/null 2>&1
+          set_state error "Wi-Fi moved to 2.4GHz (ch$sta_now); AirDrop is off until it is back on 5GHz"
+          : > "$RUNDIR/sta_24"
+          kill "$OD_PID" 2>/dev/null
+          break
+        fi
+
         if ! ip link show awdl0 >/dev/null 2>&1 || ! pgrep -x airdrop-owl >/dev/null; then
           set_state error "stack died (awdl0 or owl gone) - toggle off and on"
           log "HEALTH: awdl0 or owl vanished while armed"
@@ -518,9 +584,9 @@ serve_forever() {
           # so the last known value is marked ~stale rather than reprinted as
           # though it were current.
           if [ -n "$overlapping" ]; then
-            log "CHAN sta=ch$(sta_channel || echo '?') go=ch$BUILT_CHAN peer=ch${want:-?}~stale overlap=${kept:-0}/16"
+            log "CHAN sta=ch${sta_now:-?} go=ch$BUILT_CHAN peer=ch${want:-?}~stale overlap=${kept:-0}/16"
           else
-            log "CHAN sta=ch$(sta_channel || echo '?') go=ch$BUILT_CHAN peer=ch${want:-?} overlap=0/16"
+            log "CHAN sta=ch${sta_now:-?} go=ch$BUILT_CHAN peer=ch${want:-?} overlap=0/16"
           fi
 
           if [ -z "$overlapping" ] \
@@ -575,6 +641,26 @@ serve_forever() {
     OD_PID=""
     kill "$HEALTH_PID" 2>/dev/null
     HEALTH_PID=""
+
+    # The 2.4GHz guard has already taken the GO down - the radio is safe and
+    # the state file says why. All that is left is to wait for the station to
+    # come back to 5GHz and re-arm on whatever channel it landed on. Checked
+    # before the wrong-channel block because any pending channel request is
+    # about a stack that no longer exists.
+    if [ -e "$RUNDIR/sta_24" ]; then
+      rm -f "$RUNDIR/sta_24" "$RUNDIR/want_chan"
+      # Nothing of ours is on the radio now, and the station may sit on 2.4GHz
+      # for hours, so give the system its mDNS responder back for the duration
+      # rather than leaving .local resolution broken the whole time. Taken
+      # again on the way back up, for the reason avahi_stop documents.
+      avahi_restore
+      wait_for_5ghz
+      avahi_stop
+      stack_up_retry
+      log "opendrop exited - respawning"
+      sleep 1
+      continue
+    fi
 
     # The wrong-channel watch asked for a different GO channel. Tear the radio
     # stack down and bring it back up there. Only the GO path can do this - on
@@ -644,6 +730,9 @@ cmd_run() {
   trap cleanup EXIT
 
   : > "$LOG"
+  # Both are requests from a previous run's health watch. Surviving a crash,
+  # they would be acted on against a stack that has nothing to do with them.
+  rm -f "$RUNDIR/sta_24" "$RUNDIR/want_chan"
 
   if [ "$ALWAYS" = 1 ]; then
     log "airdropd started in always-on mode (dualchan=$DUALCHAN)"
