@@ -142,6 +142,90 @@ sta_channel() {
   iw dev "$s" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
 }
 
+# Which channel should the GO be built on, and why? Sets GO_TARGET, GO_REASON,
+# and on failure GO_FAIL (band|chan). Returns 1 when no GO can be built at all.
+#
+# PRECEDENCE: THE STATION FIRST, the peer only as a fallback. This is the
+# inverse of what the wrong-channel watch used to do, and the measurement is
+# unambiguous about which way round it goes. With the AP on ch36 the phone
+# advertised
+#   36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36
+# - six slots of 36 against two of 149. Following the peer to its "dominant"
+# 149 bought 2/16 overlap: owl synced, saw the phone at rssi -28, and not one
+# IPv6 packet crossed in 60s with the share sheet open. Sitting on the station's
+# ch36 is 6/16 of the same sequence AND is the pairing measured to hold the
+# association (ch36+ch36 held; ch36+ch149 held the link but carried nothing).
+#
+# So the peer's channel is not evidence about where WE should be. It is only
+# useful when the station cannot tell us anything: unreadable, or on a channel
+# no GO can be built on.
+go_target() {
+  local peer="${1:-}" sta_chan
+  GO_TARGET=""; GO_REASON=""; GO_FAIL=""
+
+  sta_chan=$(sta_channel)
+
+  # The whole point of P2P-GO mode is keeping the internet, so refuse the
+  # combination that provably cannot hold it. Measured 2026-08-03, one evening,
+  # same chip and phone:
+  #
+  #   STA ch2  + GO ch149  -> association lost ("Connection to AP lost" 1/s)
+  #   STA ch2  + GO ch6    -> association lost, though both are 2.4GHz
+  #   STA ch36 + GO ch149  -> held, 60s clean, 0% loss to the gateway
+  #   STA ch36 + GO ch36   -> held
+  #
+  # So the predictor is NOT whether the two channels share a band - the ch6
+  # case rules that out. It is the STA's own band: a 2.4GHz association does
+  # not survive a second chanctx at all, a 5GHz one does. Refuse up front,
+  # because a bar switch that silently drops your network is worse than one
+  # that declines to turn on and says why. Checked here rather than in
+  # stack_up so that a caller can ask "could we?" without tearing anything down.
+  if [ -n "$sta_chan" ] && [ "$sta_chan" -le 14 ]; then
+    GO_FAIL=band
+    GO_REASON="STA is on 2.4GHz ch$sta_chan; a GO alongside it drops the link"
+    return 1
+  fi
+
+  # An explicit override is an instruction, not a guess - it outranks both.
+  if [ "$GO_CHAN" != auto ]; then
+    if chan_supported "$GO_CHAN"; then
+      GO_TARGET="$GO_CHAN"; GO_REASON="AIRDROP_GO_CHAN=$GO_CHAN (explicit)"
+      return 0
+    fi
+    GO_FAIL=chan
+    GO_REASON="AIRDROP_GO_CHAN=$GO_CHAN is not one of $GO_CHANNELS"
+    return 1
+  fi
+
+  if [ -n "$sta_chan" ] && chan_supported "$sta_chan"; then
+    GO_TARGET="$sta_chan"
+    GO_REASON="following STA ${STA:-?} on ch$sta_chan"
+    return 0
+  fi
+
+  if [ -n "$peer" ] && chan_supported "$peer"; then
+    GO_TARGET="$peer"
+    if [ -n "$sta_chan" ]; then
+      GO_REASON="STA ch$sta_chan cannot host a GO ($GO_CHANNELS); falling back to the peer's ch$peer"
+    else
+      GO_REASON="STA channel unreadable; falling back to the peer's ch$peer"
+    fi
+    return 0
+  fi
+
+  # Nothing to go on from either side. Build something rather than nothing -
+  # this is the old ${sta_chan:-149} fallback, kept, but now it says so.
+  if [ -z "$sta_chan" ] && [ -z "$peer" ]; then
+    GO_TARGET=149
+    GO_REASON="no STA channel and no peer hint - last-resort ch149"
+    return 0
+  fi
+
+  GO_FAIL=chan
+  GO_REASON="cannot follow: STA ch${sta_chan:-?}, peer ch${peer:-none}, buildable are $GO_CHANNELS"
+  return 1
+}
+
 # State is written for waybar to read. Keep it a single line and always
 # rewrite atomically: waybar polls on its own schedule and a half-written file
 # is a parse error on the bar.
@@ -211,47 +295,26 @@ stack_up() {
   local peer_hint="${1:-}"
   local up chan owlargs
 
-  # The whole point of P2P-GO mode is keeping the internet, so refuse the
-  # combination that provably cannot hold it. Measured 2026-08-03, one evening,
-  # same chip and phone:
-  #
-  #   STA ch2  + GO ch149  -> association lost ("Connection to AP lost" 1/s)
-  #   STA ch2  + GO ch6    -> association lost, though both are 2.4GHz
-  #   STA ch36 + GO ch149  -> held, 60s clean, 0% loss to the gateway
-  #   STA ch36 + GO ch36   -> held
-  #
-  # So the predictor is NOT whether the two channels share a band - the ch6
-  # case rules that out. It is the STA's own band: a 2.4GHz association does
-  # not survive a second chanctx at all, a 5GHz one does. Refuse up front,
-  # because a bar switch that silently drops your network is worse than one
-  # that declines to turn on and says why.
-  local go_chan="$GO_CHAN"
+  local go_chan=""
   if [ "$DUALCHAN" = 1 ]; then
-    # Read the station LIVE, on every single bring-up. Not once at startup and
-    # not carried over from the last one: a rebuild exists precisely because
-    # something moved, and the station is the thing most likely to have moved.
-    local sta_chan
-    sta_chan=$(sta_channel)
-    if [ -n "$sta_chan" ] && [ "$sta_chan" -le 14 ]; then
-      log "REFUSING: STA on 2.4GHz ch$sta_chan - a GO alongside it drops the link"
-      set_state error "Wi-Fi is on 2.4GHz (ch$sta_chan); AirDrop needs a 5GHz AP"
+    # Resolve the channel from scratch, LIVE, on every single bring-up - the
+    # station is read here and nowhere else is it remembered. A rebuild exists
+    # precisely because something moved, and the station is the thing most
+    # likely to have moved. All the policy, and the reason for it, is in
+    # go_target(); this only has to report what it decided and act on it.
+    if ! go_target "$peer_hint"; then
+      case "$GO_FAIL" in
+        band)
+          log "REFUSING: $GO_REASON"
+          set_state error "Wi-Fi is on 2.4GHz; AirDrop needs a 5GHz AP" ;;
+        *)
+          log "CANNOT FOLLOW: $GO_REASON"
+          set_state unreachable "$GO_REASON" ;;
+      esac
       return 1
     fi
-
-    # Follow the STA rather than pinning a constant. The phone is on the same
-    # AP, and iOS weights its AWDL channel sequence heavily toward the channel
-    # its own association is on: with the AP on ch36 the phone advertised
-    #   36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36
-    # i.e. six slots of 36 against two of 149. Pinned to 149 we overlapped the
-    # phone 2/16 of the time; owl synced and saw it at rssi -28, but not one
-    # IPv6 packet made it across in 60s with the share sheet open - AWDL up,
-    # data plane dead. The AP moves between channels, so a constant is wrong
-    # somewhere by definition; the STA's channel tracks it for free and is
-    # also the pairing measured to hold the association (ch36+ch36 above).
-    if [ "$go_chan" = auto ]; then
-      go_chan="${peer_hint:-${sta_chan:-149}}"
-      log "GO channel auto -> ch$go_chan (peer hint ${peer_hint:-none}, STA ${sta_chan:-?} on ${STA:-?})"
-    fi
+    go_chan="$GO_TARGET"
+    log "GO channel -> ch$go_chan ($GO_REASON)"
   fi
   if [ "$DUALCHAN" = 1 ]; then
     # P2P-GO mode: pick AWDL's channel ourselves instead of hoping the AP's
@@ -454,9 +517,15 @@ serve_forever() {
           # a momentary gap is normal. Only act once it has been unreachable
           # for a sustained stretch.
           if [ "$no_overlap" -ge "$WRONGCHAN_AFTER" ]; then
-            if [ "$GO_FOLLOW" = 1 ] && [ "$DUALCHAN" = 1 ]; then
-              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want - rebuilding GO"
-              set_state waking "moving to ch $want"
+            # Ask the precedence BEFORE killing opendrop. Under station-first
+            # the common answer is "stay where you are", and acting on the old
+            # assumption that a wrong channel always means a rebuild would tear
+            # the HTTPS listener and the mDNS registration down every
+            # WRONGCHAN_AFTER seconds to accomplish nothing.
+            if [ "$GO_FOLLOW" = 1 ] && [ "$DUALCHAN" = 1 ] \
+               && go_target "$want" && [ "$GO_TARGET" != "$BUILT_CHAN" ]; then
+              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want - rebuilding on ch $GO_TARGET ($GO_REASON)"
+              set_state waking "moving to ch $GO_TARGET"
               # The GO cannot retune in place: hostapd chan_switch returns FAIL
               # for every parameter form, including a same-subband 149->153 hop,
               # and this phy advertises no channel-switch support (tested
@@ -467,8 +536,12 @@ serve_forever() {
               kill "$OD_PID" 2>/dev/null
               break
             else
-              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want (not following)"
-              set_state error "wrong channel: phone is on ch $want, we are on ch $BUILT_CHAN"
+              # Either following is off, or the precedence says our channel is
+              # still the right one to be on. Either way the phone cannot see
+              # us, which the bar has to say - but opendrop keeps running,
+              # because nothing about the stack is broken.
+              log "WRONG CHANNEL: on ch $BUILT_CHAN, phone wants ch $want - staying (${GO_REASON:-following is off})"
+              set_state unreachable "phone is on ch$want; we are on ch $BUILT_CHAN"
             fi
             no_overlap=0
           fi
@@ -486,17 +559,23 @@ serve_forever() {
     # the single-channel path owl retunes itself and there is nothing to rebuild.
     if [ -s "$RUNDIR/want_chan" ]; then
       want_chan=$(cat "$RUNDIR/want_chan"); rm -f "$RUNDIR/want_chan"
-      # VALIDATE BEFORE TEARING ANYTHING DOWN. The peer's channel is whatever
-      # the phone happens to be on, which is frequently a channel no GO can be
-      # built on here (anything outside GO_CHANNELS). Tearing the stack down
-      # first and discovering that afterwards traded a working receiver on the
-      # wrong channel for no receiver at all - and then exited. A refusal has
-      # to be free: log it, say so on the bar, leave the radio exactly as it is.
-      if ! chan_supported "$want_chan"; then
-        log "CANNOT FOLLOW to ch$want_chan: not one of $GO_CHANNELS - staying on ch $BUILT_CHAN"
+      # ASK BEFORE TEARING ANYTHING DOWN, and ask the same function the
+      # bring-up will ask, so the answer cannot differ between deciding and
+      # doing. Tearing the stack down first and discovering afterwards that the
+      # target was unbuildable traded a working receiver on the wrong channel
+      # for no receiver at all. A refusal has to be free: log it, say so on the
+      # bar, leave the radio exactly as it is.
+      if ! go_target "$want_chan"; then
+        log "CANNOT FOLLOW to ch$want_chan: $GO_REASON - staying on ch $BUILT_CHAN"
         set_state unreachable "cannot follow to ch$want_chan; still on ch $BUILT_CHAN"
-      elif [ "$want_chan" != "$BUILT_CHAN" ]; then
-        log "rebuilding stack on ch $want_chan (was ch $BUILT_CHAN)"
+      elif [ "$GO_TARGET" = "$BUILT_CHAN" ]; then
+        # The peer moved, we did not, and the station says stay. This is the
+        # precedence doing its job rather than a failure - but we ARE now
+        # invisible to that phone, so the bar must not keep saying "on".
+        log "peer wants ch$want_chan; $GO_REASON - staying on ch $BUILT_CHAN"
+        set_state unreachable "phone is on ch$want_chan; staying on ch $BUILT_CHAN with the Wi-Fi"
+      else
+        log "rebuilding stack on ch $GO_TARGET (was ch $BUILT_CHAN): $GO_REASON"
         sudo -n "$HELPER" owl-stop >/dev/null 2>&1
         sudo -n "$HELPER" go-down >/dev/null 2>&1
         # The peer's channel is passed in for THIS bring-up only. It used to be
