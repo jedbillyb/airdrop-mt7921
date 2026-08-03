@@ -61,9 +61,10 @@ MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
 # this defaults OFF. Set AIRDROP_DUALCHAN=1 to try it.
 DUALCHAN="${AIRDROP_DUALCHAN:-0}"
 # GO channel POLICY, fixed for the life of the daemon. "auto" = whatever
-# go_target() decides at each bring-up, which is the station's channel unless
-# the station cannot supply one; anything else is an explicit override and is
-# honoured as given. This value is never rewritten at runtime - the channel the
+# go_target() decides at each bring-up: the station's channel when that is one
+# we can build on, else the peer's, else ch149 for any other 5GHz station;
+# anything else is an explicit override and is honoured as given. This value is
+# never rewritten at runtime - the channel the
 # GO currently sits on is BUILT_CHAN, and conflating the two is what previously
 # turned "auto" into a constant after the first channel correction.
 GO_CHAN="${AIRDROP_GO_CHAN:-auto}"
@@ -227,6 +228,29 @@ go_target() {
     else
       GO_REASON="STA channel unreadable; falling back to the peer's ch$peer"
     fi
+    return 0
+  fi
+
+  # The STA is on 5GHz but not on a channel we can build a GO on - ch157 on
+  # the "student" network is the case that found this, and any 5GHz channel
+  # outside $GO_CHANNELS lands here. Refusing outright was wrong: the rule the
+  # 2.4GHz guard above encodes is that the association survives a second
+  # chanctx iff the STA is on 5GHz, and it says nothing about the two channels
+  # matching (STA ch36 + GO ch149 held clean). So a 5GHz STA can host a GO on
+  # 149 regardless of which 5GHz channel it is itself on - confirmed on
+  # 2026-08-04, STA ch157 + GO ch149: armed, and the association held for the
+  # whole 60s with no "Connection to AP lost" at all. It is not free, and the
+  # numbers here are the dualchan uplink cost rather than a broken link -
+  # 59/60 to the gateway, avg 164ms / max 473ms against a 30/30, avg 20ms /
+  # max 167ms baseline on the same (busy) network minutes earlier. That sits
+  # inside the ~40-590ms DUALCHAN already documents. 149 rather than 36/44
+  # because it is a standard AWDL social channel, so the phone scans it anyway.
+  #
+  # Below the peer hint deliberately: if we can see the peer and it is on a
+  # buildable channel, its real channel beats a blind guess.
+  if [ -n "$sta_chan" ] && [ "$sta_chan" -gt 14 ]; then
+    GO_TARGET=149
+    GO_REASON="STA ch$sta_chan is 5GHz but not buildable ($GO_CHANNELS); using ch149"
     return 0
   fi
 
