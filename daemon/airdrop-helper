@@ -296,18 +296,21 @@ EOF
     # active` vif that can ACK while riding the AP's chanctx (§14).
     vif="${3:-$MONA}"
 
-    # Sequence strategy. `verbatim` copies whichever row a peer last advertised,
-    # so our presence drifts with the phone's: measured across one evening the
-    # same iPhone cycled between 1/16 and 15/16 slots on a channel, and when it
-    # dropped to its sparse idle row our slots stopped overlapping its active
-    # ones and discovery died. `pin` holds all 16 slots on our own channel, so
-    # our presence is constant while the phone's varies - we are then present
-    # for every slot the phone offers, whatever row it picks. Slots 2 and 10
-    # were ch149 in EVERY sequence observed, which is why 149 is the default
-    # anchor. Override with AIRDROP_OWL_STRATEGY if a peer needs verbatim.
-    strategy="${AIRDROP_OWL_STRATEGY:-pin}"
+    # Sequence strategy. `pin` was the default here and should not have been:
+    # OWL's own channel.h records it measured as REJECTED by iOS 26 (§25, "same
+    # phone, same setup, same binary, verbatim 60% ping loss against pin 100%"),
+    # because one channel in all 16 slots with no empty slots looks like nothing
+    # an Apple device emits. The helper default contradicted the finding.
+    #
+    # `intersect` is the right shape for THIS configuration. Under P2P-GO the
+    # radio is held on one channel by go0's chanctx and OWL's channel switching
+    # is a silent no-op - measured, 2425 of 2425 captured frames on 5180 MHz
+    # while OWL logged ten switches to 149 and ten back. So we advertise exactly
+    # the peer's slots that sit on our channel and leave the rest empty: true,
+    # and structurally like a real sequence.
+    strategy="${AIRDROP_OWL_STRATEGY:-intersect}"
     case "$strategy" in
-      pin|verbatim|fixed) ;;
+      pin|verbatim|fixed|intersect|widen|rotate) ;;
       *) echo "airdrop-helper: bad strategy $strategy" >&2; exit 1 ;;
     esac
 
