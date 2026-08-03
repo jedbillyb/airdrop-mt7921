@@ -47,9 +47,18 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 |---|---|
 | Receiving from an iPhone | **works** (iOS 26, proven end to end) |
 | Sending to an iPhone | **works** (iOS 26, `POST /Upload -> 200`, file delivered - see [FINDINGS §37](docs/FINDINGS.md)) |
-| Receive throughput | ~40-45 kB/s with `-S verbatim` - ~22 kB per availability window, ~1.8 windows/s ([§18](docs/FINDINGS.md)) |
+| Receive throughput | 45-67 kB/s with `-S verbatim`, varying run to run with the sequence the peer advertises - ~22 kB per availability window ([§18](docs/FINDINGS.md)) |
 | Send throughput | not yet measured - the proving run sent a 68-byte file; needs a real file + `tools/bursts.py` |
+| Wi-Fi at the same time | **works**, via P2P-GO ([§46](docs/FINDINGS.md)); costs ~200-400 ms uplink latency while up |
 | Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.18.33 |
+
+**Two paths, and they are at different stages.** The standalone `airdrop.sh` is
+the proven one: a full 2.56 MB photo, byte-exact and PIL-verified, in 40 s at
+~67 kB/s. It takes the card exclusively, so you have no internet while it runs.
+The `daemon/airdropd` waybar switch keeps your Wi-Fi up and has carried a real
+transfer to **99.1%**, but has not yet been seen to complete one - see
+[`daemon/README.md`](daemon/README.md#limitations) for exactly what is and is
+not proven there.
 
 The auth wall that everyone warns about was never reached, in **either**
 direction. In **Everyone** mode an iPhone both accepts an unsigned receiver and
@@ -72,6 +81,9 @@ announces `TransferID={'id': UUID}` in its `/Ask` body and repeats the same id o
 - A patched OWL build - see below
 - OpenDrop, patched with `patches/opendrop-ios26-airdrop.patch`
 - Root, and a willingness to lose networking for the duration of a run
+  (`airdrop.sh` only - the `daemon/` path keeps the association up and needs a
+  5 GHz AP plus the patched hostapd instead; see
+  [`daemon/README.md`](daemon/README.md))
 
 ## Setup
 
@@ -251,16 +263,27 @@ P2P-GO vif plus a MAC-aliased monitor vif lets a single MT7921 pick AWDL's
 channel independently of the AP's, on a stock kernel, and it has now also been
 shown to survive a real Wi-Fi reassociation.
 
-This mechanism **is now ported into `daemon/airdropd`**, as an opt-in mode
-(`AIRDROP_DUALCHAN=1`) rather than the default - it's newer and less proven
-than the AP-channel mode above, and carries its own open questions (active-
-monitor ACKs against a GO chanctx untested, ~40-590ms added latency the whole
-time `go0` is up). See [`daemon/README.md`](daemon/README.md#p2p-go-mode-airdrop_dualchan1--opt-in-less-proven-than-the-default)
-for the details. It is **not** wired into the plain `KEEP_WIFI=1` /
-`airdrop.sh` path, only the daemon. Until either mode is shown to complete a
-real transfer, the fallback for "Wi-Fi and AirDrop simultaneously with no
-conditions attached, no caveats" is still giving AWDL its own radio (an
-AR9271 on USB): two phys, no shared channel context.
+This mechanism **is now ported into `daemon/airdropd`** as an opt-in mode
+(`AIRDROP_DUALCHAN=1`), and it is what the waybar switch actually runs. It has
+since carried a real transfer to 99.1% with the association up throughout, so
+"untested" no longer describes it - but it has not been seen to complete one,
+and the remaining faults are listed honestly in
+[`daemon/README.md`](daemon/README.md#limitations). It is **not** wired into the
+plain `KEEP_WIFI=1` / `airdrop.sh` path, only the daemon.
+
+Constraints on this mode worth knowing before you try it:
+
+- Your station must be on **5 GHz**. A 2.4 GHz association provably cannot
+  survive a second channel context, whatever channel the GO uses. If your SSID
+  also has a 5 GHz BSS the daemon moves you to it for the session; if it does
+  not, the switch refuses.
+- The GO is built on `6/36/44/149`. A station on any *other* 5 GHz channel is
+  fine - the GO goes to ch149 alongside it (confirmed on ch100 and ch157).
+- Uplink latency is ~200-400 ms the whole time it is up.
+
+If you want AirDrop with no caveats at all, giving AWDL its own radio (an
+AR9271 on USB) is still the unconditional answer: two phys, no shared channel
+context.
 
 ## Two mt7921 driver bugs you will hit
 
@@ -283,7 +306,9 @@ retracted conclusions in `docs/FINDINGS.md` come from trusting `iw`.
 ## Repo layout
 
 ```
-airdrop.sh          the tool
+airdrop.sh          the tool - exclusive card, proven, no internet while it runs
+daemon/             airdropd: the always-on waybar switch, keeps your Wi-Fi up
+waybar/             the bar module (JSON status + click-to-toggle)
 patches/            OpenDrop fixes for iOS 26
 docs/FINDINGS.md    the full investigation, including what I got wrong
 docs/NOTES.md       dated lab notebook
