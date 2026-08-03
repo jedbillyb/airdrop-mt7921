@@ -138,9 +138,39 @@ for.
 |---|---|---|
 | `AIRDROP_MIN_RSSI` | `-70` | Ignore faint adverts. A transfer happens at arm's length; a weak advert is a stranger's phone and waking the radio for it is pure cost. |
 | `AIRDROP_WINDOW` | `90` | How long to stay up after a trigger. Also the worst case for how long the radio is committed. |
-| `AIRDROP_CONFIRM_TIMEOUT` | `45` | Unanswered prompt → decline. |
+| `AIRDROP_CONFIRM_TIMEOUT` | `45` | Unanswered prompt → decline. Always-on mode overrides this to `15`, so one unanswered prompt cannot fill the listen backlog. |
 | `AIRDROP_DUALCHAN` | `0` | Set `1` to use P2P-GO mode instead of the default AP-channel-borrowing mode. See below. |
-| `AIRDROP_GO_CHAN` | `149` | Which channel `go0` sits on in P2P-GO mode. One of `6/36/44/132/149`. |
+| `AIRDROP_GO_CHAN` | `auto` | Which channel `go0` sits on in P2P-GO mode. `auto` follows the station; an explicit value must be one of `6/36/44/149`. Never rewritten at runtime — the channel currently built is tracked separately. |
+| `AIRDROP_GO_FOLLOW` | `1` | Rebuild the GO on the peer's channel when the station cannot supply a usable one. `0` warns without rebuilding. |
+| `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
+| `AIRDROP_ALWAYS` | `0` | `1` = no BLE, stay advertising until toggled off. What the waybar switch sets. |
+
+The buildable channel set is `6/36/44/149` and is enforced in three places that
+must agree: `airdropd`'s `GO_CHANNELS`, `airdrop-helper`'s `go-up` and
+`owl-start`, and owl's own switch in `daemon/owl.c`. `132` was in the helper's
+list and not in owl's, which built a GO fine and then had owl exit — surfacing
+as the unrelated-sounding "awdl0 never appeared".
+
+### Channel policy in `auto`
+
+The **station's** channel wins; the peer's is a fallback used only when the
+station is unreadable or on a channel no GO can be built on. Measured against a
+phone advertising `36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36` with the AP on
+36: following the peer to its dominant 149 gives 2/16 overlap and moved zero
+bytes in 60 s, while the station's own 36 is 6/16 of the same sequence and is
+the pairing that holds the association.
+
+Consequence worth knowing: when the phone is on a *different* AP from us, we
+now stay put and go `unreachable` rather than chasing it. Waybar needs a CSS
+rule for `.unreachable` (it reads "drop on" — the receiver is up and would
+serve a phone on our channel).
+
+### If the station roams to 2.4 GHz
+
+The health watch tears the GO down within one 5 s tick and waits for 5 GHz
+before re-arming. A 2.4 GHz association provably cannot survive a second
+chanctx, and protecting the Wi-Fi outranks keeping AirDrop up. This is a guard,
+not roam handling: nothing follows the station's channel while the stack is up.
 
 ### P2P-GO mode (`AIRDROP_DUALCHAN=1`) — opt-in, less proven than the default
 

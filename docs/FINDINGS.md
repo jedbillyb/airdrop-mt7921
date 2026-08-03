@@ -3321,3 +3321,82 @@ a real mid-session channel move.**
 - owl logs `STATS` every 10 s: `tx_unicast` frozen while `tx_multicast` climbs
   means the unicast gate is shut; `rx_action` at 0 means the phone is not
   talking to us at all and no measurement on this box is meaningful.
+
+## §48 — the channel policy was backwards, and every "Accept" was a 403 (2026-08-03 late)
+
+Two unrelated faults, both of which presented as "AirDrop is unreliable".
+
+### The consent prompt lost a race with itself, every time
+
+`swaynag --button-dismiss-no-terminal` **dismisses first and runs the button's
+command from a detached child**. `airdrop-confirm` waited on swaynag and then
+tested for the Accept marker — a file that did not exist yet. It lost by two
+milliseconds, reproducibly:
+
+    /run/user/1000/airdrop-accept.LQtoEz  mtime 21:42:48.416265
+    opendrop logged "user declined"       at    21:42:48.418
+
+So every accept became a 403 on `/Ask`, and the phone sat on "Waiting" forever.
+Because the marker was written *after* the check it was never cleaned up
+either, so four orphaned markers in `XDG_RUNTIME_DIR` were the only evidence
+the button had ever been pressed. The single `declined or timed out` message
+is what made this look like a slow user rather than a bug — it conflated three
+different outcomes, one of which was "the code is wrong".
+
+Both buttons now write their own marker and the answer is whichever appears,
+polled, with the timeout as the outer bound and a second of grace after
+swaynag exits. Three outcomes, three messages.
+
+**The general lesson:** if a helper's exit is not the thing that produces the
+answer, do not wait on the helper's exit. Wait for the answer.
+
+### Diagnosing it: three checks that all lied
+
+The reported symptom was "opendrop is running but not listening", from:
+
+    ss -tlnp | grep -i python    -> empty
+    ss -tnp  | grep 8771         -> empty
+
+Both are wrong for different reasons, and the socket was up the whole time:
+
+- `-p` prints the **comm name**, which for the venv console script is
+  `opendrop`, not `python`.
+- `ss -tnp` without `-l` or `-a` lists **established connections only**, so a
+  listener with no live connection can never appear.
+
+`ss -tlnpH | grep "pid=$PID,"` is the form that answers the question.
+
+Two `airdropd` processes in `pgrep -a` are also not two daemons: a forked
+subshell keeps the parent's argv, so the health watch looks identical to its
+parent. The `flock` on `$RUNDIR/lock` already prevents duplicates, and that
+lock file *is* the pidfile — it holds the daemon's pid.
+
+### The station decides the channel, not the peer
+
+The wrong-channel watch let the peer's dominant channel win outright and wrote
+it into `GO_CHAN`, which permanently replaced `auto` with one number — so
+after the first correction the station was never consulted again. Inverted:
+station first, peer only when the station is unreadable or unbuildable, and
+`GO_CHAN` is policy that is never rewritten (the built channel is tracked
+separately). See daemon/README.md for the measurement.
+
+A failed rebuild used to `break` out of `serve_forever` and end the daemon,
+with the switch reading "drop off" and nothing running. It now validates the
+target *before* any teardown, refuses for free with a distinct `unreachable`
+state, and retries bring-up with backoff instead of exiting.
+
+### Still open
+
+1. **A real transfer has still not completed.** Every accept was a 403 all
+   evening, so the upload path past `/Ask` remains unproven from `airdropd`.
+   This is the next thing to test.
+2. **No roam detection.** The GO tracks the station at bring-up only. A
+   station roaming between 5 GHz channels is undetected; roaming to 2.4 GHz is
+   now caught by a guard that tears the GO down and waits, which protects the
+   association but does not follow.
+3. **A station on a 5 GHz channel outside `6/36/44/149`** (40, 48, 157, 161 …)
+   cannot host a GO at all, so the switch stays red and retries. Widening the
+   set means re-testing which pairings hold the association, DFS included.
+4. §47's "wrong-channel watch is untested live" is now partly answered: it
+   fires and logs correctly, but under station-first precedence it declines to
+   rebuild in the common case, which is intended and mostly untested.
