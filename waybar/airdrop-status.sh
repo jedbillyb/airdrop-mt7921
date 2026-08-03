@@ -54,7 +54,6 @@ fi
 
 STATE_JSON=$("$DAEMON" status 2>/dev/null || echo '{"state":"off"}')
 state=$(printf '%s' "$STATE_JSON" | grep -oP '"state":"\K[^"]+')
-detail=$(printf '%s' "$STATE_JSON" | grep -oP '"detail":"\K[^"]*')
 
 # Escape for JSON. A sender name or an error string can contain a quote or a
 # backslash, and one of those on the bar breaks waybar's parse for every
@@ -62,13 +61,19 @@ detail=$(printf '%s' "$STATE_JSON" | grep -oP '"detail":"\K[^"]*')
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 case "$state" in
-  off)    text="drop off";  class="off";    tip="AirDrop off - click to turn on" ;;
-  idle)   text="drop idle"; class="idle";   tip="AirDrop listening on Bluetooth. Open the share sheet on your iPhone." ;;
-  waking) text="drop ..";   class="waking"; tip="AirDrop turning on ($detail) - bringing the radio up" ;;
-  armed)  text="drop on";   class="armed";  tip="AirDrop on ($detail) - pick this machine on your iPhone. Wi-Fi stays up; uplink latency is raised while on." ;;
-  error)  text="drop err";  class="error";  tip="AirDrop error: $detail" ;;
-  *)      text="drop ?";    class="off";    tip="AirDrop: unknown state" ;;
+  # Only ever two labels: the switch is on or it is off. Everything else is
+  # carried by the class, which is the colour. "waking" reads as on
+  # deliberately - the click has happened and the switch IS on, the radio is
+  # just still catching up, and a third transient label made the bar look
+  # busier than the thing it describes. An error still reads "off", because
+  # that is the truth: you cannot receive. It is coloured red instead.
+  off)    text="drop off"; class="off"    ;;
+  idle)   text="drop on";  class="idle"   ;;
+  waking) text="drop on";  class="waking" ;;
+  armed)  text="drop on";  class="armed"  ;;
+  error)  text="drop off"; class="error"  ;;
+  *)      text="drop off"; class="error"  ;;
 esac
 
-printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' \
-  "$(esc "$text")" "$(esc "$class")" "$(esc "$tip")"
+# No tooltip key at all - waybar shows nothing on hover when it is absent.
+printf '{"text":"%s","class":"%s"}\n' "$(esc "$text")" "$(esc "$class")"
