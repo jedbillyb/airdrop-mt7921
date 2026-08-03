@@ -3127,3 +3127,197 @@ a real transfer. CSA on a GO is untested on this chip.
   always-on. `patches/opendrop-ask-confirm.patch` is not applied.
 - Active-monitor ACKs against a GO-held chanctx: untested. If unicast fails,
   try the §14 PAIR with both vifs MAC-aliased.
+
+## §47 — the always-on waybar toggle, end to end: five bugs, a new strategy, and a 99.1% photo (2026-08-03 evening)
+
+Starting point: the bar toggle existed (§46) but "turn it on and my phone never
+shows me". Ending point: a 666 KB photo arriving 99.1% intact at ~73 kB/s, with
+Wi-Fi up throughout. Five separate bugs were stacked, each of which alone was
+enough to break it. They are listed in the order they had to be peeled off,
+because each one hid the next.
+
+### 1. The re-announce never ran once (`fc075a1`)
+
+The guard meant to skip re-announcing mid-transfer was
+
+    ss -tn state established "( sport = :8771 or sport = :8772 )" | grep -q .
+
+and **`ss` prints its column header even when nothing matches**, so `grep -q .`
+was always true. Every tick logged `re-announce deferred - transfer in flight`
+with nothing transferring — fourteen in a row in the first capture. Since
+python-zeroconf announces once at registration and the iPhone never polls, the
+receiver was invisible from ~30 s after arming. Fix: `ss -Htn`.
+
+**Diagnostic:** `grep re-announcing $XDG_RUNTIME_DIR/airdropd/airdropd.log`. If
+only `deferred` lines appear, it is this class of bug, not the phone.
+
+### 2. The bar lied about being on (`fc075a1`)
+
+`status` trusted a state file that outlives the daemon. Toggle off then
+straight back on: the new `run` loses the flock race against the old instance's
+cleanup, exits silently, and leaves the click's nudged `waking` behind — bar
+reads "drop on" with no airdropd, no owl, no awdl0. `status` now treats a free
+lock as `off` regardless of the file.
+
+### 3. "Re-announce" was implemented as killing opendrop (`02b6619`)
+
+    19:41:19 re-announcing (30s since last)
+    19:41:19 opendrop exited - respawning
+    19:41:21 Starting HTTPS server
+
+Every `REANNOUNCE` seconds the service deregistered and nothing listened on
+8771 for ~1.5 s. **This is what "it appears then disappears" actually was** — a
+30-second flap, not a phone problem. A transfer starting near a boundary lost
+its socket outright.
+
+Fixed by `patches/opendrop-mdns-reannounce.patch`: opendrop re-sends its own
+records from a daemon thread (`OPENDROP_ANNOUNCE_INTERVAL`, default 5 s)
+without touching the registration or the listener. Verified 6 announces in
+32 s, one PID, zero restarts. The kill loop is gone.
+
+### 4. OWL's channel switching is a silent no-op under P2P-GO
+
+The measurement that reframed everything. In one 15 s capture on `mon0`:
+
+| what | count |
+|---|---|
+| frames on 5180 MHz | 2425 |
+| frames on any other frequency | 0 |
+| channel switches OWL logged in that window | 10 to ch149, 10 back to ch36 |
+
+`go0` owns the chanctx and `set_channel()` on the MAC-aliased monitor vif
+cannot move it. OWL believes it is hopping to follow the phone; the radio never
+leaves the GO's channel. **This is the structural cost of P2P-GO**: the thing
+that keeps the Wi-Fi association alive is exactly the thing that pins us to one
+channel while the phone ranges over 36/149/6 plus empty slots.
+
+Nor can the GO retune in place. `hostapd_cli chan_switch` returns FAIL for
+every parameter form tried, including a same-subband 149→153 hop:
+
+    chan_switch 5 5180 center_freq1=5180 bandwidth=20 ht   -> FAIL
+    chan_switch 5 5180                                     -> FAIL
+    chan_switch 5 5180 bandwidth=20                        -> FAIL
+    chan_switch 5 5180 center_freq1=5210 bandwidth=80 vht  -> FAIL
+    chan_switch 5 5765 center_freq1=5765 bandwidth=20 ht   -> FAIL
+
+hostapd logs `chanswitch: invalid frequency settings provided`; the phy
+advertises no channel-switch support. **Changing the GO's channel requires a
+full teardown and bring-up.**
+
+### 5. The strategy was one OWL's own header says iOS rejects
+
+`airdrop-helper` defaulted to `-S pin`, while `owl/src/channel.h` records PIN as
+measured *rejected* by iOS 26 (§25: same phone, same binary, verbatim 60% ping
+loss against pin 100%) because one channel in all 16 slots with no empty slots
+looks like nothing an Apple device emits. The helper default contradicted the
+finding it was documented against.
+
+**New strategy: INTERSECT** (`owl` `fa2e6b1`, helper default in `e5d215d`).
+Advertise the peer's own slots that sit on our channel; blank the rest. Both
+existing options lie in opposite directions — VERBATIM claims we follow the peer
+onto channels we are deaf on, PIN claims all 16 slots. The intersection is the
+only honest sequence for a radio that cannot hop, and empty slots are ordinary
+in every captured Apple sequence, so the structure §25 found to matter survives.
+Bytes are copied from the peer's sequence, never constructed.
+
+### What INTERSECT revealed: the phone widens for transfers
+
+The single most useful log line of the evening. The phone's sequence is not
+static and the idle figure is not the transfer figure:
+
+    20:33:07  intersect:  2/16 slots overlap        <- phone idle
+    20:33:08  peer -> 149,149,149,...,149 (x15)     <- phone WIDENS to send
+    20:33:08  intersect: 15/16 slots overlap        <- tracked instantly
+    20:33:13  peer narrows                          -> intersect:  5/16
+    20:33:19  peer narrows to idle row              -> intersect:  2/16
+
+`rx_data` went 205 → 689 in those ten seconds: ~484 AWDL data frames, ~660 KB,
+roughly **73 kB/s** against `airdrop.sh`'s proven 45–67 kB/s.
+
+Also note slot 0 is the device's **infra** channel — it read 36 while the phone
+was on the 5 GHz AP and 2 after it roamed to the 2.4 GHz one. That is why
+discovery works when the GO sits on the phone's slot-0 channel, and why a
+hardcoded GO channel is wrong in principle: it is right for one phone state,
+not for the phone.
+
+### 6. iOS keep-alive wedged the HTTP server completely (`87a7483`)
+
+The phone sat on "Waiting…" indefinitely:
+
+    Recv-Q 1496 on [fe80::...]%awdl0:8771, and no opendrop log line for 12 min
+
+opendrop's server was the stock single-threaded `HTTPServer`. iOS sends
+`Connection: keep-alive` and holds the connection open idle, so the server
+stayed parked in `handle_one_request()` on that idle socket and never got back
+to `accept()` — the connection actually carrying the file was never read.
+`patches/opendrop-threaded-server.patch` makes it `ThreadingHTTPServer` with
+`daemon_threads`.
+
+This is the same bottleneck that made one slow consent prompt fill the listen
+backlog with iOS validation connects (§46), which `airdropd` worked around by
+cutting the prompt timeout to 15 s. **That workaround is now solving a problem
+that no longer exists and should be relaxed** — a 15 s window to notice and
+answer a consent prompt is too short, and it auto-declines.
+
+### Wrong-channel watch (`e5d215d`)
+
+Zero overlap was the silent-failure state: owl alive, awdl0 up, opendrop
+listening, mDNS provably leaving the radio, and not one slot able to carry a
+frame to the phone. Every health signal green, nothing working.
+
+owl now logs it at INFO naming the channel the peer wants
+(`NO OVERLAP with 42:c7:… on ch 36 - peer wants ch 149`), and `airdropd`'s
+health watcher acts after `AIRDROP_WRONGCHAN_AFTER` (20 s) of it: either
+rebuilds the GO there (`AIRDROP_GO_FOLLOW=1`, default) or turns the bar red
+saying which channel we should be on. Rebuild because retune is impossible
+(above). State is compared by the timestamps of owl's own lines, not by a byte
+window over the log, because `-vv` trace makes any fixed window cover anywhere
+from a second to a minute.
+
+Detection logic verified against synthetic owl logs for four cases: overlapping
+(never fires), wrong channel (fires at 20 s naming 149), peer wants the channel
+we are already on, peer advertising nothing usable. **Not yet exercised against
+a real mid-session channel move.**
+
+### WHAT IS STILL BROKEN
+
+1. **The tail of a transfer is lost.** 660,490 of 666,346 bytes arrived — 99.1%,
+   dying in the last 5,856. The phone collapsed its window 15/16 → 5/16 → 2/16
+   *during* the transfer. Why it narrows is **unknown**. One hypothesis, not a
+   diagnosis: INTERSECT mirrors the peer downward, so a brief dip by the phone
+   narrows our advertisement, which may make it dip further — a feedback
+   collapse. If so the fix is to stop mirroring downward mid-transfer. We are
+   physically on the GO channel in all 16 slots regardless, so advertising more
+   of them is true rather than a lie, and `awdl_chanseq_widen()` already exists
+   to do it. Needs two or three more transfers watched before changing anything.
+
+2. **opendrop crashes on a truncated stream** instead of salvaging it:
+   `ValueError: invalid literal for int() with base 16: b''` out of
+   `_next_chunk()` on EOF. The 660 KB survived only because the ios26 patch
+   buffers the body to disk first. It should catch EOF, report bytes received
+   against `TotalBytes`, and keep what arrived.
+
+3. **The 15 s consent timeout auto-declines** and no longer needs to be tight
+   (see 6 above).
+
+4. **2.4 GHz is unusable.** `stack_up` refuses when the STA is on 2.4 GHz,
+   because a GO alongside it provably drops the association. So the toggle
+   simply cannot work on a 2.4 GHz AP, and says so. Unresolved as a UX question.
+
+5. **The wrong-channel watch is untested live** — committed, but the running
+   daemon predates it.
+
+### Environment notes for whoever picks this up
+
+- Phone: iPhone, iOS 26, AirDrop must be **Everyone** (opendrop has no Apple ID
+  validation record); iOS reverts to Contacts Only after ~10 min.
+- `~/owl/.venv-opendrop` is **not version controlled**. Every opendrop fix lives
+  in `patches/` and must be reapplied after a venv rebuild.
+- `pkill -f opendrop` from an inline shell command matches the calling shell and
+  kills the caller (exit 144). Put such kills in a script file.
+- `/run/airdrop-owl.log` is **not** truncated between owl restarts, so grepping
+  it for `add peer` matches stale runs. Gate on the live `STATS ... rx_action`
+  counter instead.
+- owl logs `STATS` every 10 s: `tx_unicast` frozen while `tx_multicast` climbs
+  means the unicast gate is shut; `rx_action` at 0 means the phone is not
+  talking to us at all and no measurement on this box is meaningful.
