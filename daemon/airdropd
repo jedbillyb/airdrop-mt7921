@@ -390,6 +390,51 @@ stack_up() {
   return 0
 }
 
+# Wait for a spawned opendrop to actually reach a listening socket.
+#
+# "Alive" is not "serving". opendrop binds, wraps the socket in TLS and only
+# then calls serve_forever; anything that goes wrong in between can leave a
+# process that is running, logging, and answering nothing - which from out here
+# is indistinguishable from a healthy receiver until a phone tries to connect
+# and sits on "Waiting".
+#
+# ss -tlnp, and all three parts matter. -l is what restricts it to LISTEN: a
+# plain `ss -tnp` lists established connections only, so a listener with no
+# connection to it never appears (this is what made a working socket look
+# missing during one debugging session). -p is what attaches the process, and
+# the name it prints is the COMM name - for the venv console script that is
+# "opendrop", not "python", so grepping for python finds nothing either. The
+# pid is what is actually matched on below, because it is the one identifier
+# that cannot alias with another process on the box.
+#
+# Once per spawn, not per tick: the answer cannot change from "never listened"
+# to "listening" later, and a subprocess every 5s forever to learn nothing is
+# exactly the kind of cost this loop has been kept free of.
+#
+# The pid we hold is the one bash reported for `( cd … && opendrop ) &`. Bash
+# exec-optimises that subshell away, so in practice it IS opendrop's pid
+# (verified live: python's parent was the daemon, with no bash in between) -
+# but that is an optimisation, not a promise, so a child of it counts too.
+wait_for_listener() {
+  local pid="$1" i p pids sockets
+  # 100 ticks of 0.1s, plus the ss/pgrep each tick costs - about 15s of wall
+  # clock before giving up, measured. Measured cold start to "Starting HTTPS
+  # server" is ~1.5s (python startup, cert load, zeroconf), so this is
+  # generous by design: a false "not listening" would kill a receiver that
+  # was merely slow, and it only ever runs to the end when something is
+  # actually broken.
+  for i in $(seq 100); do
+    kill -0 "$pid" 2>/dev/null || return 1
+    pids="$pid $(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')"
+    sockets=$(ss -tlnpH 2>/dev/null)
+    for p in $pids; do
+      case "$sockets" in *"pid=$p,"*) return 0 ;; esac
+    done
+    sleep 0.1
+  done
+  return 1
+}
+
 # Block until the station is associated on 5GHz again. Used after the 2.4GHz
 # guard has torn the GO down: there is no point retrying a bring-up, because
 # go_target would refuse on the same rule every time and each attempt would only
@@ -494,6 +539,26 @@ serve_forever() {
         OPENDROP_ANNOUNCE_INTERVAL="$REANNOUNCE" \
         "$OPENDROP" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
     OD_PID=$!
+
+    # A receive process with no listening socket is a failed bring-up, not a
+    # running receiver. Say so and start over rather than arming the bar over
+    # a process that cannot be connected to - that failure is invisible from
+    # the phone's side until someone actually tries to send, and then it looks
+    # like the transfer failing rather than the receiver never having been up.
+    if ! wait_for_listener "$OD_PID"; then
+      log "FAILED BRING-UP: opendrop is alive but never opened a listening socket"
+      set_state error "receiver never started listening - see the log"
+      kill "$OD_PID" 2>/dev/null
+      wait "$OD_PID" 2>/dev/null
+      OD_PID=""
+      # Respawning is the right response: the plausible causes (a port still
+      # held from the last run, a transient failure inside its startup) are
+      # ones a fresh process clears, and the radio stack underneath is not
+      # implicated. Bounded so a permanent fault is one line every 5s rather
+      # than a spin.
+      sleep 5
+      continue
+    fi
 
     # Watch the stack while opendrop runs. Without this the bar keeps saying
     # "on" after owl or the GO has died underneath it - the state file is

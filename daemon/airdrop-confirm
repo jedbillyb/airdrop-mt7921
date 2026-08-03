@@ -44,30 +44,81 @@ MSG="AirDrop: accept file from ${SENDER}?"
 [ -n "$DETAIL" ] && MSG="$MSG"$'\n'"$DETAIL"
 
 # swaynag has no built-in timeout and no exit code that distinguishes the
-# buttons, so both are built here: a marker file written by the Accept button,
-# and a watchdog that kills the prompt if nobody answers. Leaving an
-# unanswered prompt on screen forever would wedge the transfer AND the daemon.
-MARK=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/airdrop-accept.XXXXXX")
-rm -f "$MARK"
+# buttons, so both are built here: a marker file per button, and a poll that
+# gives up after TIMEOUT. Leaving an unanswered prompt on screen forever would
+# wedge the transfer AND the daemon.
+#
+# BOTH BUTTONS WRITE A MARKER, and the answer is whichever marker appears -
+# never inferred from swaynag having exited. `--button-dismiss-no-terminal`
+# dismisses first and runs the command from a DETACHED CHILD, so swaynag is
+# gone before its own action has run. The previous version waited on swaynag
+# and then tested for the Accept marker, which lost that race by two
+# milliseconds, every single time:
+#
+#   /run/user/1000/airdrop-accept.LQtoEz  mtime 21:42:48.416265
+#   opendrop logged "user declined"       at    21:42:48.418
+#
+# Every accept became a 403 and the phone sat on "Waiting" - and because the
+# marker was written after the check, it was never cleaned up either, so the
+# orphans in XDG_RUNTIME_DIR were the only evidence it had ever been clicked.
+BASE=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/airdrop-confirm.XXXXXX")
+ACCEPT="$BASE.accept"
+DECLINE="$BASE.decline"
+rm -f "$ACCEPT" "$DECLINE"
+
+# Every exit path, including the timeout, takes the markers and the prompt with
+# it. Nothing of ours outlives this script.
+NAG=""
+cleanup() {
+  [ -n "$NAG" ] && kill "$NAG" 2>/dev/null
+  rm -f "$ACCEPT" "$DECLINE"
+}
+trap cleanup EXIT
 
 swaynag \
   --type warning \
   --message "$MSG" \
-  --button-dismiss-no-terminal "Accept" "/bin/sh -c 'touch \"$MARK\"'" \
-  --button-dismiss-no-terminal "Decline" "/bin/true" \
+  --button-dismiss-no-terminal "Accept" "/bin/sh -c 'touch \"$ACCEPT\"'" \
+  --button-dismiss-no-terminal "Decline" "/bin/sh -c 'touch \"$DECLINE\"'" \
   >/dev/null 2>&1 &
 NAG=$!
 
-( sleep "$TIMEOUT"; kill "$NAG" 2>/dev/null ) &
-KILLER=$!
+# Poll ten times a second: fast enough that the answer is not perceptibly
+# delayed, slow enough to be free next to a human pressing a button.
+ANSWER=""
+TICKS=$((TIMEOUT * 10))
+# Grace after swaynag exits, for the detached child that is about to write.
+# One second is three orders of magnitude more than the 2 ms that was lost.
+GRACE=10
+waited=0
+while :; do
+  [ -e "$ACCEPT" ]  && { ANSWER=accept;  break; }
+  [ -e "$DECLINE" ] && { ANSWER=decline; break; }
+  if ! kill -0 "$NAG" 2>/dev/null; then
+    g=0
+    while [ "$g" -lt "$GRACE" ]; do
+      [ -e "$ACCEPT" ]  && { ANSWER=accept;  break; }
+      [ -e "$DECLINE" ] && { ANSWER=decline; break; }
+      sleep 0.1
+      g=$((g + 1))
+    done
+    break
+  fi
+  [ "$waited" -ge "$TICKS" ] && break
+  sleep 0.1
+  waited=$((waited + 1))
+done
 
-wait "$NAG" 2>/dev/null
-kill "$KILLER" 2>/dev/null
-
-if [ -e "$MARK" ]; then
-  rm -f "$MARK"
-  log "accepted by user"
-  exit 0
-fi
-log "declined or timed out after ${TIMEOUT}s"
-exit 1
+# Three outcomes, three messages. The old single line said "declined or timed
+# out", which is how a lost race spent an evening looking like a slow user.
+case "$ANSWER" in
+  accept)
+    log "accepted by user"
+    exit 0 ;;
+  decline)
+    log "declined by user"
+    exit 1 ;;
+  *)
+    log "no answer within ${TIMEOUT}s - declining"
+    exit 1 ;;
+esac
