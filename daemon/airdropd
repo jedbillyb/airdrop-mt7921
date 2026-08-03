@@ -60,7 +60,8 @@ MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
 # yet proven for a real file transfer or for ACKs on the resulting vif - so
 # this defaults OFF. Set AIRDROP_DUALCHAN=1 to try it.
 DUALCHAN="${AIRDROP_DUALCHAN:-0}"
-GO_CHAN="${AIRDROP_GO_CHAN:-149}"
+# "auto" = follow the STA. See stack_up for why that beats any constant.
+GO_CHAN="${AIRDROP_GO_CHAN:-auto}"
 
 # Always-on mode: no BLE, no windows. Bring the stack up once and stay
 # advertising until stopped, so the bar toggle is a plain on/off switch and
@@ -154,6 +155,7 @@ stack_up() {
   # not survive a second chanctx at all, a 5GHz one does. Refuse up front,
   # because a bar switch that silently drops your network is worse than one
   # that declines to turn on and says why.
+  local go_chan="$GO_CHAN"
   if [ "$DUALCHAN" = 1 ]; then
     local sta sta_chan
     sta=$(iw dev 2>/dev/null | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
@@ -163,17 +165,32 @@ stack_up() {
       set_state error "Wi-Fi is on 2.4GHz (ch$sta_chan); AirDrop needs a 5GHz AP"
       return 1
     fi
+
+    # Follow the STA rather than pinning a constant. The phone is on the same
+    # AP, and iOS weights its AWDL channel sequence heavily toward the channel
+    # its own association is on: with the AP on ch36 the phone advertised
+    #   36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36
+    # i.e. six slots of 36 against two of 149. Pinned to 149 we overlapped the
+    # phone 2/16 of the time; owl synced and saw it at rssi -28, but not one
+    # IPv6 packet made it across in 60s with the share sheet open - AWDL up,
+    # data plane dead. The AP moves between channels, so a constant is wrong
+    # somewhere by definition; the STA's channel tracks it for free and is
+    # also the pairing measured to hold the association (ch36+ch36 above).
+    if [ "$go_chan" = auto ]; then
+      go_chan="${sta_chan:-149}"
+      log "GO channel auto -> ch$go_chan (following STA${sta:+ $sta})"
+    fi
   fi
   if [ "$DUALCHAN" = 1 ]; then
     # P2P-GO mode: pick AWDL's channel ourselves instead of hoping the AP's
     # matches (mt7921-dual-channel). owl rides go0's own chanctx via mon0
     # (the single MAC-aliased vif go-up creates), not the AP's mon1 pair.
-    if ! up=$(sudo -n "$HELPER" go-up "$GO_CHAN" 2>&1); then
+    if ! up=$(sudo -n "$HELPER" go-up "$go_chan" 2>&1); then
       log "helper go-up FAILED: $up"
       set_state error "no privilege or go0 setup failed - see README (sudoers)"
       return 1
     fi
-    chan="$GO_CHAN"
+    chan="$go_chan"
     # Run OWL on whichever vif go-up says can ACK - the `flags active` mon1 if
     # it came up, else the plain mon0. Unicast AWDL is unanswered without it.
     local ackvif
