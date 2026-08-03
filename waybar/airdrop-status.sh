@@ -71,6 +71,13 @@ case "$state" in
   idle)   text="drop on";  class="idle"   ;;
   waking) text="drop on";  class="waking" ;;
   armed)  text="drop on";  class="armed"  ;;
+  # The station was on 2.4GHz, where a GO cannot coexist with it, so the daemon
+  # is moving the Wi-Fi to the SSID's 5GHz BSS for the duration. Reads as on -
+  # the switch is on and this resolves itself in a few seconds - but carries its
+  # own class, because the Wi-Fi is reassociating and the bar should say so
+  # rather than looking identical to a normal bring-up. Still no third label:
+  # two labels was an explicit call and the colour carries the rest.
+  switching) text="drop on"; class="switching" ;;
   # The stack is up and advertising, but the phone we can see is on a channel
   # we cannot follow it to (see airdropd's go_target). Reads as on, because it
   # is - a phone on our channel would be served right now - with its own class

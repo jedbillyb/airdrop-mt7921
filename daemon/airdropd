@@ -129,6 +129,18 @@ BUILT_CHAN=""
 STA=""
 # The station's channel as of the last sta_channel() call; empty when unknown.
 STA_CHAN=""
+# WHY the channel is empty, which is a different question from whether it is,
+# and the distinction the guards below turn on:
+#
+#   ok      - associated, STA_CHAN is its channel
+#   unknown - a managed vif exists but has no channel right now: mid-roam,
+#             scanning, or between associations
+#   none    - there is no managed vif at all
+#
+# Only "none" is genuinely unconstrained. "unknown" is a station that is about
+# to land somewhere, quite possibly on 2.4GHz, and treating it as "no
+# constraint" is what let a blind ch149 GO get built during a roam.
+STA_STATE=none
 
 # BOTH OF THESE ASSIGN RATHER THAN PRINT, which is not a style choice: a
 # caller writing ch=$(sta_channel) runs the whole thing in a subshell, so the
@@ -137,25 +149,54 @@ STA_CHAN=""
 # and - worse - invalidating the cache on a failed read would be a no-op,
 # because there is nothing in this shell left to invalidate.
 sta_iface() {
-  [ -n "$STA" ] || STA=$(iw dev 2>/dev/null \
-    | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
+  [ -n "$STA" ] && return 0
+  local ifs i
+  ifs=$(iw dev 2>/dev/null | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i}')
+  # PREFER AN ASSOCIATED ONE. This used to take the first managed vif `iw dev`
+  # happened to print, which is not the oldest or the primary - it is roughly
+  # reverse creation order, so any second managed vif on the phy shadows the
+  # real station. That was survivable while an unreadable station meant "no
+  # constraint" and the bring-up carried on regardless; now that unreadable
+  # means "wait", picking the wrong vif is an indefinite hold-off instead of a
+  # wrong-but-moving daemon. Caught exactly this way in testing: a scratch
+  # `sta1` vif made the daemon report the live, associated wlp2s0 as roaming.
+  for i in $ifs; do
+    if iw dev "$i" info 2>/dev/null | grep -q 'channel '; then STA="$i"; return 0; fi
+  done
+  # None associated - fall back to the first, which may simply be mid-roam.
+  STA=$(printf '%s\n' $ifs | head -1)
   [ -n "$STA" ]
 }
 
-# Read the station's CURRENT channel into STA_CHAN. Returns 1, with STA_CHAN
-# empty, when there is no managed vif or it is not associated.
+# Read the station's CURRENT channel into STA_CHAN, and WHY it is what it is
+# into STA_STATE. Returns 0 only when the channel was actually read.
+#
+# The tri-state is the whole point. This used to report "no channel" for two
+# completely different situations - no managed vif at all, and a managed vif
+# that is simply mid-roam - and every caller then read the empty string as "the
+# station imposes no constraint". A roaming station imposes the STRONGEST
+# constraint we have: it is about to associate somewhere, and if that somewhere
+# is 2.4GHz then a GO built during the gap is the configuration measured to
+# kill the link. The gap is a second or two, which is exactly long enough for a
+# bring-up to fall through it.
 sta_channel() {
-  STA_CHAN=""
+  STA_CHAN=""; STA_STATE=none
   sta_iface || return 1
-  STA_CHAN=$(iw dev "$STA" info 2>/dev/null | grep -oP 'channel \K[0-9]+')
-  [ -n "$STA_CHAN" ] && return 0
-  # Drop the cached name on any failed read. It may simply be unassociated, in
-  # which case re-resolving costs one extra `iw dev` per tick while it is down
-  # - but it may also have been renamed or removed by a driver reset, and a
-  # cache that never expires turns that into a permanently empty channel: the
-  # station silently stops being consulted and go_target falls through to the
-  # peer fallback forever.
-  STA=""
+  local info
+  if ! info=$(iw dev "$STA" info 2>/dev/null) || [ -z "$info" ]; then
+    # The vif we cached has gone, rather than merely gone quiet - renamed, or
+    # removed by a driver reset. Drop the cache and re-resolve once; a cache
+    # that never expires turns a rename into a permanently absent station.
+    # Note this is NOT the unassociated case: an unassociated vif still prints
+    # its `iw dev <if> info` block, just without a channel line, so it lands
+    # below as "unknown" and keeps the cache.
+    STA=""
+    sta_iface || return 1
+    info=$(iw dev "$STA" info 2>/dev/null) || { STA=""; return 1; }
+  fi
+  STA_CHAN=$(printf '%s' "$info" | grep -oP 'channel \K[0-9]+')
+  if [ -n "$STA_CHAN" ]; then STA_STATE=ok; return 0; fi
+  STA_STATE=unknown
   return 1
 }
 
@@ -182,6 +223,24 @@ go_target() {
 
   sta_channel
   sta_chan="$STA_CHAN"
+
+  # AN UNREADABLE STATION IS UNKNOWN, NOT UNCONSTRAINED. This is checked before
+  # everything else because it is the case that used to skip everything else:
+  # each rule below is written `[ -n "$sta_chan" ] && ...`, so an empty read
+  # fell past all three and landed on the last-resort ch149 arm - the single
+  # most dangerous thing to do without knowing the station's band. Observed
+  # live 2026-08-04: the daemon refused correctly on ch11 at 10:05, then at
+  # 10:11, mid-roam, read nothing and built a GO on ch149 blind.
+  #
+  # A vif that exists but has no channel is between associations. It will have
+  # one again within a second or two, so the answer is to wait and ask again,
+  # not to guess. Distinct from the `chan` failure so stack_up_retry can retry
+  # in seconds rather than backing off to a minute.
+  if [ "$STA_STATE" = unknown ]; then
+    GO_FAIL=unknown
+    GO_REASON="station ${STA:-?} has no channel right now (mid-roam or unassociated); not guessing"
+    return 1
+  fi
 
   # The whole point of P2P-GO mode is keeping the internet, so refuse the
   # combination that provably cannot hold it. Measured 2026-08-03, one evening,
@@ -256,7 +315,14 @@ go_target() {
 
   # Nothing to go on from either side. Build something rather than nothing -
   # this is the old ${sta_chan:-149} fallback, kept, but now it says so.
-  if [ -z "$sta_chan" ] && [ -z "$peer" ]; then
+  #
+  # STA_STATE=none is load-bearing here and is the narrowing that fixes the
+  # blind-ch149 bug: this arm may only fire when there is genuinely NO managed
+  # vif, which is a machine with nothing to protect. It used to fire on any
+  # empty read, and the overwhelmingly common empty read is a station that has
+  # a vif, has an association a moment ago and will have one again - i.e. the
+  # one case where guessing can cost the user their Wi-Fi.
+  if [ "$STA_STATE" = none ] && [ -z "$peer" ]; then
     GO_TARGET=149
     GO_REASON="no STA channel and no peer hint - last-resort ch149"
     return 0
@@ -296,6 +362,109 @@ avahi_restore() {
   fi
 }
 
+# --- temporary 5GHz band lock -------------------------------------------------
+#
+# A 2.4GHz station cannot host a GO alongside it (see go_target), and the old
+# behaviour was to refuse and leave the switch red until the user went and
+# changed networks by hand. On a dual-band SSID that is a pointless dead end:
+# the 5GHz BSS is right there, the station just happened to pick the other one.
+# So take it - for the session only - and give it back when the switch goes off.
+#
+# Scoped like avahi_stop/avahi_restore: changed on the way up, restored on the
+# way down, and restorable by a LATER run if this one dies without cleaning up,
+# because the change outlives the process (it is written into the saved NM
+# profile on disk, not just the running connection).
+BAND_LOCK_FILE="$RUNDIR/band_lock"
+# Set once a lock is in force, so a bring-up that refuses on the band rule
+# knows whether locking has already been tried and failed - otherwise a
+# station that stays on 2.4GHz would relock on every retry, reassociating
+# the user's Wi-Fi in a loop.
+BAND_LOCKED=""
+
+# The NM connection currently active on the station, or empty.
+sta_connection() {
+  sta_iface || return 1
+  nmcli -t -f GENERAL.CONNECTION device show "$STA" 2>/dev/null \
+    | sed -n 's/^GENERAL.CONNECTION://p' | head -1 | grep -v '^--$'
+}
+
+# Does the SSID we are on actually have a 5GHz BSS? Locking the band to `a`
+# when it does not is not a degraded AirDrop, it is no Wi-Fi at all: NM would
+# find no matching AP and simply fail to activate. Never lock without checking.
+has_5ghz_bss() {
+  local ssid="$1"
+  [ -n "$ssid" ] || return 1
+  nmcli -t -f SSID,FREQ device wifi list --rescan no 2>/dev/null \
+    | sed 's/\\:/\x01/g' \
+    | awk -F: -v s="$ssid" '{gsub(/\x01/,":",$1)} $1==s && $2+0 >= 4900 {found=1} END{exit !found}'
+}
+
+band_lock_engage() {
+  local conn ssid prev i
+  conn=$(sta_connection) || return 1
+  [ -n "$conn" ] || return 1
+  ssid=$(nmcli -t -f 802-11-wireless.ssid connection show "$conn" 2>/dev/null \
+    | sed -n 's/^802-11-wireless.ssid://p')
+  if ! has_5ghz_bss "$ssid"; then
+    log "no 5GHz BSS for SSID '$ssid' - cannot lock the band, refusing instead"
+    return 1
+  fi
+  prev=$(nmcli -t -f 802-11-wireless.band connection show "$conn" 2>/dev/null \
+    | sed -n 's/^802-11-wireless.band://p')
+
+  # Record BEFORE changing anything. If we die between the modify and the
+  # restore, the next run reads this and puts the profile back - the whole
+  # reason the record is a file rather than a variable.
+  printf '%s\n%s\n' "$conn" "$prev" > "$BAND_LOCK_FILE"
+
+  log "station is on 2.4GHz - locking '$conn' to 5GHz for this session (was '${prev:-both bands}')"
+  if ! nmcli connection modify "$conn" 802-11-wireless.band a >/dev/null 2>&1; then
+    log "band lock FAILED: nmcli connection modify was refused"
+    rm -f "$BAND_LOCK_FILE"
+    return 1
+  fi
+  BAND_LOCKED=1
+
+  # Reactivate so the new constraint is applied. `connection up` alone, never
+  # a disconnect followed by a connect: on an NM-managed device those two
+  # activations race NM's own autoconnect, and the observed result was an
+  # association that lasted about a second and then deauthenticated with no
+  # retry.
+  nmcli connection up "$conn" >/dev/null 2>&1
+
+  # Wait for it to actually land on 5GHz. The bring-up that called us is about
+  # to read the station's channel and must not read it mid-reassociation - that
+  # is the very bug the other half of this change is about.
+  for i in $(seq 30); do
+    sleep 1
+    sta_channel
+    if [ "$STA_STATE" = ok ] && [ "$STA_CHAN" -gt 14 ]; then
+      log "station reassociated on 5GHz ch$STA_CHAN"
+      return 0
+    fi
+  done
+  log "band lock engaged but the station has not reached 5GHz after 30s"
+  return 1
+}
+
+# Put the profile back exactly as it was. Restores the SETTING only and does
+# not reactivate: the station is happily on 5GHz by now, and forcing another
+# activation just to allow 2.4GHz again would bounce the link a second time on
+# the way out, for no benefit. It will roam back on its own if it wants to.
+band_lock_release() {
+  [ -s "$BAND_LOCK_FILE" ] || return 0
+  local conn prev
+  conn=$(sed -n 1p "$BAND_LOCK_FILE")
+  prev=$(sed -n 2p "$BAND_LOCK_FILE")
+  if [ -n "$conn" ]; then
+    nmcli connection modify "$conn" 802-11-wireless.band "$prev" >/dev/null 2>&1 \
+      && log "released the 5GHz lock on '$conn' (band back to '${prev:-both bands}')" \
+      || log "could not release the 5GHz lock on '$conn' - check 802-11-wireless.band"
+  fi
+  rm -f "$BAND_LOCK_FILE"
+  BAND_LOCKED=""
+}
+
 teardown() {
   avahi_restore
   sudo -n "$HELPER" owl-stop >/dev/null 2>&1
@@ -315,6 +484,9 @@ cleanup() {
   # would rewrite the state file after we set it to off, so the bar would show
   # an error for a daemon that is no longer there.
   [ -n "${HEALTH_PID:-}" ] && kill "$HEALTH_PID" 2>/dev/null
+  # After the radio is down, so the station is free to go wherever it likes the
+  # moment both bands are allowed again.
+  band_lock_release
   set_state off
   log "airdropd exiting"
 }
@@ -344,15 +516,38 @@ stack_up() {
     # likely to have moved. All the policy, and the reason for it, is in
     # go_target(); this only has to report what it decided and act on it.
     if ! go_target "$peer_hint"; then
-      case "$GO_FAIL" in
-        band)
+      # A 2.4GHz station is not a dead end on a dual-band SSID - the 5GHz BSS
+      # is usually sitting right there and the station simply picked the other
+      # one. Take it for the session rather than refusing and leaving the user
+      # to go and change networks by hand. Only ever attempted ONCE per run:
+      # if the lock is already in force and the station is STILL on 2.4GHz,
+      # relocking would reassociate the Wi-Fi on every retry tick.
+      if [ "$GO_FAIL" = band ] && [ -z "$BAND_LOCKED" ]; then
+        set_state switching "moving Wi-Fi to 5GHz so AirDrop can come up"
+        if band_lock_engage && go_target "$peer_hint"; then
+          : # locked, landed on 5GHz, and the retry resolved a channel
+        else
           log "REFUSING: $GO_REASON"
-          set_state error "Wi-Fi is on 2.4GHz; AirDrop needs a 5GHz AP" ;;
-        *)
-          log "CANNOT FOLLOW: $GO_REASON"
-          set_state unreachable "$GO_REASON" ;;
-      esac
-      return 1
+          set_state error "Wi-Fi is on 2.4GHz and could not be moved to 5GHz"
+          return 1
+        fi
+      else
+        case "$GO_FAIL" in
+          band)
+            log "REFUSING: $GO_REASON"
+            set_state error "Wi-Fi is on 2.4GHz; AirDrop needs a 5GHz AP" ;;
+          unknown)
+            # Not an error and not worth colouring the bar red: the station is
+            # between associations and will have a channel again in a moment.
+            # The switch IS on, so the bar keeps reading on while we wait.
+            log "HOLDING OFF: $GO_REASON"
+            set_state waking "waiting for the Wi-Fi to settle" ;;
+          *)
+            log "CANNOT FOLLOW: $GO_REASON"
+            set_state unreachable "$GO_REASON" ;;
+        esac
+        return 1
+      fi
     fi
     go_chan="$GO_TARGET"
     log "GO channel -> ch$go_chan ($GO_REASON)"
@@ -469,11 +664,23 @@ wait_for_listener() {
 # association at all, and coming back up on the last-resort ch149 against an
 # unknown station is exactly the gamble this guard exists to stop taking.
 wait_for_5ghz() {
+  # Same dead end the bring-up refusal used to be, for the same reason, so it
+  # gets the same answer: if the SSID has a 5GHz BSS, take it rather than
+  # waiting for the user to notice and go and change networks. Once only -
+  # BAND_LOCKED makes a second call here a no-op, so a station that keeps
+  # falling back to 2.4GHz is waited out rather than reassociated in a loop.
+  if [ -z "$BAND_LOCKED" ]; then
+    set_state switching "moving Wi-Fi back to 5GHz"
+    band_lock_engage && { log "station back on 5GHz ch$STA_CHAN - re-arming"; return 0; }
+  fi
   log "holding off until the station is back on 5GHz"
   while :; do
     sleep 5
     sta_channel
-    if [ -n "$STA_CHAN" ] && [ "$STA_CHAN" -gt 14 ]; then
+    # STA_STATE, not a non-empty channel: an unreadable station is mid-roam and
+    # re-arming into it would build the GO against an unknown band, which is
+    # precisely what this guard exists to stop.
+    if [ "$STA_STATE" = ok ] && [ "$STA_CHAN" -gt 14 ]; then
       log "station back on 5GHz ch$STA_CHAN - re-arming"
       return 0
     fi
@@ -492,11 +699,22 @@ wait_for_5ghz() {
 # says how long until the next attempt. Backoff caps at a minute: past that
 # the cost of retrying is nil and the value of noticing quickly is not.
 stack_up_retry() {
-  local delay=5 tries=0
+  local delay=5 tries=0 wait_s
   until stack_up "$@"; do
     tries=$((tries + 1))
-    log "bring-up attempt $tries failed - retrying in ${delay}s"
-    sleep "$delay"
+    # An unreadable station is a second or two of roam, not a fault, so it gets
+    # a short FIXED wait and does not touch the escalating backoff. Feeding it
+    # through the normal ladder would be actively wrong: the gap closes in
+    # about a second, and by the fourth attempt we would be sleeping 40s
+    # waiting for something that resolved long ago. It also stays quiet in the
+    # log - a roam printing "attempt N failed" reads like a fault.
+    if [ "${GO_FAIL:-}" = unknown ]; then
+      sleep 2
+      continue
+    fi
+    wait_s="$delay"
+    log "bring-up attempt $tries failed - retrying in ${wait_s}s"
+    sleep "$wait_s"
     [ "$delay" -lt 60 ] && delay=$((delay * 2))
     [ "$delay" -gt 60 ] && delay=60
   done
@@ -595,6 +813,24 @@ serve_forever() {
         sleep 5
         elapsed=$((elapsed + 5))
         sta_channel; sta_now="$STA_CHAN"
+
+        # Same fail-open as go_target had, with the same consequence: the 2.4GHz
+        # guard below is `[ -n "$sta_now" ] && ...`, so a station caught between
+        # associations skipped it entirely and the GO stayed up through the one
+        # window in which the station is most likely to land on 2.4GHz. Waiting
+        # a full 5s tick to look again is a long time to hold a configuration
+        # that drops the link, so resolve it now with a few fast polls instead.
+        # Deliberately bounded and short: if it is still unreadable after this
+        # the station is properly down rather than roaming, there is no
+        # association to protect at the moment, and the next tick will catch it
+        # the instant one comes back.
+        if [ "$STA_STATE" = unknown ]; then
+          for _ in 1 2 3 4; do
+            sleep 1
+            sta_channel; sta_now="$STA_CHAN"
+            [ "$STA_STATE" = ok ] && break
+          done
+        fi
 
         # 2.4GHz GUARD. The measurement behind go_target's bring-up refusal is
         # not a property of the moment we start: a 2.4GHz station cannot hold
@@ -822,6 +1058,14 @@ cmd_run() {
   # Both are requests from a previous run's health watch. Surviving a crash,
   # they would be acted on against a stack that has nothing to do with them.
   rm -f "$RUNDIR/sta_24" "$RUNDIR/want_chan"
+
+  # A band lock is written into the saved NM profile, so unlike everything else
+  # here it outlives the process that set it. A previous run that was killed
+  # rather than stopped leaves the user's Wi-Fi pinned to 5GHz indefinitely,
+  # with nothing on the bar to say so. Put it back before doing anything else -
+  # if this run needs the lock again it will take it again a moment later, and
+  # taking it is idempotent.
+  band_lock_release
 
   if [ "$ALWAYS" = 1 ]; then
     log "airdropd started in always-on mode (dualchan=$DUALCHAN)"
