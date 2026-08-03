@@ -23,7 +23,11 @@ PHY="${PHY:-phy0}"
 IFACE="${IFACE:-}"
 MON=mon0
 MONA=mon1
+GO=go0
 MT76=/sys/kernel/debug/ieee80211/$PHY/mt76
+GO_HOSTAPD=/usr/local/bin/airdrop-go-hostapd
+GO_CONF=/run/airdrop-go-hostapd.conf
+GO_LOG=/run/airdrop-go-hostapd.log
 
 if [ "$(id -u)" != "0" ]; then
   echo "airdrop-helper: must run as root (via sudo)" >&2
@@ -53,15 +57,26 @@ if [ -z "$IFACE" ]; then
 fi
 
 usage() {
-  cat >&2 <<EOF
-usage: airdrop-helper <verb>
+  cat >&2 <<'EOF'
+usage: airdrop-helper <verb> [chan]
 
   up            create the monitor pair, disable runtime PM, report the channel
   down          remove the monitor vifs and restore runtime PM
+  go-up <chan>  P2P-GO mode: bring up go0 on <chan>, alias mon0 to its MAC -
+                gets AWDL its own channel independent of the AP's (6/36/44/
+                132/149 only; see mt7921-dual-channel)
+  go-down       tear down go0/hostapd/mon0 from go-up, restore runtime PM
+  wifi-reset    down + go-down, PLUS rfkill-unblock and bring the managed
+                interface back up. For manual "THE WORKING RECIPE" testing
+                that ran `ip link set <iface> down` by hand and never
+                restored it - down/go-down deliberately don't touch that
+                because KEEP_WIFI mode never takes it down, but a stuck
+                keybinding needs to cover the manual path too.
   status        print JSON: vifs present, channel, association state
   ap-channel    print the channel the managed interface is associated on
 
-Never takes a path or a command. See the header for why.
+Never takes a free-form path or command - <chan> is validated against a fixed
+list. See the header for why.
 EOF
   exit 2
 }
@@ -100,6 +115,96 @@ case "${1:-}" in
       "$(ap_channel || echo null)"
     ;;
 
+  go-up)
+    # P2P-GO + MAC-aliased injection (mt7921-dual-channel). Gives AWDL a
+    # channel independent of the AP's, at the cost of ~40-590ms added uplink
+    # latency while go0 is up (measured, see that repo). Not yet proven for a
+    # real file transfer or for active-monitor ACKs against a GO chanctx -
+    # this is the newer, less-tested mode; `up`/`down` remain the default.
+    chan="${2:-}"
+    case "$chan" in
+      6) hw=g ;;
+      36|44|132|149) hw=a ;;
+      *) echo "airdrop-helper: bad channel $chan (want 6/36/44/132/149)" >&2; exit 1 ;;
+    esac
+    if [ ! -x "$GO_HOSTAPD" ]; then
+      echo "airdrop-helper: $GO_HOSTAPD missing - see daemon/README.md" >&2
+      exit 1
+    fi
+    owner=$(stat -c '%U' "$GO_HOSTAPD")
+    if [ "$owner" != "root" ]; then
+      echo "airdrop-helper: $GO_HOSTAPD must be root-owned (is $owner)" >&2
+      exit 1
+    fi
+    mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+    pkill -f "^$GO_HOSTAPD " 2>/dev/null
+    iw dev $MON del 2>/dev/null
+    iw dev $GO del 2>/dev/null
+    iw phy "$PHY" interface add $GO type __p2pgo || exit 1
+    ip link set $GO up || exit 1
+    GOMAC=$(cat "/sys/class/net/$GO/address")
+
+    # A fresh, unpublished passphrase every run - never a fixed value that
+    # could end up in a log or a repo. Nobody is meant to join this network;
+    # it exists only to hold a chanctx open.
+    PASS=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    cat > "$GO_CONF" <<EOF
+interface=$GO
+driver=nl80211
+ssid=airdrop-relay-$$
+country_code=${REG:-NZ}
+ieee80211d=1
+hw_mode=$hw
+channel=$chan
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_passphrase=$PASS
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ctrl_interface=/var/run/hostapd
+EOF
+    chmod 600 "$GO_CONF"
+    : > "$GO_LOG"
+    # setsid is load-bearing: without it hostapd is a child of this sudo
+    # invocation's process group, and dies the moment airdrop-helper returns
+    # (verified live - it took wlp2s0 through three deauth/reassoc cycles on
+    # the way down). owl-start already uses setsid for the same reason.
+    setsid env HOSTAPD_P2P_GO=1 "$GO_HOSTAPD" "$GO_CONF" >> "$GO_LOG" 2>&1 &
+    for _ in $(seq 60); do
+      grep -q 'AP-ENABLED' "$GO_LOG" 2>/dev/null && break
+      sleep 0.1
+    done
+    if ! grep -q 'AP-ENABLED' "$GO_LOG" 2>/dev/null; then
+      echo "airdrop-helper: go0 hostapd failed to reach AP-ENABLED, see $GO_LOG" >&2
+      pkill -f "^$GO_HOSTAPD " 2>/dev/null
+      iw dev $GO del 2>/dev/null
+      exit 1
+    fi
+
+    iw phy "$PHY" interface add $MON type monitor || exit 1
+    ip link set $MON down
+    ip link set $MON address "$GOMAC"
+    ip link set $MON up || exit 1
+    echo 0 > "$MT76/runtime-pm" 2>/dev/null
+    echo 0 > "$MT76/deep-sleep" 2>/dev/null
+    printf '{"go":"%s","mon":"%s","chan":%s}\n' "$GO" "$MON" "$chan"
+    ;;
+
+  go-down)
+    pkill -x airdrop-owl 2>/dev/null
+    pkill -f "^$GO_HOSTAPD " 2>/dev/null
+    ip link set $MON down 2>/dev/null
+    iw dev $MON del 2>/dev/null
+    ip link set $GO down 2>/dev/null
+    iw dev $GO del 2>/dev/null
+    rm -f "$GO_CONF"
+    echo 1 > "$MT76/runtime-pm" 2>/dev/null
+    echo 1 > "$MT76/deep-sleep" 2>/dev/null
+    echo '{"ok":true}'
+    ;;
+
   owl-start)
     # OWL must run as root: it creates the awdl0 tun interface, and without
     # privilege it starts, prints its banner and never produces one - which
@@ -127,9 +232,13 @@ case "${1:-}" in
       6|36|44|132|149) ;;
       *) echo "airdrop-helper: bad channel $chan" >&2; exit 1 ;;
     esac
+    # go-up's mon0 is a single MAC-aliased vif (no ACK-tuned pair needed - it
+    # rides go0's own chanctx); up's default pair uses mon1, the `flags
+    # active` vif that can ACK while riding the AP's chanctx (§14).
+    vif="${3:-$MONA}"
     pkill -x airdrop-owl 2>/dev/null
     # stdbuf -oL so the log is readable live rather than in 4 KiB bursts.
-    setsid stdbuf -oL "$OWL_BIN" -i $MONA -c "$chan" -N -S verbatim -vv \
+    setsid stdbuf -oL "$OWL_BIN" -i "$vif" -c "$chan" -N -S verbatim -vv \
       >> /run/airdrop-owl.log 2>&1 &
     for _ in $(seq 60); do
       ip link show awdl0 >/dev/null 2>&1 && break
@@ -163,10 +272,40 @@ case "${1:-}" in
     echo '{"ok":true}'
     ;;
 
+  wifi-reset)
+    pkill -x airdrop-owl 2>/dev/null
+    pkill -f "^$GO_HOSTAPD " 2>/dev/null
+    for v in $MONA $MON $GO; do
+      ip link set "$v" down 2>/dev/null
+      iw dev "$v" del 2>/dev/null
+    done
+    rm -f "$GO_CONF"
+    echo 1 > "$MT76/runtime-pm" 2>/dev/null
+    echo 1 > "$MT76/deep-sleep" 2>/dev/null
+    rfkill unblock wifi 2>/dev/null
+    if [ -n "$IFACE" ]; then
+      ip link set "$IFACE" up 2>/dev/null
+    else
+      # up/managed lookup above only matches an already-managed vif; if the
+      # interface got renamed or the driver reset, fall back to any mt7921
+      # netdev that isn't one of our own vifs.
+      for d in /sys/class/net/*/device/driver; do
+        case "$(basename "$(readlink -f "$d")")" in
+          mt7921*)
+            cand=$(basename "$(dirname "$(dirname "$d")")")
+            case "$cand" in "$MON"|"$MONA"|"$GO") continue ;; esac
+            ip link set "$cand" up 2>/dev/null ;;
+        esac
+      done
+    fi
+    echo '{"ok":true}'
+    ;;
+
   status)
-    printf '{"mon":%s,"active":%s,"assoc":%s,"chan":%s}\n' \
+    printf '{"mon":%s,"active":%s,"go":%s,"assoc":%s,"chan":%s}\n' \
       "$(ip link show $MON  >/dev/null 2>&1 && echo true || echo false)" \
       "$(ip link show $MONA >/dev/null 2>&1 && echo true || echo false)" \
+      "$(ip link show $GO   >/dev/null 2>&1 && echo true || echo false)" \
       "$(iw dev "$IFACE" link 2>/dev/null | grep -q '^Connected' && echo true || echo false)" \
       "$(ap_channel || echo null)"
     ;;

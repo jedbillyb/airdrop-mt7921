@@ -249,12 +249,18 @@ AP's channel, that constraint is gone as of 2026-08-03: see
 (despite an earlier repo name, no kernel patch is involved). A
 P2P-GO vif plus a MAC-aliased monitor vif lets a single MT7921 pick AWDL's
 channel independently of the AP's, on a stock kernel, and it has now also been
-shown to survive a real Wi-Fi reassociation. **Not yet ported into this repo's
-`KEEP_WIFI` mode or into `daemon/airdropd`** - that repo documents the
-mechanism, this one is the application. Until that port happens, the fallback
-for "Wi-Fi and AirDrop simultaneously with no conditions attached" is still
-giving AWDL its own radio (an AR9271 on USB): two phys, no shared channel
-context.
+shown to survive a real Wi-Fi reassociation.
+
+This mechanism **is now ported into `daemon/airdropd`**, as an opt-in mode
+(`AIRDROP_DUALCHAN=1`) rather than the default - it's newer and less proven
+than the AP-channel mode above, and carries its own open questions (active-
+monitor ACKs against a GO chanctx untested, ~40-590ms added latency the whole
+time `go0` is up). See [`daemon/README.md`](daemon/README.md#p2p-go-mode-airdrop_dualchan1--opt-in-less-proven-than-the-default)
+for the details. It is **not** wired into the plain `KEEP_WIFI=1` /
+`airdrop.sh` path, only the daemon. Until either mode is shown to complete a
+real transfer, the fallback for "Wi-Fi and AirDrop simultaneously with no
+conditions attached, no caveats" is still giving AWDL its own radio (an
+AR9271 on USB): two phys, no shared channel context.
 
 ## Two mt7921 driver bugs you will hit
 

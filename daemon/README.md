@@ -139,6 +139,38 @@ for.
 | `AIRDROP_MIN_RSSI` | `-70` | Ignore faint adverts. A transfer happens at arm's length; a weak advert is a stranger's phone and waking the radio for it is pure cost. |
 | `AIRDROP_WINDOW` | `90` | How long to stay up after a trigger. Also the worst case for how long the radio is committed. |
 | `AIRDROP_CONFIRM_TIMEOUT` | `45` | Unanswered prompt → decline. |
+| `AIRDROP_DUALCHAN` | `0` | Set `1` to use P2P-GO mode instead of the default AP-channel-borrowing mode. See below. |
+| `AIRDROP_GO_CHAN` | `149` | Which channel `go0` sits on in P2P-GO mode. One of `6/36/44/132/149`. |
+
+### P2P-GO mode (`AIRDROP_DUALCHAN=1`) — opt-in, less proven than the default
+
+The default mode borrows whatever channel the AP is already on for AWDL —
+which only works when the phone's AWDL happens to land there ([§38, the
+original constraint](https://github.com/jedbillyb/mt7921-dual-channel)).
+Setting `AIRDROP_DUALCHAN=1` switches `serve_window` to
+[`mt7921-dual-channel`](https://github.com/jedbillyb/mt7921-dual-channel)'s
+mechanism instead: `airdrop-helper go-up "$AIRDROP_GO_CHAN"` brings up a
+`go0` P2P-GO vif on a channel chosen independently of the AP's, then a `mon0`
+monitor vif with its MAC address aliased to `go0`'s, which `owl` runs against.
+`go-down` tears both down. No `KEEP_WIFI`-style channel-context borrowing is
+involved, and the association is never touched.
+
+Requires the patched hostapd from that repo, installed root-owned exactly
+like `airdrop-owl`:
+
+```sh
+sudo install -o root -g root -m 755 \
+  /mnt/shared/build/hostapd-2.11/hostapd/hostapd \
+  /usr/local/bin/airdrop-go-hostapd
+```
+
+**This mode is newer and less proven than the default.** It carries the same
+"not yet shown to complete a transfer" caveat as the default mode, plus two
+open questions from `mt7921-dual-channel` that haven't been re-tested inside
+`airdropd` specifically: whether `owl`'s active-monitor ACKs work against a
+GO-held chanctx (untested there too — AWDL unicast needs ACKs), and the
+~40–590ms added uplink latency the whole time `go0` is up, which is why this
+defaults off rather than replacing the AP-channel mode outright.
 
 ## Known-good and not-yet-proven
 
@@ -149,9 +181,12 @@ commands too, so this needed an explicit direction filter); helper up/down/statu
 with the association surviving throughout; all six confirmation paths above;
 valid waybar JSON.
 
-**Not yet proven:** an actual end-to-end transfer through `airdropd`. That needs
-a phone. The trigger path in particular has never seen a real iPhone share-sheet
-advert — only our own emitted one, which it is designed to ignore.
+**Not yet proven:** an actual end-to-end transfer through `airdropd`, in either
+mode. That needs a phone. The trigger path in particular has never seen a real
+iPhone share-sheet advert — only our own emitted one, which it is designed to
+ignore. P2P-GO mode (`AIRDROP_DUALCHAN=1`) additionally has never been
+exercised through `airdropd` at all yet — only through the standalone scripts
+in `mt7921-dual-channel`.
 
 ## Gotchas paid for already
 

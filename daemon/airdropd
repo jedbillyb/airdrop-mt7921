@@ -54,6 +54,14 @@ WINDOW="${AIRDROP_WINDOW:-90}"
 # it is pure cost.
 MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
 
+# Opt-in P2P-GO mode (mt7921-dual-channel): picks AWDL's own channel
+# independent of the AP's, instead of gambling on the AP's channel matching.
+# Costs ~40-590ms added uplink latency the whole window it's up, and is not
+# yet proven for a real file transfer or for ACKs on the resulting vif - so
+# this defaults OFF. Set AIRDROP_DUALCHAN=1 to try it.
+DUALCHAN="${AIRDROP_DUALCHAN:-0}"
+GO_CHAN="${AIRDROP_GO_CHAN:-149}"
+
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
 
 # State is written for waybar to read. Keep it a single line and always
@@ -68,7 +76,11 @@ set_state() {
 teardown() {
   sudo -n "$HELPER" owl-stop >/dev/null 2>&1
   [ -n "${OD_PID:-}" ] && kill "$OD_PID" 2>/dev/null
-  sudo -n "$HELPER" down >/dev/null 2>&1
+  if [ "$DUALCHAN" = 1 ]; then
+    sudo -n "$HELPER" go-down >/dev/null 2>&1
+  else
+    sudo -n "$HELPER" down >/dev/null 2>&1
+  fi
   log "stack down"
 }
 
@@ -87,22 +99,36 @@ serve_window() {
   log "trigger from $trigger - bringing stack up"
   set_state waking "$trigger"
 
-  local up
-  if ! up=$(sudo -n "$HELPER" up 2>&1); then
-    log "helper up FAILED: $up"
-    set_state error "no privilege - see README (sudoers)"
-    return 1
+  local up chan owlargs
+  if [ "$DUALCHAN" = 1 ]; then
+    # P2P-GO mode: pick AWDL's channel ourselves instead of hoping the AP's
+    # matches (mt7921-dual-channel). owl rides go0's own chanctx via mon0
+    # (the single MAC-aliased vif go-up creates), not the AP's mon1 pair.
+    if ! up=$(sudo -n "$HELPER" go-up "$GO_CHAN" 2>&1); then
+      log "helper go-up FAILED: $up"
+      set_state error "no privilege or go0 setup failed - see README (sudoers)"
+      return 1
+    fi
+    chan="$GO_CHAN"
+    owlargs=(owl-start "$chan" mon0)
+    log "go0 up on ch $chan (P2P-GO mode)"
+  else
+    if ! up=$(sudo -n "$HELPER" up 2>&1); then
+      log "helper up FAILED: $up"
+      set_state error "no privilege - see README (sudoers)"
+      return 1
+    fi
+    chan=$(printf '%s' "$up" | grep -oP '"chan":\K[0-9]+')
+    owlargs=(owl-start "${chan:-36}")
+    log "stack up on ch ${chan:-?}"
   fi
-  local chan
-  chan=$(printf '%s' "$up" | grep -oP '"chan":\K[0-9]+')
-  log "stack up on ch ${chan:-?}"
 
   # OWL is started BY THE HELPER, as root. It creates the awdl0 tun interface
   # and cannot do that unprivileged - run as the user it starts, prints its
   # banner, and simply never produces awdl0, which reads as "awdl0 never
   # appeared" rather than as the permission problem it is. That cost one live
   # run against a real phone with the share sheet open.
-  if ! sudo -n "$HELPER" owl-start "${chan:-36}" >/dev/null 2>&1; then
+  if ! sudo -n "$HELPER" "${owlargs[@]}" >/dev/null 2>&1; then
     log "owl-start failed - awdl0 never appeared (see /run/airdrop-owl.log)"
     set_state error "awdl0 failed"
     teardown
@@ -142,6 +168,11 @@ cmd_run() {
   if ! sudo -n "$HELPER" status >/dev/null 2>&1; then
     echo "airdropd: cannot run $HELPER without a password." >&2
     echo "  waybar has no tty, so this must be passwordless. See daemon/README.md." >&2
+    exit 1
+  fi
+  if [ "$DUALCHAN" = 1 ] && ! sudo -n test -x /usr/local/bin/airdrop-go-hostapd; then
+    echo "airdropd: AIRDROP_DUALCHAN=1 but /usr/local/bin/airdrop-go-hostapd is missing." >&2
+    echo "  See daemon/README.md - install the mt7921-dual-channel hostapd build there." >&2
     exit 1
   fi
 
