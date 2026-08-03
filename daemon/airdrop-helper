@@ -141,6 +141,20 @@ case "${1:-}" in
     iw dev $MON del 2>/dev/null
     iw dev $GO del 2>/dev/null
     iw phy "$PHY" interface add $GO type __p2pgo || exit 1
+    # mon0 (below) is deliberately MAC-aliased to go0, so once owl derives
+    # awdl0's link-local address from mon0's MAC, go0's own auto-assigned
+    # link-local address is byte-for-byte identical to awdl0's. ifaddr/
+    # zeroconf (what opendrop uses for mDNS) resolve "which interface" purely
+    # by matching that IP string, and pick whichever adapter enumerates
+    # first - go0, a dead-end local vif with no path to any AWDL peer -
+    # instead of awdl0. Silent failure: opendrop announces successfully,
+    # zeroconf reports no error, and the _airdrop._tcp record simply never
+    # reaches the wire, because it went out go0 instead. go0 has no need of
+    # an IP stack at all (it only exists to anchor the chanctx), so disabling
+    # IPv6 on it before it can acquire that address removes the ambiguity
+    # entirely. Confirmed with a standalone zeroconf test: zero _airdrop._tcp
+    # packets on awdl0 without this, full PTR/SRV/TXT/AAAA announce with it.
+    sysctl -w net.ipv6.conf.$GO.disable_ipv6=1 >/dev/null 2>&1
     ip link set $GO up || exit 1
     GOMAC=$(cat "/sys/class/net/$GO/address")
 

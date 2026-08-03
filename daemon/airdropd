@@ -170,7 +170,7 @@ cmd_run() {
     echo "  waybar has no tty, so this must be passwordless. See daemon/README.md." >&2
     exit 1
   fi
-  if [ "$DUALCHAN" = 1 ] && ! sudo -n test -x /usr/local/bin/airdrop-go-hostapd; then
+  if [ "$DUALCHAN" = 1 ] && [ ! -x /usr/local/bin/airdrop-go-hostapd ]; then
     echo "airdropd: AIRDROP_DUALCHAN=1 but /usr/local/bin/airdrop-go-hostapd is missing." >&2
     echo "  See daemon/README.md - install the mt7921-dual-channel hostapd build there." >&2
     exit 1
