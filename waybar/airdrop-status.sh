@@ -71,6 +71,12 @@ case "$state" in
   idle)   text="drop on";  class="idle"   ;;
   waking) text="drop on";  class="waking" ;;
   armed)  text="drop on";  class="armed"  ;;
+  # The stack is up and advertising, but the phone we can see is on a channel
+  # we cannot follow it to (see airdropd's go_target). Reads as on, because it
+  # is - a phone on our channel would be served right now - with its own class
+  # so the colour can say "not everyone can see you". Without this arm it fell
+  # through to the catch-all below and claimed to be off while receiving.
+  unreachable) text="drop on"; class="unreachable" ;;
   error)  text="drop off"; class="error"  ;;
   *)      text="drop off"; class="error"  ;;
 esac

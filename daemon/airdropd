@@ -60,14 +60,12 @@ MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
 # yet proven for a real file transfer or for ACKs on the resulting vif - so
 # this defaults OFF. Set AIRDROP_DUALCHAN=1 to try it.
 DUALCHAN="${AIRDROP_DUALCHAN:-0}"
-# Initial GO channel. "auto" = start on the STA's, which is a reasonable first
-# guess because slot 0 of an iPhone's sequence is its own infra channel and the
-# phone is usually on the same AP. It is only a guess: the phone's sequence
-# moves (observed 36 -> 149 and back within one evening, and following the
-# phone's band when it roamed), so the wrong-channel watch below corrects it at
-# runtime rather than this value having to be right. Hardcoding 149 would be
-# wrong for the same reason - it was right for one phone state, not for the
-# phone.
+# GO channel POLICY, fixed for the life of the daemon. "auto" = whatever
+# go_target() decides at each bring-up, which is the station's channel unless
+# the station cannot supply one; anything else is an explicit override and is
+# honoured as given. This value is never rewritten at runtime - the channel the
+# GO currently sits on is BUILT_CHAN, and conflating the two is what previously
+# turned "auto" into a constant after the first channel correction.
 GO_CHAN="${AIRDROP_GO_CHAN:-auto}"
 # The channels a GO can actually be built on. THREE PLACES MUST AGREE: this
 # list, daemon/airdrop-helper (the `go-up` and `owl-start` cases), and owl's own
@@ -500,8 +498,32 @@ serve_forever() {
           last_none=$(grep -a "NO OVERLAP" "$OWL_LOG" 2>/dev/null | tail -1)
           last_over=$(grep -a "intersect:" "$OWL_LOG" 2>/dev/null | tail -1)
           want=$(printf '%s' "$last_none" | grep -oP 'peer wants ch \K[0-9]+')
-          if [ -n "$last_none" ] \
-             && [ "${last_none%% *}" \> "${last_over%% *}" ] \
+          kept=$(printf '%s' "$last_over" | grep -oP 'intersect: \K[0-9]+')
+          # Which of the two is the CURRENT state - compared by owl's own
+          # timestamps, since at -vv no fixed byte window means anything.
+          overlapping=1
+          [ -n "$last_none" ] && [ "${last_none%% *}" \> "${last_over%% *}" ] \
+            && overlapping=""
+
+          # THE ONE LINE THAT HAS ALL THREE CHANNELS IN IT. Until now the
+          # station's channel, the GO's channel and the peer's lived in three
+          # different places at three different times - two of them in a
+          # different process's log - so "AirDrop stopped working" could not be
+          # attributed after the fact to a roam, to the phone's sequence moving,
+          # or to neither. One line a tick, from the loop that was already
+          # running: no new process beyond the iw read, no new privilege.
+          #
+          # peer= is only knowable when owl says it has no overlap; while we DO
+          # overlap, owl reports the count and not the peer's dominant channel,
+          # so the last known value is marked ~stale rather than reprinted as
+          # though it were current.
+          if [ -n "$overlapping" ]; then
+            log "CHAN sta=ch$(sta_channel || echo '?') go=ch$BUILT_CHAN peer=ch${want:-?}~stale overlap=${kept:-0}/16"
+          else
+            log "CHAN sta=ch$(sta_channel || echo '?') go=ch$BUILT_CHAN peer=ch${want:-?} overlap=0/16"
+          fi
+
+          if [ -z "$overlapping" ] \
              && [ -n "$want" ] && [ "$want" != "0" ] && [ "$want" != "$BUILT_CHAN" ]; then
             no_overlap=$((no_overlap + 5))
           else
