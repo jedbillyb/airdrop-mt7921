@@ -62,6 +62,20 @@ MIN_RSSI="${AIRDROP_MIN_RSSI:--70}"
 DUALCHAN="${AIRDROP_DUALCHAN:-0}"
 GO_CHAN="${AIRDROP_GO_CHAN:-149}"
 
+# Always-on mode: no BLE, no windows. Bring the stack up once and stay
+# advertising until stopped, so the bar toggle is a plain on/off switch and
+# "on" means "you can AirDrop to this machine right now" with no second step.
+# The BLE path exists to avoid holding the radio when nobody is sending; with
+# P2P-GO the cost of holding it is added uplink latency rather than losing the
+# association, which is a trade worth making for a switch that just works.
+ALWAYS="${AIRDROP_ALWAYS:-0}"
+
+# How often to re-announce the mDNS service while armed. The iPhone does not
+# poll for AirDrop receivers; it only picks us up from an announce burst, so a
+# receiver that announces once is invisible for all but the first few seconds
+# of being on. 30s keeps us discoverable without churning the HTTPS server.
+REANNOUNCE="${AIRDROP_REANNOUNCE:-30}"
+
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
 
 # State is written for waybar to read. Keep it a single line and always
@@ -73,7 +87,28 @@ set_state() {
     > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 
+# avahi-daemon binds 5353 and answers for this host on awdl0 too, so with it
+# running the phone can get avahi's reply (which carries no _airdrop._tcp
+# record) instead of opendrop's, and we simply never appear. airdrop.sh has
+# always stopped it for the duration; the daemon path never did.
+avahi_stop() {
+  AVAHI_WAS=""
+  if pgrep -x avahi-daemon >/dev/null 2>&1; then
+    AVAHI_WAS=1
+    sudo -n "$HELPER" avahi-down >/dev/null 2>&1
+    log "avahi-daemon stopped for this session (restored on exit)"
+  fi
+}
+
+avahi_restore() {
+  if [ -n "${AVAHI_WAS:-}" ]; then
+    sudo -n "$HELPER" avahi-up >/dev/null 2>&1
+    AVAHI_WAS=""
+  fi
+}
+
 teardown() {
+  avahi_restore
   sudo -n "$HELPER" owl-stop >/dev/null 2>&1
   [ -n "${OD_PID:-}" ] && kill "$OD_PID" 2>/dev/null
   if [ "$DUALCHAN" = 1 ]; then
@@ -87,6 +122,10 @@ teardown() {
 cleanup() {
   teardown
   [ -n "${BLE_PID:-}" ] && kill "$BLE_PID" 2>/dev/null
+  # The health watcher outlives opendrop if we exit mid-window; left running it
+  # would rewrite the state file after we set it to off, so the bar would show
+  # an error for a daemon that is no longer there.
+  [ -n "${HEALTH_PID:-}" ] && kill "$HEALTH_PID" 2>/dev/null
   set_state off
   log "airdropd exiting"
 }
@@ -94,12 +133,37 @@ cleanup() {
 # One transfer window: bring the stack up, advertise, wait, tear down.
 # Everything here is bounded - a bar toggle that can wedge is worse than one
 # that occasionally misses a transfer.
-serve_window() {
-  local trigger="$1"
-  log "trigger from $trigger - bringing stack up"
-  set_state waking "$trigger"
-
+# Bring the radio stack up and leave awdl0 ready. Sets CHAN on success.
+# Shared by the BLE-triggered window and the always-on switch so the two
+# cannot drift apart - the P2P-GO bring-up is the fiddly part and there must
+# only ever be one copy of it.
+stack_up() {
   local up chan owlargs
+
+  # The whole point of P2P-GO mode is keeping the internet, so refuse the
+  # combination that provably cannot hold it. Measured 2026-08-03, one evening,
+  # same chip and phone:
+  #
+  #   STA ch2  + GO ch149  -> association lost ("Connection to AP lost" 1/s)
+  #   STA ch2  + GO ch6    -> association lost, though both are 2.4GHz
+  #   STA ch36 + GO ch149  -> held, 60s clean, 0% loss to the gateway
+  #   STA ch36 + GO ch36   -> held
+  #
+  # So the predictor is NOT whether the two channels share a band - the ch6
+  # case rules that out. It is the STA's own band: a 2.4GHz association does
+  # not survive a second chanctx at all, a 5GHz one does. Refuse up front,
+  # because a bar switch that silently drops your network is worse than one
+  # that declines to turn on and says why.
+  if [ "$DUALCHAN" = 1 ]; then
+    local sta sta_chan
+    sta=$(iw dev 2>/dev/null | awk '/^\tInterface /{i=$2} /^\t\ttype managed/{print i; exit}')
+    sta_chan=$(iw dev "${sta:-none}" info 2>/dev/null | grep -oP 'channel \K[0-9]+')
+    if [ -n "$sta_chan" ] && [ "$sta_chan" -le 14 ]; then
+      log "REFUSING: STA on 2.4GHz ch$sta_chan - a GO alongside it drops the link"
+      set_state error "Wi-Fi is on 2.4GHz (ch$sta_chan); AirDrop needs a 5GHz AP"
+      return 1
+    fi
+  fi
   if [ "$DUALCHAN" = 1 ]; then
     # P2P-GO mode: pick AWDL's channel ourselves instead of hoping the AP's
     # matches (mt7921-dual-channel). owl rides go0's own chanctx via mon0
@@ -110,8 +174,12 @@ serve_window() {
       return 1
     fi
     chan="$GO_CHAN"
-    owlargs=(owl-start "$chan" mon0)
-    log "go0 up on ch $chan (P2P-GO mode)"
+    # Run OWL on whichever vif go-up says can ACK - the `flags active` mon1 if
+    # it came up, else the plain mon0. Unicast AWDL is unanswered without it.
+    local ackvif
+    ackvif=$(printf '%s' "$up" | grep -oP '"ackvif":"\K[^"]+')
+    owlargs=(owl-start "$chan" "${ackvif:-mon0}")
+    log "go0 up on ch $chan (P2P-GO mode, owl on ${ackvif:-mon0})"
   else
     if ! up=$(sudo -n "$HELPER" up 2>&1); then
       log "helper up FAILED: $up"
@@ -135,7 +203,32 @@ serve_window() {
     return 1
   fi
 
-  set_state armed "ch ${chan:-?}"
+  # awdl0 exists but its link-local address is not immediately bindable.
+  # opendrop's zeroconf binds 5353 once at startup and does NOT retry: too
+  # early and it logs "Address not available ... 5353" and then announces into
+  # nothing, silently, while still looking healthy. airdrop.sh only avoids
+  # this by accident, because its ping checks take ~20s first.
+  local i
+  for i in $(seq 40); do
+    ip -6 addr show dev awdl0 scope link 2>/dev/null \
+      | grep -q 'inet6 .*\(tentative\)' || \
+      { ip -6 addr show dev awdl0 scope link 2>/dev/null | grep -q inet6 && break; }
+    sleep 0.25
+  done
+  log "awdl0 link-local ready after $((i*250))ms"
+
+  CHAN="${chan:-?}"
+  return 0
+}
+
+serve_window() {
+  local trigger="$1"
+  log "trigger from $trigger - bringing stack up"
+  set_state waking "$trigger"
+
+  stack_up || return 1
+
+  set_state armed "ch $CHAN"
   log "advertising for ${WINDOW}s"
   mkdir -p "$RECV_DIR"
   # AIRDROP_CONFIRM is what makes the patched handle_ask prompt. Without it
@@ -152,6 +245,89 @@ serve_window() {
   return 0
 }
 
+# Always-on: up once, advertise until stopped. opendrop is run in a loop
+# because it exits after some transfers and on some malformed requests; in a
+# timed window that just ended the window, but here it would silently turn a
+# bar that still reads "on" into one that no longer receives anything. The
+# radio stack stays up across the restart - only the HTTPS server is respawned.
+serve_forever() {
+  log "always-on mode - bringing stack up"
+  set_state waking "switch"
+
+  avahi_stop
+  stack_up || { avahi_restore; return 1; }
+
+  set_state armed "ch $CHAN"
+  log "advertising on ch $CHAN until stopped"
+  mkdir -p "$RECV_DIR"
+
+  # opendrop's HTTP server is single-threaded, so anything slow inside a
+  # handler stops it accepting. The consent prompt is exactly that: at the
+  # stock 45s, one unanswered prompt filled the listen backlog (Recv-Q 6 on a
+  # backlog of 5) with iOS's own validation connects, which time out and make
+  # the phone DROP the device from the share sheet - so a prompt nobody
+  # answered also destroyed discovery for everyone. Keep the prompt, but bound
+  # it tightly enough that the server frees up before iOS gives up on us.
+  export AIRDROP_CONFIRM_TIMEOUT="${AIRDROP_CONFIRM_TIMEOUT:-15}"
+
+  while :; do
+    # -d matches airdrop.sh's invocation. Without it opendrop logs only
+    # "File(s) received (size 0.00 MB)" with no request headers, so a transfer
+    # that arrives empty is indistinguishable from one that never carried a
+    # payload - there is no TotalBytes to compare against. PYTHONUNBUFFERED so
+    # the lines reach the log file as they happen rather than sitting in an
+    # 8 KiB block buffer, which matters when reading it live during a transfer.
+    ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" PYTHONUNBUFFERED=1 \
+        "$OPENDROP" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
+    OD_PID=$!
+
+    # Watch the stack while opendrop runs. Without this the bar keeps saying
+    # "on" after owl or the GO has died underneath it - the state file is
+    # written once at bring-up and never revisited, so a dead receiver is
+    # indistinguishable from a working one right up until a transfer fails.
+    # A switch that claims to be on when it is not is worse than one that is
+    # simply off.
+    ( elapsed=0
+      while kill -0 "$OD_PID" 2>/dev/null; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        if ! ip link show awdl0 >/dev/null 2>&1 || ! pgrep -x airdrop-owl >/dev/null; then
+          set_state error "stack died (awdl0 or owl gone) - toggle off and on"
+          log "HEALTH: awdl0 or owl vanished while armed"
+          break
+        fi
+        # Re-announce. python-zeroconf announces ONCE at registration and the
+        # iPhone does not poll - it only learns we exist by catching that
+        # burst. Measured repeatedly: the phone connects within seconds of an
+        # opendrop restart and is blind to us otherwise, which is why the
+        # receiver looked like it "worked then vanished". Restarting opendrop
+        # is the only re-announce hook available from out here.
+        #
+        # Never do it mid-transfer: an ESTABLISHED socket on the data port
+        # means a file is moving, so hold off and try again next tick.
+        if [ "$elapsed" -ge "$REANNOUNCE" ]; then
+          if ss -tn state established "( sport = :8771 or sport = :8772 )" \
+               2>/dev/null | grep -q .; then
+            log "re-announce deferred - transfer in flight"
+          else
+            log "re-announcing (${REANNOUNCE}s since last)"
+            kill "$OD_PID" 2>/dev/null
+            break
+          fi
+          elapsed=0
+        fi
+      done ) &
+    HEALTH_PID=$!
+
+    wait "$OD_PID" 2>/dev/null
+    OD_PID=""
+    kill "$HEALTH_PID" 2>/dev/null
+    HEALTH_PID=""
+    log "opendrop exited - respawning"
+    sleep 1
+  done
+}
+
 cmd_run() {
   # Single instance. Without this a second toggle deletes the first's mon0
   # mid-transfer, which presents as a mysterious mid-file failure.
@@ -162,7 +338,11 @@ cmd_run() {
   fi
   echo $$ >&9
 
-  for p in "$HELPER" "$BLE_WATCH" "$CONFIRM" "$OWL" "$OPENDROP"; do
+  # ble-watch is only needed by the BLE-triggered path; always-on never runs
+  # it, so do not make a missing one fatal for a mode that will not call it.
+  local need=("$HELPER" "$CONFIRM" "$OWL" "$OPENDROP")
+  [ "$ALWAYS" = 1 ] || need+=("$BLE_WATCH")
+  for p in "${need[@]}"; do
     [ -x "$p" ] || { echo "airdropd: missing or not executable: $p" >&2; exit 1; }
   done
   if ! sudo -n "$HELPER" status >/dev/null 2>&1; then
@@ -180,6 +360,13 @@ cmd_run() {
   trap cleanup EXIT
 
   : > "$LOG"
+
+  if [ "$ALWAYS" = 1 ]; then
+    log "airdropd started in always-on mode (dualchan=$DUALCHAN)"
+    serve_forever
+    return $?
+  fi
+
   set_state idle
   log "airdropd started; watching BLE for AirDrop adverts (min rssi $MIN_RSSI)"
 

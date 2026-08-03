@@ -201,14 +201,59 @@ EOF
     ip link set $MON down
     ip link set $MON address "$GOMAC"
     ip link set $MON up || exit 1
+
+    # The ACK pair, exactly as in airdrop.sh's PAIR mode (§13/§14). A plain
+    # monitor cannot ACK, and AWDL unicast - which is everything past
+    # discovery - needs ACKs, so with mon0 alone the phone's frames go
+    # unanswered and it never completes discovery: 100% loss on a ping6 over
+    # awdl0 even though go0 is up on the right channel and mDNS is bound.
+    # Order matters: the plain vif must already exist and own the channel, or
+    # an active vif is stuck on 5180 MHz forever. MAC-aliased to go0 like mon0
+    # so monitor TX borrows go0's chanctx.
+    if iw phy "$PHY" interface add $MONA type monitor flags active 2>/dev/null; then
+      ip link set $MONA down
+      ip link set $MONA address "$GOMAC"
+      if ip link set $MONA up 2>/dev/null; then
+        ACKVIF=$MONA
+      else
+        iw dev $MONA del 2>/dev/null
+        ACKVIF=$MON
+      fi
+    else
+      ACKVIF=$MON
+    fi
+
     echo 0 > "$MT76/runtime-pm" 2>/dev/null
     echo 0 > "$MT76/deep-sleep" 2>/dev/null
-    printf '{"go":"%s","mon":"%s","chan":%s}\n' "$GO" "$MON" "$chan"
+    printf '{"go":"%s","mon":"%s","ackvif":"%s","chan":%s}\n' \
+      "$GO" "$MON" "$ACKVIF" "$chan"
+    ;;
+
+  avahi-down)
+    # avahi answers for this host on awdl0 and has no _airdrop._tcp record, so
+    # whichever responder the phone hears first decides whether we exist. Done
+    # through the helper because that is what the sudoers rule covers - a bare
+    # `sudo sv` from the daemon has no rule and fails silently.
+    if pgrep -x avahi-daemon >/dev/null 2>&1; then
+      sv down avahi-daemon >/dev/null 2>&1 \
+        || systemctl stop avahi-daemon >/dev/null 2>&1
+      echo '{"avahi":"stopped"}'
+    else
+      echo '{"avahi":"already-down"}'
+    fi
+    ;;
+
+  avahi-up)
+    sv up avahi-daemon >/dev/null 2>&1 \
+      || systemctl start avahi-daemon >/dev/null 2>&1
+    echo '{"avahi":"started"}'
     ;;
 
   go-down)
     pkill -x airdrop-owl 2>/dev/null
     pkill -f "^$GO_HOSTAPD " 2>/dev/null
+    ip link set $MONA down 2>/dev/null
+    iw dev $MONA del 2>/dev/null
     ip link set $MON down 2>/dev/null
     iw dev $MON del 2>/dev/null
     ip link set $GO down 2>/dev/null
@@ -250,9 +295,25 @@ EOF
     # rides go0's own chanctx); up's default pair uses mon1, the `flags
     # active` vif that can ACK while riding the AP's chanctx (§14).
     vif="${3:-$MONA}"
+
+    # Sequence strategy. `verbatim` copies whichever row a peer last advertised,
+    # so our presence drifts with the phone's: measured across one evening the
+    # same iPhone cycled between 1/16 and 15/16 slots on a channel, and when it
+    # dropped to its sparse idle row our slots stopped overlapping its active
+    # ones and discovery died. `pin` holds all 16 slots on our own channel, so
+    # our presence is constant while the phone's varies - we are then present
+    # for every slot the phone offers, whatever row it picks. Slots 2 and 10
+    # were ch149 in EVERY sequence observed, which is why 149 is the default
+    # anchor. Override with AIRDROP_OWL_STRATEGY if a peer needs verbatim.
+    strategy="${AIRDROP_OWL_STRATEGY:-pin}"
+    case "$strategy" in
+      pin|verbatim|fixed) ;;
+      *) echo "airdrop-helper: bad strategy $strategy" >&2; exit 1 ;;
+    esac
+
     pkill -x airdrop-owl 2>/dev/null
     # stdbuf -oL so the log is readable live rather than in 4 KiB bursts.
-    setsid stdbuf -oL "$OWL_BIN" -i "$vif" -c "$chan" -N -S verbatim -vv \
+    setsid stdbuf -oL "$OWL_BIN" -i "$vif" -c "$chan" -N -S "$strategy" -vv \
       >> /run/airdrop-owl.log 2>&1 &
     for _ in $(seq 60); do
       ip link show awdl0 >/dev/null 2>&1 && break
