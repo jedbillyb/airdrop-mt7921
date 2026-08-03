@@ -243,8 +243,17 @@ in every working transfer (§24), so the radio has always been effectively pinne
 to one channel. `KEEP_WIFI` only changes who chooses it.
 
 **Not yet proven to complete a transfer** - only to coexist. If you want Wi-Fi
-and AirDrop simultaneously with no conditions attached, give AWDL its own radio
-(an AR9271 on USB): two phys, no shared channel context.
+and AirDrop simultaneously with no conditions attached without touching your
+AP's channel, that constraint is gone at the kernel level as of 2026-08-03: see
+[`mt7921-awdl-kernel`](https://github.com/jedbillyb/mt7921-awdl-kernel). A
+P2P-GO vif plus a MAC-aliased monitor vif lets a single MT7921 pick AWDL's
+channel independently of the AP's, on a stock kernel, and it has now also been
+shown to survive a real Wi-Fi reassociation. **Not yet ported into this repo's
+`KEEP_WIFI` mode or into `daemon/airdropd`** - that repo is kernel/driver-level
+research, this one is the application. Until that port happens, the fallback
+for "Wi-Fi and AirDrop simultaneously with no conditions attached" is still
+giving AWDL its own radio (an AR9271 on USB): two phys, no shared channel
+context.
 
 ## Two mt7921 driver bugs you will hit
 
