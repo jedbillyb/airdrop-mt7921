@@ -35,12 +35,12 @@ detail=$(printf '%s' "$STATE_JSON" | grep -oP '"detail":"\K[^"]*')
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 case "$state" in
-  off)    text=""; class="off";    tip="AirDrop off - click to start listening" ;;
-  idle)   text=""; class="idle";   tip="AirDrop listening on Bluetooth. Open the share sheet on your iPhone." ;;
-  waking) text=""; class="waking"; tip="AirDrop: phone detected ($detail) - bringing radio up" ;;
-  armed)  text=""; class="armed";  tip="AirDrop ready ($detail) - pick this machine on your iPhone" ;;
-  error)  text=""; class="error";  tip="AirDrop error: $detail" ;;
-  *)      text=""; class="off";    tip="AirDrop: unknown state" ;;
+  off)    text="drop off";  class="off";    tip="AirDrop off - click to start listening" ;;
+  idle)   text="drop idle"; class="idle";   tip="AirDrop listening on Bluetooth. Open the share sheet on your iPhone." ;;
+  waking) text="drop..";    class="waking"; tip="AirDrop: phone detected ($detail) - bringing radio up" ;;
+  armed)  text="drop on";   class="armed";  tip="AirDrop ready ($detail) - pick this machine on your iPhone" ;;
+  error)  text="drop err";  class="error";  tip="AirDrop error: $detail" ;;
+  *)      text="drop ?";    class="off";    tip="AirDrop: unknown state" ;;
 esac
 
 printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' \
