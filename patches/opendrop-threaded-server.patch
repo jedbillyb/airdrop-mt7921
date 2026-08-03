@@ -1,0 +1,39 @@
+--- a/opendrop/server.py
++++ b/opendrop/server.py
+@@ -27,7 +27,7 @@
+ import threading
+ import time
+ import zlib
+-from http.server import BaseHTTPRequestHandler, HTTPServer
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ 
+ import libarchive
+ import libarchive.extract
+@@ -201,8 +201,26 @@
+         return properties
+ 
+ 
+-class HTTPServerV6(HTTPServer):
++class HTTPServerV6(ThreadingHTTPServer):
++    """
++    One thread per connection. This MUST NOT be the stock single-threaded
++    HTTPServer: iOS sends `Connection: keep-alive` and then holds the
++    connection open idle, so a single-threaded server stays parked in
++    handle_one_request() on that socket and never returns to accept(). The
++    next connection - the one actually carrying the file - then sits unread
++    in the kernel queue forever, which the phone shows as "Waiting...".
++
++    Observed exactly that: an established socket on 8771 with Recv-Q 1496
++    while opendrop had logged nothing for twelve minutes. It is also the same
++    single-thread bottleneck that let one slow consent prompt fill the listen
++    backlog with iOS's validation connects and get us dropped from the share
++    sheet; threading removes the whole class of stall.
++
++    daemon_threads so a hung handler cannot keep the process alive on exit.
++    """
++
+     address_family = socket.AF_INET6
++    daemon_threads = True
+ 
+ 
+ class AirDropServerHandler(BaseHTTPRequestHandler):

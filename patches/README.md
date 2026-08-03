@@ -12,6 +12,23 @@ git apply /path/to/airdrop-mt7921/patches/opendrop-ios26-airdrop.patch
 (Void has no `patch(1)` installed; `git apply` works and the patch is verified
 against it.)
 
+## opendrop-threaded-server.patch
+
+Makes `HTTPServerV6` subclass `ThreadingHTTPServer` (with `daemon_threads`)
+instead of the stock single-threaded `HTTPServer`.
+
+iOS sends `Connection: keep-alive` and then holds the connection open idle. A
+single-threaded server stays parked in `handle_one_request()` on that idle
+socket and never gets back to `accept()`, so the next connection - the one
+carrying the file - sits unread in the kernel queue indefinitely. The phone
+shows this as "Waiting...". Observed directly: an ESTABLISHED socket on 8771
+with **Recv-Q 1496** while opendrop had logged nothing for twelve minutes.
+
+This is the same single-thread bottleneck that made a slow consent prompt fill
+the listen backlog with iOS's validation connects and get us dropped from the
+share sheet, which `airdropd` worked around by cutting the prompt timeout to
+15s. Threading removes the class of stall rather than tuning around it.
+
 ## opendrop-mdns-reannounce.patch
 
 Re-sends the receiver's mDNS announcement every
