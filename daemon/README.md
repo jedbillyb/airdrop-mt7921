@@ -1,8 +1,7 @@
 # AirDrop as a switch (`airdropd`)
 
 `airdropd` has **two modes**, and the one the waybar toggle actually uses is
-the second. Read this section before the rest of the file, because most of the
-document below was written for the first.
+the second.
 
 | mode | how it arms | what the switch means |
 |---|---|---|
@@ -36,7 +35,7 @@ trade worth making for a switch that just works with no second step.
 | `ble-watch` | Detects Apple Continuity **AirDrop** adverts (company `0x004C`, type `0x05`) by parsing `btmon`. Prints one JSON line per sighting. |
 | `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path. |
 | `airdrop-confirm` | Asks the user, via `swaynag`, whether to accept an incoming file. |
-| `airdropd` | Orchestrator: BLE trigger → stack up → advertise → confirm → tear down. |
+| `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. |
 | `../waybar/airdrop-status.sh` | waybar module: JSON status + click-to-toggle. |
 
 ## Security: read this before running it unattended
@@ -58,7 +57,10 @@ be run, the transfer is refused. Verified:
 | hook exits non-zero | **403 Forbidden**, phone shows "Declined" |
 | hook missing / unrunnable | **decline** |
 | no Wayland session to prompt in | **decline** |
-| prompt not answered within 45 s | **decline** |
+| prompt not answered within the timeout | **decline** |
+
+The timeout is `AIRDROP_CONFIRM_TIMEOUT`, 45 s by default but **15 s in
+always-on mode** — see Tuning.
 
 An unaskable question is not consent.
 
@@ -71,12 +73,27 @@ Two things need root. Everything else runs as you.
 NOPASSWD on `tcpdump` is indistinguishable from NOPASSWD on everything. `iw` and
 `ip` are nearly as bad. The wrapper takes a fixed verb and accepts no paths.
 
-Both privileged programs must be installed **root-owned, outside the repo**:
+Everything the helper runs as root must be installed **root-owned, outside the
+repo**, for the same reason:
 
 ```sh
+# The two sudoers entry points
 sudo install -o root -g root -m 755 daemon/airdrop-helper /usr/local/bin/airdrop-helper
-sudo install -o root -g root -m 755 daemon/ble-watch     /usr/local/bin/airdrop-ble-watch
+sudo install -o root -g root -m 755 daemon/ble-watch      /usr/local/bin/airdrop-ble-watch
+
+# owl, which the helper starts as root. Its path is hard-coded in the helper -
+# owl creates the awdl0 tun and cannot do it unprivileged, and pointing this at
+# $OWL_DIR/build/daemon/owl would re-open the escalation the wrapper avoids.
+sudo install -o root -g root -m 755 ~/owl/build/daemon/owl /usr/local/bin/airdrop-owl
+
+# Only needed for AIRDROP_DUALCHAN=1: the patched hostapd from mt7921-dual-channel
+sudo install -o root -g root -m 755 \
+  /mnt/shared/build/hostapd-2.11/hostapd/hostapd /usr/local/bin/airdrop-go-hostapd
 ```
+
+**Only the first two go in sudoers.** `airdrop-owl` and `airdrop-go-hostapd`
+are invoked *by* the helper, which is already root by then, so giving them
+their own NOPASSWD rules would widen the surface for nothing.
 
 **Never point the sudoers rule at the copies in this repo.** The repo lives
 under your home / `/mnt/shared/projects` and is writable by you, and NOPASSWD on
@@ -183,6 +200,7 @@ third transient label made the bar look busier than the thing it describes.
 | state | label | colour | meaning |
 |---|---|---|---|
 | `off` | drop off | grey | not running |
+| `idle` | drop on | blue | BLE mode only: running, watching Bluetooth, radio not committed |
 | `waking` | drop on | blue | click landed, stack coming up (or waiting for the Wi-Fi to settle) |
 | `switching` | drop on | amber | station was on 2.4 GHz; the Wi-Fi is being moved to 5 GHz |
 | `armed` | drop on | blue | up and advertising |
@@ -209,8 +227,8 @@ label is evidence that *the click landed*, not that anything is working. Check
 | `AIRDROP_WINDOW` | `90` | How long to stay up after a trigger. Also the worst case for how long the radio is committed. |
 | `AIRDROP_CONFIRM_TIMEOUT` | `45` | Unanswered prompt → decline. Always-on mode overrides this to `15`, so one unanswered prompt cannot fill the listen backlog. |
 | `AIRDROP_DUALCHAN` | `0` | Set `1` to use P2P-GO mode instead of the default AP-channel-borrowing mode. See below. |
-| `AIRDROP_GO_CHAN` | `auto` | Which channel `go0` sits on in P2P-GO mode. `auto` follows the station; an explicit value must be one of `6/36/44/149`. Never rewritten at runtime — the channel currently built is tracked separately. |
-| `AIRDROP_GO_FOLLOW` | `1` | Rebuild the GO on the peer's channel when the station cannot supply a usable one. `0` warns without rebuilding. |
+| `AIRDROP_GO_CHAN` | `auto` | Which channel `go0` sits on in P2P-GO mode. `auto` runs the full precedence below; an explicit value must be one of `6/36/44/149`. Never rewritten at runtime — the channel currently built is tracked separately, and conflating the two is what once turned `auto` into a constant after the first correction. |
+| `AIRDROP_GO_FOLLOW` | `1` | Whether the wrong-channel watch may rebuild the GO on the peer's channel after `AIRDROP_WRONGCHAN_AFTER` seconds of zero overlap. `0` warns and stays put. Under station-first precedence the common answer is "stay" either way. |
 | `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
 | `AIRDROP_ALWAYS` | `0` | `1` = no BLE, stay advertising until toggled off. What the waybar switch sets. |
 | `AIRDROP_REANNOUNCE` | `5` | Seconds between mDNS re-announcements. The iPhone **does not poll** for receivers — it only ever learns we exist by catching an announce burst, so a receiver that announces once is invisible from a few seconds after arming. Handled in-process by `patches/opendrop-mdns-reannounce.patch`, so it no longer costs a restart. |
@@ -224,16 +242,17 @@ as the unrelated-sounding "awdl0 never appeared".
 ### Channel policy in `auto`
 
 The **station's** channel wins; the peer's is a fallback used only when the
-station is unreadable or on a channel no GO can be built on. Measured against a
-phone advertising `36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36` with the AP on
-36: following the peer to its dominant 149 gives 2/16 overlap and moved zero
-bytes in 60 s, while the station's own 36 is 6/16 of the same sequence and is
-the pairing that holds the association.
+station is on a channel no GO can be built on. Measured against a phone
+advertising `36,36,149,0,0,0,0,36,6,36,149,36,0,0,0,36` with the AP on 36:
+following the peer to its dominant 149 gives 2/16 overlap and moved zero bytes
+in 60 s, while the station's own 36 is 6/16 of the same sequence and is the
+pairing that holds the association.
+
+An **unreadable** station is not a fallback case — it used to be, and that was
+the bug described two sections down. It now refuses and waits.
 
 Consequence worth knowing: when the phone is on a *different* AP from us, we
-now stay put and go `unreachable` rather than chasing it. Waybar needs a CSS
-rule for `.unreachable` (it reads "drop on" — the receiver is up and would
-serve a phone on our channel).
+now stay put and go `unreachable` rather than chasing it.
 
 The full precedence, in order:
 
@@ -331,7 +350,7 @@ back to waiting for 5 GHz. Protecting the Wi-Fi outranks keeping AirDrop up.
 This is a guard, not roam *following*: nothing tracks the station between
 5 GHz channels while the stack is up.
 
-### P2P-GO mode (`AIRDROP_DUALCHAN=1`) — opt-in, less proven than the default
+### P2P-GO mode (`AIRDROP_DUALCHAN=1`) — opt-in, and what the switch runs
 
 The default mode borrows whatever channel the AP is already on for AWDL —
 which only works when the phone's AWDL happens to land there ([§38, the
@@ -344,14 +363,14 @@ monitor vif with its MAC address aliased to `go0`'s, which `owl` runs against.
 `go-down` tears both down. No `KEEP_WIFI`-style channel-context borrowing is
 involved, and the association is never touched.
 
-Requires the patched hostapd from that repo, installed root-owned exactly
-like `airdrop-owl`:
+Requires the patched hostapd from that repo as `/usr/local/bin/airdrop-go-hostapd`
+(see Install). `airdropd` refuses to start with `AIRDROP_DUALCHAN=1` if it is
+missing, rather than failing later in a way that looks like a radio fault.
 
-```sh
-sudo install -o root -g root -m 755 \
-  /mnt/shared/build/hostapd-2.11/hostapd/hostapd \
-  /usr/local/bin/airdrop-go-hostapd
-```
+The **band lock** additionally uses `nmcli connection modify`, which needs
+`org.freedesktop.NetworkManager.settings.modify.system` — check with
+`nmcli general permissions`. No sudo, no extra rule. Without it the lock fails
+cleanly and you get the old 2.4 GHz refusal.
 
 **This mode is newer than the default, but it is now the better-exercised of
 the two** — it is what the waybar switch runs, and it is the one that has
@@ -451,3 +470,38 @@ Current, honest, and roughly in the order you are likely to hit them.
   about an interface with no association, while the real link is fine.
   `airdrop.sh` escapes this only because it resolves the interface before
   creating any vifs.
+- **Picking "the station" by taking the first managed vif is wrong.** `iw dev`
+  prints roughly reverse creation order, so any second managed vif on the phy
+  shadows the real one. `airdropd`'s `sta_iface()` prefers an *associated* vif
+  for exactly this reason — a scratch `sta1` left over from a test made the
+  daemon report the live, associated `wlp2s0` as mid-roam.
+- **`ss` prints its column header even when nothing matches**, so
+  `ss -tn ... | grep -q .` is always true. That is what made the mDNS
+  re-announce guard believe a transfer was permanently in flight, leaving the
+  receiver invisible from ~30 s after arming. Use `ss -Htn`.
+- **`ss -tlnp | grep python` finds nothing for opendrop** — its comm name is
+  `opendrop`. And `ss -tnp` without `-l` lists established connections only, so
+  a live listener looks absent both ways. Use `ss -tlnpH | grep "pid=$PID,"`.
+- **`/run/airdrop-owl.log` is not truncated between owl restarts**, so grepping
+  it for `add peer` matches stale runs and a dead peer looks alive. Gate on the
+  live `STATS ... rx_action` counter instead.
+- **`pkill -f airdropd` from an inline shell command kills the caller too** —
+  the pattern appears in the calling shell's own command line (exit 144). Put
+  such kills in a script file.
+- **Two `airdropd` in `pgrep -a` is normal.** The health-watch subshell inherits
+  the parent's argv. The `flock` file is the pidfile and already prevents
+  genuine duplicates.
+- **If a helper's exit is not what produces the answer, do not wait on its
+  exit.** `swaynag --button-dismiss-no-terminal` dismisses first and runs the
+  button's command from a *detached child*, so `airdrop-confirm` tested for the
+  Accept marker ~2 ms before it existed and turned every Accept into a 403 — the
+  phone just sat on "Waiting". Wait for the answer, not the process.
+
+### First three things to check when "my phone can't see me"
+
+1. **Is AirDrop still on Everyone?** iOS reverts after ~10 minutes silently.
+   This is the most common cause by a distance.
+2. `grep re-announcing $XDG_RUNTIME_DIR/airdropd/airdropd.log` — if only
+   `deferred` lines appear, it is the `ss` bug class above, not the phone.
+3. `airdropd status`, not the bar colour. The module writes its own optimistic
+   state on click, so blue only means the click landed.
