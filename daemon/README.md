@@ -176,7 +176,14 @@ daemon/airdrop-send photo.jpg           # same, with desktop notifications
 Right-click → **Send via AirDrop** in Thunar does the second one:
 
 ```sh
-sudo install -m 755 daemon/airdrop-send /usr/local/bin/
+# A SYMLINK, not install -m 755 - airdrop-send finds airdropd beside itself,
+# and airdropd is not one of the root-owned copies (it is not a sudoers entry
+# point, so it stays in the repo). Same pattern as the waybar module.
+sudo ln -sf "$PWD/daemon/airdrop-send" /usr/local/bin/airdrop-send
+
+# The helper gains ble-adv/-stop/-count, so the root-owned copy needs updating:
+sudo install -o root -g root -m 755 daemon/airdrop-helper /usr/local/bin/airdrop-helper
+
 thunar -q                               # it rewrites uca.xml on exit
 tools/install-thunar-action.sh          # --remove undoes it
 ```

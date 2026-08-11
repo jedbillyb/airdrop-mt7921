@@ -13,13 +13,34 @@
 # rather than one for the terminal and a subtly different one for the GUI.
 set -u
 
+# readlink -f, so this works when installed as a SYMLINK into the repo - which
+# is how it is meant to be installed, following the waybar module's pattern:
+#
+#     sudo ln -s "$PWD/daemon/airdrop-send" /usr/local/bin/airdrop-send
+#
+# NOT `install -m 755`. A copy in /usr/local/bin has no relationship to the
+# repo, so the sibling lookup below resolves to /usr/local/bin/airdropd, which
+# nothing installs - airdropd is deliberately NOT one of the root-owned copies
+# (it is not a sudoers entry point and does not need to be). The symlink keeps
+# the pair together and means an edit in the repo is live immediately.
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-AIRDROPD="${AIRDROPD:-/usr/local/bin/airdropd}"
-[ -x "$AIRDROPD" ] || AIRDROPD="$HERE/airdropd"
+AIRDROPD="${AIRDROPD:-$HERE/airdropd}"
 
 if [ $# -eq 0 ]; then
   echo "usage: airdrop-send <file> [file...]" >&2
   exit 2
+fi
+
+# Checked here rather than left to fail inside the pipeline: from a Thunar
+# right-click there is no terminal, so an unresolvable airdropd would be a
+# menu entry that does nothing at all, with nowhere for the error to go.
+if [ ! -x "$AIRDROPD" ]; then
+  msg="airdrop-send: cannot find airdropd at $AIRDROPD.
+Install this as a symlink into the repo, not as a copy:
+    sudo ln -sf \"\$PWD/daemon/airdrop-send\" /usr/local/bin/airdrop-send"
+  echo "$msg" >&2
+  notify-send -a AirDrop -u critical -i dialog-error "AirDrop" "$msg" 2>/dev/null
+  exit 1
 fi
 
 # A single notification that gets REPLACED as the send progresses, rather than

@@ -49,8 +49,9 @@ fi
 
 command -v airdrop-send >/dev/null 2>&1 || {
   echo "WARNING: airdrop-send is not on PATH. The menu entry will appear and do"
-  echo "  nothing. Install it first:"
-  echo "      sudo install -m 755 daemon/airdrop-send /usr/local/bin/"
+  echo "  nothing at all - a Thunar action has no terminal to report into."
+  echo "  Install it first, as a SYMLINK so it can find airdropd beside itself:"
+  echo "      sudo ln -sf \"$HERE/../daemon/airdrop-send\" /usr/local/bin/airdrop-send"
 }
 
 mkdir -p "$(dirname "$UCA")"
