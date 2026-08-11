@@ -1,0 +1,26 @@
+<!-- Thunar custom action: "Send via AirDrop" on the right-click menu.
+     Installed into ~/.config/Thunar/uca.xml by tools/install-thunar-action.sh.
+
+     %F, not %f: %F expands to ALL selected paths, so a multi-select sends the
+     lot. airdropd turns that into one transfer per file, because opendrop's
+     send takes exactly one -f and there is no multi-file request in the
+     protocol implementation - see cmd_send.
+
+     No <patterns> restriction beyond *, and every file class enabled: AirDrop
+     does not care what it is carrying, and a right-click that appears for
+     photos but not PDFs is a worse tool than one that always appears. -->
+<action>
+	<icon>emblem-shared</icon>
+	<name>Send via AirDrop</name>
+	<submenu></submenu>
+	<unique-id>airdrop-mt7921-send</unique-id>
+	<command>airdrop-send %F</command>
+	<description>Send the selected files to an iPhone over AirDrop</description>
+	<range></range>
+	<patterns>*</patterns>
+	<audio-files/>
+	<image-files/>
+	<other-files/>
+	<text-files/>
+	<video-files/>
+</action>

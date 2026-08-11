@@ -1,0 +1,78 @@
+#!/bin/bash
+# Desktop-facing wrapper around `airdropd send`. This is what the Thunar
+# right-click runs, and the only reason it exists separately is FEEDBACK: a
+# custom action launches with no terminal, so without notifications a
+# right-click is indistinguishable from nothing having happened - for the
+# thirty-odd seconds a discovery browse can take, and then for the minute a
+# transfer takes at AirDrop-over-AWDL speeds (~45-73 kB/s; see FINDINGS §16).
+#
+#   airdrop-send <file> [file...]
+#
+# Everything real happens in `airdropd send`. This adds notifications, and
+# nothing else - keep it that way, so there is one implementation of sending
+# rather than one for the terminal and a subtly different one for the GUI.
+set -u
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+AIRDROPD="${AIRDROPD:-/usr/local/bin/airdropd}"
+[ -x "$AIRDROPD" ] || AIRDROPD="$HERE/airdropd"
+
+if [ $# -eq 0 ]; then
+  echo "usage: airdrop-send <file> [file...]" >&2
+  exit 2
+fi
+
+# A single notification that gets REPLACED as the send progresses, rather than
+# a stack of four. -p prints the id and -r reuses it; both are libnotify
+# extensions that not every server implements, so the id is optional throughout
+# and an unsupported server simply gets separate notifications.
+NID=""
+note() {
+  local urgency="$1" body="$2" icon="${3:-emblem-shared}" out
+  if [ -n "$NID" ]; then
+    notify-send -a AirDrop -i "$icon" -u "$urgency" -r "$NID" "AirDrop" "$body" 2>/dev/null
+  else
+    out=$(notify-send -a AirDrop -i "$icon" -u "$urgency" -p "AirDrop" "$body" 2>/dev/null)
+    case "$out" in ''|*[!0-9]*) : ;; *) NID="$out" ;; esac
+  fi
+}
+
+if [ $# -eq 1 ]; then
+  note normal "Sending $(basename "$1")…"
+else
+  note normal "Sending $# files…"
+fi
+
+# Line-buffered so the notification tracks the send rather than all arriving at
+# the end. The log lines airdropd prints are already user-facing sentences.
+LAST=""
+OUTPUT=$(mktemp -t airdrop-send-XXXXXX)
+trap 'rm -f "$OUTPUT"' EXIT
+
+"$AIRDROPD" send "$@" 2>&1 | while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$OUTPUT"
+  case "$line" in
+    "sending to "*) note normal "${line#sending to }: sending…" ;;
+    "sent: "*)      note normal "Sent ${line#sent: }" ;;
+  esac
+done
+# The exit status of the pipeline is `while`'s, not airdropd's. PIPESTATUS is
+# the only thing that carries the one we care about.
+rc=${PIPESTATUS[0]}
+
+if [ "$rc" = 0 ]; then
+  if [ $# -eq 1 ]; then
+    note normal "Sent $(basename "$1")" emblem-default
+  else
+    note normal "Sent $# files" emblem-default
+  fi
+else
+  # The first line of airdropd's failure text is the actionable one ("No
+  # AirDrop receiver found", then what to do on the phone). Show a couple of
+  # lines rather than "failed", because every failure this path has is a phone
+  # state the user can fix in five seconds if told which one.
+  body=$(grep -v '^$' "$OUTPUT" | tail -6)
+  note critical "${body:-Send failed. See the log.}" dialog-error
+fi
+
+exit "$rc"

@@ -74,12 +74,21 @@ usage: airdrop-helper <verb> [chan]
                 keybinding needs to cover the manual path too.
   status        print JSON: vifs present, channel, association state
   ap-channel    print the channel the managed interface is associated on
+  ble-adv <hex> register an Apple Continuity BLE advertisement (see below)
+  ble-adv-stop  remove it again
+  ble-adv-count print how many advertising instances are registered
 
 Never takes a free-form path or command - <chan> is validated against a fixed
-list. See the header for why.
+list, and <hex> against a strict length and character class. See the header
+for why.
 EOF
   exit 2
 }
+
+# The BLE advertising instance we claim. Fixed rather than caller-supplied for
+# the same reason the channel list is fixed: a caller who can name the instance
+# can clobber an instance registered by something else on the system.
+BLE_INSTANCE=1
 
 ap_channel() {
   iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
@@ -386,6 +395,57 @@ EOF
       done
     fi
     echo '{"ok":true}'
+    ;;
+
+  # --- BLE Continuity advert -------------------------------------------------
+  #
+  # WHY THIS IS HERE AND NOT IN tools/blewake.sh. blewake.sh calls plain `sudo`,
+  # which is exactly right for a human at a terminal and useless for everything
+  # this daemon does: waybar and a Thunar right-click have no tty, so a sudo
+  # that wants a password (or a fingerprint) does not prompt, it hangs. The
+  # helper is the one path with a NOPASSWD rule, so the send path has to come
+  # through here. blewake.sh keeps its own sudo calls and stays the manual tool.
+  #
+  # The DATA is built by the caller, unprivileged - it is only the SHA256
+  # prefixes of the sender's own contact identifiers (FINDINGS §36, and the wire
+  # format in tools/blewake.sh) and nothing about it needs root. Root is needed
+  # solely to hand it to btmgmt. So this validates rather than constructs:
+  # hex digits only, even length, and no longer than a BLE AD structure can
+  # carry. That keeps the granted capability "register one short advertisement"
+  # instead of "pass arbitrary arguments to btmgmt as root".
+  ble-adv)
+    adv="${2:-}"
+    case "$adv" in
+      *[!0-9A-Fa-f]*|"") echo "airdrop-helper: ble-adv data must be hex" >&2; exit 1 ;;
+    esac
+    if [ $(( ${#adv} % 2 )) -ne 0 ] || [ "${#adv}" -gt 62 ]; then
+      echo "airdrop-helper: ble-adv data must be an even number of hex digits, max 62" >&2
+      exit 1
+    fi
+    # Clear a leftover instance before claiming the slot. An advert from a
+    # previous run keeps broadcasting indefinitely and shows up in no UI, so
+    # "add" on an occupied instance failing would be a confusing way to find out.
+    timeout 10 btmgmt rm-adv "$BLE_INSTANCE" </dev/null >/dev/null 2>&1 || true
+    if ! timeout 15 btmgmt add-adv -d "$adv" -g "$BLE_INSTANCE" </dev/null 2>&1 \
+         | grep -q "Instance added"; then
+      echo "airdrop-helper: failed to register advertising instance $BLE_INSTANCE" >&2
+      exit 1
+    fi
+    echo '{"ok":true}'
+    ;;
+
+  ble-adv-stop)
+    timeout 10 btmgmt rm-adv "$BLE_INSTANCE" </dev/null >/dev/null 2>&1 || true
+    echo '{"ok":true}'
+    ;;
+
+  # The registered instance is the test, NOT whether some process is alive
+  # (§36): the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets
+  # the shared controller and the advert dies while its launcher carries on
+  # looking healthy. Callers check this before and after a bring-up.
+  ble-adv-count)
+    timeout 5 btmgmt advinfo 2>/dev/null \
+      | grep -oP 'Instances list with \K[0-9]+' || echo 0
     ;;
 
   status)

@@ -33,9 +33,11 @@ trade worth making for a switch that just works with no second step.
 | file | what it does |
 |---|---|
 | `ble-watch` | Detects Apple Continuity **AirDrop** adverts (company `0x004C`, type `0x05`) by parsing `btmon`. Prints one JSON line per sighting. |
-| `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path. |
+| `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path, and `ble-adv` / `ble-adv-stop` / `ble-adv-count` for the send path's Continuity advert. |
 | `airdrop-confirm` | Asks the user, via `swaynag`, whether to accept an incoming file. |
-| `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. |
+| `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. Also `send`, below. |
+| `airdrop-send` | Desktop wrapper around `airdropd send`: same thing with `notify-send` progress. What the Thunar right-click runs. |
+| `thunar-action.xml` | The right-click menu entry, installed by `../tools/install-thunar-action.sh`. |
 | `../waybar/airdrop-status.sh` | waybar module: JSON status + click-to-toggle. |
 
 ## Security: read this before running it unattended
@@ -164,6 +166,52 @@ then open the share sheet. In BLE-triggered mode that share sheet is also what
 emits the advert `airdropd` waits for; in always-on mode nothing is waited for
 and the receiver is already up.
 
+### Sending
+
+```sh
+daemon/airdropd send photo.jpg          # terminal
+daemon/airdrop-send photo.jpg           # same, with desktop notifications
+```
+
+Right-click → **Send via AirDrop** in Thunar does the second one:
+
+```sh
+sudo install -m 755 daemon/airdrop-send /usr/local/bin/
+thunar -q                               # it rewrites uca.xml on exit
+tools/install-thunar-action.sh          # --remove undoes it
+```
+
+**On the phone, sending is the fussier direction** and the two gates are its,
+not ours (FINDINGS §22):
+
+- AirDrop → **Everyone**, and check it has not silently expired back to
+  Contacts Only after ten minutes. Nothing on this side can see that it has,
+  and it is the cheapest explanation for "no receiver found".
+- **CLOSE the share sheet.** An open sheet makes the phone a *sender*, and a
+  sender never advertises `_airdrop._tcp` for us to find. This is the exact
+  opposite of what receiving wants, which is what makes it catch people out.
+
+What `send` does *not* do is take the radio off whatever is using it:
+
+| the toggle is | what `send` does |
+|---|---|
+| **on** | Attaches to the running stack. Nothing is brought up or torn down, the bar keeps reading `armed`, and you keep receiving throughout. Fast path. |
+| **off** | Takes the lock so a toggle cannot race it, brings the stack up, sends, tears it back down. The bar reads `sending` while this happens. |
+
+Before this existed there was no send path that could coexist with the
+receiver: sending meant `airdrop.sh`, which rebuilds everything from scratch and
+would delete the running stack's `mon0` mid-transfer.
+
+A discovery report younger than `AIRDROP_SEND_REPORT_TTL` (90 s) is reused
+instead of browsing again, so a second file to the same phone skips the browse
+entirely. If a send against a reused report fails, it re-browses and retries
+once — stale reports have cost this project a debugging session before, so the
+shortcut is bounded *and* self-correcting.
+
+Each file is a separate transfer and a separate **Accept** on the phone:
+`opendrop`'s `send` takes exactly one `-f`. Selecting five files in Thunar means
+five prompts.
+
 ## Your current setup
 
 What the waybar switch runs on this box, end to end:
@@ -232,6 +280,9 @@ label is evidence that *the click landed*, not that anything is working. Check
 | `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
 | `AIRDROP_ALWAYS` | `0` | `1` = no BLE, stay advertising until toggled off. What the waybar switch sets. |
 | `AIRDROP_REANNOUNCE` | `5` | Seconds between mDNS re-announcements. The iPhone **does not poll** for receivers — it only ever learns we exist by catching an announce burst, so a receiver that announces once is invisible from a few seconds after arming. Handled in-process by `patches/opendrop-mdns-reannounce.patch`, so it no longer costs a restart. |
+| `AIRDROP_SEND_FIND_TIME` | `25` | `send` only. Ceiling on the discovery browse, not a duration — it stops the moment a receiver appears, so all this buys is how long a *failure* takes. Shorter than `airdrop.sh`'s 45 s because a right-click that hangs for a minute is worse than one that says "not found". |
+| `AIRDROP_SEND_REPORT_TTL` | `90` | `send` only. Reuse a discovery report younger than this instead of browsing again. Set `0` to always browse. |
+| `AIRDROP_RECEIVER` | *(first in report)* | `send` only. An explicit ID or hostname. Never pass an index — it is positional, and with AirDrop on Everyone every Apple device in range is a candidate, so index 0 silently redirects the transfer. |
 
 The buildable channel set is `6/36/44/149` and is enforced in three places that
 must agree: `airdropd`'s `GO_CHANNELS`, `airdrop-helper`'s `go-up` and
@@ -411,6 +462,21 @@ Retest a plain transfer before chasing anything more exotic.
 For a receive that is proven to complete right now, use the standalone
 `airdrop.sh` exclusive path (a full 2.56 MB photo, byte-exact, PIL-verified),
 not the daemon. It drops your Wi-Fi for the duration.
+
+**`airdropd send` has never been run against a phone.** Written 2026-08-11. What
+*is* verified is everything that does not need one: argument and permission
+failures all exit before touching the lock or the radio; the helper's `ble-adv`
+rejects non-hex, odd-length, over-long and empty data before reaching `btmgmt`,
+and registers/removes an advert cleanly (0 → 1 → 0 instances); the report
+parsing picks the right ID and name out of a real `discover.last.json` and
+rejects `[]`, which passes `-s` while meaning "found nobody"; the Thunar
+installer round-trips (install → idempotent re-run → remove) to a byte-identical
+file with the user's existing actions intact.
+
+None of that is a transfer. The send *direction* has only ever completed via
+`airdrop.sh` (§37), and the discovery gates in §22 are the phone's, so the first
+live run should be a single small file with the phone freshly set to Everyone
+and the share sheet closed.
 
 ## Limitations
 

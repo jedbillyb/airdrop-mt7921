@@ -1,9 +1,11 @@
 #!/bin/bash
 # On-demand AirDrop receiver: idle on Bluetooth, wake on an iPhone's share sheet.
 #
-#   airdropd run        # foreground; this is what a waybar toggle starts
-#   airdropd status     # one line of JSON for waybar
-#   airdropd stop       # ask a running instance to exit
+#   airdropd run          # foreground; this is what a waybar toggle starts
+#   airdropd status       # one line of JSON for waybar
+#   airdropd stop         # ask a running instance to exit
+#   airdropd send <file>  # send TO a phone, borrowing a running stack if there
+#                         # is one. This is what the Thunar right-click calls.
 #
 # THE MODEL (FINDINGS §39). A Mac does not hold AWDL up permanently either. It
 # scans BLE continuously - which costs nothing on the Wi-Fi side - and brings
@@ -1097,6 +1099,360 @@ cmd_run() {
   done < "$FIFO"
 }
 
+# --- sending ------------------------------------------------------------------
+#
+# `airdropd send <file>...` exists because until now there was NO send path that
+# could coexist with the receiver. Sending meant airdrop.sh, which rebuilds
+# layers 1-4 from scratch: with the bar toggle on, that takes the flock this
+# daemon holds, and if it got past that it would delete the mon0 the running
+# stack is using, mid-transfer. So the two tools could not both be on.
+#
+# Two modes, decided by whether anything already holds the lock:
+#
+#   ATTACH - the daemon is running and the stack is up. Borrow it. Nothing is
+#            brought up, nothing is torn down, and the state file is left
+#            entirely alone, because "armed" is still true: we are receiving
+#            throughout. This is the fast path and the one a right-click uses.
+#   OWN    - nothing is running. Take the lock so a toggle cannot race us,
+#            bring the stack up, send, tear it down again.
+#
+# What this deliberately does NOT do is make sending reliable. The two gates in
+# FINDINGS §22 are unchanged and are the phone's, not ours: its AWDL has to be
+# awake, and it has to actually be advertising _airdrop._tcp - which needs
+# AirDrop set to Everyone, that setting not having silently expired after ten
+# minutes, and the share sheet CLOSED (an open sheet makes it a sender, and a
+# sender never advertises for us to find). All this does is remove our own
+# ~90 s of self-imposed setup from in front of those gates.
+SEND_REPORT="${AIRDROP_SEND_REPORT:-$HOME/.opendrop/discover.last.json}"
+# Ceiling, not a duration - the browse stops the moment a receiver appears, so
+# the only thing this buys is how long a FAILURE takes. Every discovery failure
+# in this project has been categorical (the phone either advertises or it does
+# not); nothing has ever turned up late. Shorter than airdrop.sh's 45 s because
+# this one is user-facing and a right-click that hangs for a minute is worse
+# than one that says "not found" and lets you re-arm the phone.
+SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-25}"
+# Reuse a discovery report younger than this instead of browsing again. THE
+# WHOLE POINT of the quick-send path: a second file to the same phone should
+# not pay for a second browse. Stale reports have burned this project before
+# (a three-hour-old empty report read as an opendrop crash), so this is bounded
+# tightly AND self-correcting - if a send against a reused report fails, the
+# caller re-browses and tries once more, which turns a stale report into a
+# slow success rather than a confusing failure.
+SEND_REPORT_TTL="${AIRDROP_SEND_REPORT_TTL:-90}"
+
+# Register the Continuity advert that wakes the phone's AWDL, if one is not
+# already up. The REGISTERED INSTANCE is the test, not a live process (§36):
+# the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets the
+# shared controller and kills any advert started beforehand. Hence this runs
+# AFTER the stack is up, never before.
+#
+# Non-fatal throughout. §22 could not establish that the advert does anything -
+# the one experiment was confounded by a phone whose AWDL was already awake -
+# so failing the send because the advert did not register would be refusing to
+# try on the strength of a mechanism we have never actually measured.
+send_ble_wake() {
+  local n
+  n=$(sudo -n "$HELPER" ble-adv-count 2>/dev/null || echo 0)
+  if [ "${n:-0}" != "0" ]; then
+    log "send: BLE advert already registered ($n instance)"
+    return 0
+  fi
+  # All-zero contact hashes. §22 quotes Stute et al: a receiver wakes if a
+  # contact hash matches OR if it is discoverable by Everyone, and Everyone is
+  # the mode this whole path assumes. Real hashes would only matter for a
+  # contacts-only target, which cannot see us anyway - our hashes are zeros and
+  # no contact match is possible. Wire format lives in tools/blewake.sh.
+  if sudo -n "$HELPER" ble-adv "17FF4C000512000000000000000001000000000000000000" \
+       >/dev/null 2>&1; then
+    SEND_ADV_OURS=1
+    log "send: BLE advert registered - giving the phone 3s to react"
+    sleep 3
+  else
+    log "send: could not register a BLE advert; continuing without it"
+  fi
+}
+
+# Is the discovery report fresh enough to send against without browsing again?
+send_report_fresh() {
+  local mtime now
+  [ -s "$SEND_REPORT" ] || return 1
+  mtime=$(stat -c %Y "$SEND_REPORT" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  [ "$((now - mtime))" -lt "$SEND_REPORT_TTL" ] || return 1
+  # Non-empty as JSON, not merely non-empty as a file: `[]` is 2 bytes and
+  # passes -s while meaning "found nobody", and sending against it produces
+  # opendrop's TypeError traceback rather than a useful message.
+  [ "$(jq 'length' "$SEND_REPORT" 2>/dev/null || echo 0)" -gt 0 ]
+}
+
+# The receiver to send to: an explicit override, else the first entry in the
+# report. NEVER an index. `opendrop send -r` takes index, ID or hostname, and
+# an index is positional - with AirDrop on Everyone every Apple device in range
+# is a candidate, so index 0 silently redirects the transfer to whichever one
+# answered mDNS first. Worse, opendrop's _get_receiver_info() does int(receiver)
+# and falls through to len() on IndexError, so a short report gives a traceback
+# instead of "no such receiver". An ID cannot do either.
+send_receiver() {
+  if [ -n "${AIRDROP_RECEIVER:-}" ]; then printf '%s' "$AIRDROP_RECEIVER"; return 0; fi
+  jq -r '.[0].id // empty' "$SEND_REPORT" 2>/dev/null
+}
+
+send_receiver_name() {
+  jq -r --arg id "$1" '(.[] | select(.id == $id) | .name) // $id' "$SEND_REPORT" 2>/dev/null \
+    | head -1
+}
+
+# Browse for receivers, bounded, and leave a usable report behind.
+#
+# Every awkward detail here was paid for in airdrop.sh and none of it is
+# optional:
+#   - SIGINT, not SIGTERM. `opendrop find` blocks forever and writes its report
+#     from a finally: block reached via KeyboardInterrupt. Python does not turn
+#     SIGTERM into one, so plain `timeout` kills it with no report written -
+#     which surfaces much later as "please run 'opendrop find' first".
+#   - PYTHONUNBUFFERED. Python block-buffers stdout to a file, so the receiver
+#     line sits in an 8 KiB buffer and the poll that exists to notice it never
+#     fires in time.
+#   - Wait for the REPORT, not for the process. zeroconf.close() tears down
+#     threads and does not reliably return; one measured wait hung for 2m10s
+#     after the browse had already produced everything we needed.
+send_browse() {
+  local flog="$RUNDIR/find.log" mtime i found=0
+  mtime=$(stat -c %Y "$SEND_REPORT" 2>/dev/null || echo 0)
+  : > "$flog"
+  PYTHONUNBUFFERED=1 "$OPENDROP" -i awdl0 find > "$flog" 2>&1 &
+  local pid=$!
+  for i in $(seq $((SEND_FIND_TIME * 2))); do
+    kill -0 "$pid" 2>/dev/null || break
+    if grep -qE "^\s*[0-9]+\)|Found" "$flog" 2>/dev/null; then
+      found=1
+      # A beat, so a second receiver one line later is not cut off.
+      sleep 2
+      break
+    fi
+    sleep 0.5
+  done
+  kill -INT "$pid" 2>/dev/null || true
+  for i in $(seq 80); do
+    kill -0 "$pid" 2>/dev/null || break
+    [ "$(stat -c %Y "$SEND_REPORT" 2>/dev/null || echo 0)" -gt "$mtime" ] && break
+    sleep 0.25
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  # Distinguish "the phone is not advertising" from "our browse never got off
+  # the ground". They need opposite responses, and the second one is a real
+  # possibility on the ATTACH path: the daemon's receiver already holds 5353
+  # on awdl0, so a second zeroconf in the same place can fail to bind. Reported
+  # as "no receiver found" that sends the user off to fiddle with a phone that
+  # was never the problem.
+  if grep -qiE "address (already in use|not available)|errno 9[89]" "$flog" 2>/dev/null; then
+    log "send: browse could not bind 5353 - see $flog"
+    SEND_BROWSE_ERR="The discovery browse could not bind mDNS (port 5353).
+Something else on this machine holds it - most likely the running receiver.
+Try again with the AirDrop toggle OFF, which gives the send its own stack."
+    return 1
+  fi
+  [ "$found" = 1 ] || return 1
+  # Found a line, but the report is what `send` actually reads. If the browse
+  # printed a receiver and then failed to write the report, sending would read
+  # whatever was there before - which is the stale-report failure again.
+  [ "$(stat -c %Y "$SEND_REPORT" 2>/dev/null || echo 0)" -gt "$mtime" ] || {
+    log "send: browse found a receiver but wrote no report"
+    return 1
+  }
+  return 0
+}
+
+send_one() {
+  local file="$1" rcv="$2"
+  log "send: $file -> $rcv"
+  "$OPENDROP" -i awdl0 send -r "$rcv" -f "$file" >> "$LOG" 2>&1
+}
+
+# Everything the user needs to do on the phone, in one place. Printed on the
+# discovery failure because that is the only failure this path has ever had,
+# and "not found" without this is unactionable.
+send_no_receiver_help() {
+  # A browse that failed for a reason of OUR own says so instead, because none
+  # of the phone advice below would help.
+  if [ -n "${SEND_BROWSE_ERR:-}" ]; then
+    printf '%s\n' "$SEND_BROWSE_ERR" >&2
+    return 0
+  fi
+  cat >&2 <<'EOF'
+No AirDrop receiver found.
+
+This is nearly always the phone's state, not the radio. On the phone:
+
+  1. Settings > General > AirDrop > Everyone for 10 Minutes.
+     It EXPIRES back to Contacts Only, silently, and nothing on this side can
+     see that it has. Re-arm it and try again - check this first, it is the
+     cheapest explanation.
+  2. CLOSE the share sheet. An open share sheet makes the phone a sender, and
+     a sender never advertises itself for us to find. This is the opposite of
+     what receiving needs, which is why it catches people out.
+  3. Unlock it and leave it unlocked.
+EOF
+}
+
+cmd_send() {
+  [ $# -gt 0 ] || { echo "usage: airdropd send <file> [file...]" >&2; return 2; }
+
+  local f files=()
+  for f in "$@"; do
+    [ -f "$f" ] || { echo "airdropd: not a file: $f" >&2; return 2; }
+    [ -r "$f" ] || { echo "airdropd: not readable: $f" >&2; return 2; }
+    files+=("$f")
+  done
+  [ -x "$OPENDROP" ] || { echo "airdropd: missing or not executable: $OPENDROP" >&2; return 1; }
+
+  # ATTACH or OWN. Note the fd: cmd_run uses 9, so a send that ends up owning
+  # the stack must use the same one for the lock to mean the same thing.
+  # Installed for BOTH modes, because both leave something behind that has to
+  # be cleaned up: OWN leaves a whole radio stack, ATTACH leaves a BLE advert
+  # that would otherwise keep broadcasting indefinitely with nothing in any UI
+  # to say so. What it actually tears down is decided inside, by SEND_OWNED -
+  # an ATTACH send must never take the running daemon's radio down on its way
+  # out, which would turn "I sent a photo" into "the bar went off by itself".
+  SEND_OWNED=0
+  trap 'send_cleanup; exit 130' INT TERM
+  trap send_cleanup EXIT
+
+  local owned=0
+  exec 9>>"$LOCK"
+  if flock -n 9; then
+    owned=1
+  fi
+
+  if [ "$owned" = 1 ]; then
+    # Nothing was running, so we are responsible for the whole stack. Same
+    # preconditions cmd_run checks - a send is the first thing a new user will
+    # try, and "awdl0 never appeared" is a much worse first experience than
+    # being told the sudoers rule is missing.
+    if ! sudo -n "$HELPER" status >/dev/null 2>&1; then
+      echo "airdropd: cannot run $HELPER without a password." >&2
+      echo "  A right-click has no tty, so this must be passwordless. See daemon/README.md." >&2
+      return 1
+    fi
+    if [ "$DUALCHAN" = 1 ] && [ ! -x /usr/local/bin/airdrop-go-hostapd ]; then
+      echo "airdropd: AIRDROP_DUALCHAN=1 but /usr/local/bin/airdrop-go-hostapd is missing." >&2
+      return 1
+    fi
+    echo $$ >&9
+    SEND_OWNED=1
+    set_state waking "send"
+    log "send: nothing was running - bringing the stack up for this send"
+    avahi_stop
+    if ! stack_up; then
+      echo "airdropd: could not bring the stack up - see $LOG" >&2
+      return 1
+    fi
+    set_state sending "ch $BUILT_CHAN"
+  else
+    # THE LOCK IS NOT ENOUGH TO CONCLUDE THE STACK IS UP, in two ways.
+    #
+    # Falsely ATTACH: cmd_status takes the same lock, briefly, on every waybar
+    # poll - every 2 s, forever. A send that starts inside that window finds
+    # the lock held, concludes a daemon is running, and browses on an awdl0
+    # that does not exist. Rare, but the failure it produces ("no receiver
+    # found") points at the phone, which is the one place it is not.
+    #
+    # Genuinely ATTACHed but not up: the daemon holds the lock from the moment
+    # it starts, and is legitimately in `waking`, `switching` or `error` for
+    # seconds at a time with no stack behind it. Same wrong answer.
+    #
+    # awdl0 answers both. It exists only when owl is running, which is the
+    # thing a send actually needs.
+    if ! ip link show awdl0 >/dev/null 2>&1; then
+      echo "airdropd: something else holds the lock but awdl0 is not up." >&2
+      echo "  If the bar is mid-bring-up, wait for it to read on and try again." >&2
+      echo "  State: $(cmd_status)" >&2
+      return 1
+    fi
+    log "send: attaching to the running daemon's stack"
+  fi
+
+  send_ble_wake
+
+  # Fresh report? Skip the browse entirely - this is what makes a second file
+  # to the same phone nearly instant.
+  local browsed=0
+  if send_report_fresh; then
+    log "send: reusing a discovery report from $(( $(date +%s) - $(stat -c %Y "$SEND_REPORT") ))s ago"
+  else
+    browsed=1
+    if ! send_browse; then
+      send_no_receiver_help
+      return 1
+    fi
+  fi
+
+  local rcv name rc=0
+  rcv=$(send_receiver)
+  if [ -z "$rcv" ]; then
+    send_no_receiver_help
+    return 1
+  fi
+  name=$(send_receiver_name "$rcv")
+  echo "sending to ${name:-$rcv}"
+
+  local first=1
+  for f in "${files[@]}"; do
+    if send_one "$f" "$rcv"; then
+      echo "sent: $(basename "$f")"
+    elif [ "$first" = 1 ] && [ "$browsed" = 0 ]; then
+      # THE SELF-CORRECTION the reused report is only safe because of. The one
+      # plausible reason a first send fails against a reused report is that the
+      # report is stale - the phone moved, slept, or re-armed with a new ID -
+      # so browse once and try that file again. Only on the FIRST file, and
+      # only when we did not already browse: a failure after a fresh browse is
+      # a real failure and retrying it just doubles the wait.
+      log "send: first send failed on a reused report - re-browsing"
+      browsed=1
+      if send_browse && rcv=$(send_receiver) && [ -n "$rcv" ] && send_one "$f" "$rcv"; then
+        echo "sent: $(basename "$f")"
+      else
+        echo "FAILED: $(basename "$f")" >&2
+        rc=1
+      fi
+    else
+      echo "FAILED: $(basename "$f")" >&2
+      rc=1
+    fi
+    first=0
+  done
+
+  # Each file is its own transfer and its own Accept on the phone: opendrop's
+  # `-f` takes exactly one file and there is no multi-file request in it. Worth
+  # saying out loud, because selecting five files in Thunar and then being
+  # asked five times looks like a bug if you were not told.
+  [ "${#files[@]}" -gt 1 ] && echo "(${#files[@]} files = ${#files[@]} separate transfers, one Accept each)"
+
+  return $rc
+}
+
+# Deliberately not `cleanup`: that one also kills BLE_PID/HEALTH_PID, which
+# belong to a receiving daemon that a send does not have.
+#
+# The advert goes in BOTH modes - we registered it, so we remove it. Only the
+# radio stack and the state file are conditional on having owned them.
+send_cleanup() {
+  if [ "${SEND_ADV_OURS:-0}" = 1 ]; then
+    sudo -n "$HELPER" ble-adv-stop >/dev/null 2>&1
+  fi
+  if [ "${SEND_OWNED:-0}" = 1 ]; then
+    teardown
+    set_state off
+    log "send: stack down"
+  fi
+  # Explicit, so the EXIT trap cannot end on a failed test and muddy what the
+  # caller sees. bash preserves the original status across an EXIT trap, but
+  # only for as long as nobody adds an `exit` in here later.
+  return 0
+}
+
 cmd_status() {
   if [ ! -r "$STATE" ]; then echo '{"state":"off"}'; return 0; fi
   # The state file outlives the daemon, so on its own it can lie. It lies in
@@ -1125,5 +1481,6 @@ case "${1:-run}" in
   run)    cmd_run ;;
   status) cmd_status ;;
   stop)   cmd_stop ;;
-  *) echo "usage: airdropd [run|status|stop]" >&2; exit 2 ;;
+  send)   shift; cmd_send "$@" ;;
+  *) echo "usage: airdropd [run|status|stop|send <file>...]" >&2; exit 2 ;;
 esac

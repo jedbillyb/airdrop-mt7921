@@ -84,6 +84,13 @@ case "$state" in
   # so the colour can say "not everyone can see you". Without this arm it fell
   # through to the catch-all below and claimed to be off while receiving.
   unreachable) text="drop on"; class="unreachable" ;;
+  # `airdropd send` with nothing else running: it took the lock and brought the
+  # stack up for itself, so the radio IS on and this reads as on. Without this
+  # arm it fell through to the catch-all and went red mid-send, which looks
+  # exactly like the send having failed. A send that ATTACHES to an already-on
+  # daemon never writes this - the state stays "armed", which is the truth,
+  # because that send is receiving the whole time as well.
+  sending) text="drop on"; class="sending" ;;
   error)  text="drop off"; class="error"  ;;
   *)      text="drop off"; class="error"  ;;
 esac
