@@ -8,11 +8,15 @@ with no Apple ID and no signed identity. This repo is the script that sets it up
 the OpenDrop patches that make iOS 26 transfers parse and send, and the research
 that got there.
 
-> **Unsupported personal fork / personal project.** This is my own work, done on
-> my own laptop, published in case it is useful. It is not affiliated with the
-> Open Wireless Link project, OpenDrop, or Apple. There is no support, no
-> warranty, and no promise that it works on your hardware. Issues and PRs may
-> sit unread.
+> **Personal project.** This is my own work, done on my own laptop, published in case it is useful. It is not affiliated with the Open Wireless Link project, OpenDrop, or Apple. There is no warranty, and no promise that it works on your hardware. Issues and PRs may be slow to respond, but I do try to help when I can.
+
+## Support
+
+If you need help or run into issues:
+
+- **Email:** [hello@jedbillyb.com](mailto:hello@jedbillyb.com)
+- **Website:** [jedbillyb.com](https://jedbillyb.com) for other contact methods
+- **GitHub Issues:** Open an issue in this repo
 
 ## Documentation
 - [docs/FINDINGS.md](docs/FINDINGS.md) - numbered session-by-session findings log
