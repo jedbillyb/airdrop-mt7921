@@ -49,6 +49,13 @@ SENDFILE="${2:-}"
 # working directory it was invoked from.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Optional per-machine settings, shared with daemon/airdropd so RECV_DIR and
+# friends only have to be set in one place. Write it with `${VAR:-value}`
+# assignments so a real environment variable still overrides it.
+CONF="${AIRDROP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
 # Wi-Fi interface. Autodetected as the first mt7921-driven interface; override
 # with IFACE=... if you have more than one Wi-Fi card.
 if [ -z "${IFACE:-}" ]; then
@@ -873,6 +880,17 @@ if [ "$MODE" = "receive" ]; then
   # what an Apple sender actually puts on an /Upload rather than theorising. The
   # extra verbosity is worth the ground truth.
   ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
+  # iOS packs even a single photo inside an NSIRD_AirDrop_* wrapper alongside an
+  # ._ AppleDouble sidecar. Flatten it so what lands in RECV_DIR is the file
+  # that was sent. AIRDROP_TIDY_ON=0 keeps the archive exactly as it arrived,
+  # which is what you want when the packing itself is what is being debugged.
+  if [ "${AIRDROP_TIDY_ON:-1}" = 1 ] && [ -x "$HERE/tools/airdrop-tidy" ]; then
+    # SETTLE=0: opendrop has already exited, so nothing can still be writing
+    # and the quiet-period guard would only skip a transfer that finished in
+    # the last couple of seconds - the common case for a window that ran full
+    # length.
+    AIRDROP_TIDY_SETTLE=0 "$HERE/tools/airdrop-tidy" "$RECV_DIR" | sed 's/^/  /'
+  fi
   if grep -q "POST request at" "$OUT/receive.log" 2>/dev/null; then
     echo ""
     echo "### the phone's own request headers (ground truth for the send path)"

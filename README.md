@@ -172,9 +172,45 @@ RECEIVER="Jed's iPhone" ./airdrop.sh send photo.jpg
 
 Files land in `~/Downloads`. Per-run logs and captures go to `./runs/`.
 
+### What lands on disk
+
+iOS never sends a bare file. Even one photo arrives as a cpio holding a
+staging directory and an AppleDouble sidecar:
+
+```
+NSIRD_AirDrop_wvB8nv/
+  IMG_8370.PNG          the photo
+  ._IMG_8370.PNG        resource fork + Finder flags, ~1.6 KB
+```
+
+The wrapper name is random per transfer and the `._` file is metadata only
+Finder reads, so `tools/airdrop-tidy` flattens both away and you get
+`IMG_8370.PNG` directly in `RECV_DIR`. Both `airdrop.sh receive` and `airdropd`
+do this automatically - the daemon sweeps every couple of seconds while it is
+running, so files appear as they arrive rather than when it stops. Name clashes
+get a `-1`, `-2` suffix before the extension; nothing is ever overwritten.
+
+Set `AIRDROP_TIDY_ON=0` to keep the transfer exactly as the phone packed it,
+which is what you want when the packing itself is what you are debugging. The
+tool also runs standalone over a directory of past receives:
+
+```sh
+tools/airdrop-tidy ~/Downloads
+```
+
 ### Configuration
 
-All optional, all environment variables:
+All optional, all environment variables. They can also go in
+`~/.config/airdrop/config`, which both `airdrop.sh` and `daemon/airdropd`
+source - useful because the callers that would otherwise set them (the waybar
+module, a sway keybind) are tracked files in this repo. Write it with `:-`
+assignments so the environment still wins:
+
+```sh
+# ~/.config/airdrop/config
+RECV_DIR="${RECV_DIR:-/mnt/shared/airdrop}"
+```
+
 
 | variable | default | meaning |
 |---|---|---|
@@ -183,6 +219,7 @@ All optional, all environment variables:
 | `CHAN` | `36` | starting channel (6, 36, 44, 149) |
 | `OWL_DIR` | `~/owl` | your patched OWL checkout |
 | `RECV_DIR` | `~/Downloads` | where received files are extracted |
+| `AIRDROP_TIDY_ON` | `1` | flatten the `NSIRD_AirDrop_*` wrapper and drop `._` sidecars; `0` keeps the transfer as sent |
 | `RECV_TIME` | `300` | seconds to stay advertising |
 | `OUT_DIR` | `./runs` | where logs and captures go |
 | `STRATEGY` | `verbatim` | how OWL derives its channel sequence: `verbatim`, `widen`, `rotate`, `pin`. `verbatim` is the default because `pin` breaks TX to iOS 26 ([§25](docs/FINDINGS.md)) |

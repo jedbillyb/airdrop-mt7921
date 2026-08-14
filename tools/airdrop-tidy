@@ -1,0 +1,96 @@
+#!/bin/bash
+# Flatten what an iPhone actually puts on disk into what the user asked for.
+#
+#   airdrop-tidy [DIR]        # tidy DIR once (default: $RECV_DIR, else ~/Downloads)
+#   airdrop-tidy --watch DIR  # tidy DIR every POLL seconds until killed
+#
+# WHY THIS EXISTS. opendrop extracts the cpio exactly as iOS packed it, and iOS
+# does not pack a bare file. A single photo arrives as:
+#
+#   NSIRD_AirDrop_wvB8nv/
+#     IMG_8370.PNG          <- the photo
+#     ._IMG_8370.PNG        <- AppleDouble sidecar: resource fork + Finder flags
+#
+# The wrapper directory is a macOS staging name (NSIRD = NSItemProvider
+# ReceiveDirectory) and carries no information - it is a fresh random suffix
+# every transfer, so it cannot even be used to group a set. The ._ file is
+# metadata only Finder reads; on Linux it is a 1.6 KB turd next to every photo
+# that image viewers happily list as a broken file. Neither is wanted here, so
+# neither is kept: the file lands in DIR and the wrapper is removed.
+#
+# SAFETY. Only directories matching NSIRD_AirDrop_* are touched, and only after
+# they have been quiet for SETTLE seconds - opendrop buffers the whole archive
+# to disk before extracting, so a directory that is still changing is one whose
+# extraction has not finished, and moving out of it would take a partial file.
+# Anything unexpected inside (a nested directory the sender really did send) is
+# moved out intact rather than descended into.
+set -u
+
+SETTLE="${AIRDROP_TIDY_SETTLE:-2}"   # seconds a dir must be unchanged first
+POLL="${AIRDROP_TIDY_POLL:-2}"       # --watch interval
+
+WATCH=0
+if [ "${1:-}" = "--watch" ]; then WATCH=1; shift; fi
+DIR="${1:-${RECV_DIR:-$HOME/Downloads}}"
+
+# Move SRC into DIR without ever overwriting something already there. Suffix
+# goes before the extension - "IMG_8370-1.PNG", not "IMG_8370.PNG-1" - so the
+# result is still a PNG as far as everything downstream is concerned.
+move_up() {
+  local src="$1" dst_dir="$2"
+  local base stem ext dst n
+  base=$(basename "$src")
+  dst="$dst_dir/$base"
+  if [ -e "$dst" ]; then
+    case "$base" in
+      ?*.*) stem="${base%.*}"; ext=".${base##*.}" ;;
+      *)    stem="$base";      ext="" ;;
+    esac
+    n=1
+    while [ -e "$dst_dir/$stem-$n$ext" ]; do n=$((n + 1)); done
+    dst="$dst_dir/$stem-$n$ext"
+  fi
+  mv -n -- "$src" "$dst" 2>/dev/null && printf '%s\n' "$dst"
+}
+
+# True once nothing under d has been modified for SETTLE seconds. -newermt on
+# the directory alone is not enough: the dir's own mtime stops changing as soon
+# as the last entry is created, while that entry is still being written.
+settled() {
+  local d="$1"
+  [ -z "$(find "$d" -newermt "-$SETTLE seconds" -print -quit 2>/dev/null)" ]
+}
+
+tidy_once() {
+  local dir="$1" d f moved
+  [ -d "$dir" ] || return 0
+
+  # Sidecars that escaped to the top level - from an earlier run of this
+  # script, or from an archive iOS packed without a wrapper directory.
+  find "$dir" -maxdepth 1 -type f \( -name '._*' -o -name '.DS_Store' \) \
+    -delete 2>/dev/null
+
+  for d in "$dir"/NSIRD_AirDrop_*; do
+    [ -d "$d" ] || continue
+    settled "$d" || continue
+
+    # Recursive: a sent folder carries its own sidecars all the way down.
+    find "$d" \( -name '._*' -o -name '.DS_Store' \) -delete 2>/dev/null
+
+    for f in "$d"/* "$d"/.[!.]*; do
+      [ -e "$f" ] || continue
+      moved=$(move_up "$f" "$dir") && [ -n "$moved" ] && printf 'tidied: %s\n' "$moved"
+    done
+
+    # Only ever rmdir - a non-empty wrapper means something above did not do
+    # what it thought it did, and deleting the contents to be tidy is not a
+    # trade this script gets to make.
+    rmdir "$d" 2>/dev/null
+  done
+}
+
+if [ "$WATCH" = 1 ]; then
+  while :; do tidy_once "$DIR"; sleep "$POLL"; done
+else
+  tidy_once "$DIR"
+fi

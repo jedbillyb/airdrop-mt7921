@@ -24,6 +24,19 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
+# Optional per-machine settings. Everything below is already env-overridable,
+# but the two callers that matter - the waybar module and a sway keybind - are
+# files in this repo, so "set RECV_DIR in the environment" in practice means
+# editing a tracked file with one machine's paths in it. This gives that a home
+# outside the checkout instead. Write the file with `${VAR:-value}` assignments
+# so a real environment variable still wins over it:
+#
+#   # ~/.config/airdrop/config
+#   RECV_DIR="${RECV_DIR:-/mnt/shared/airdrop}"
+CONF="${AIRDROP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
 # Prefer the root-owned installed copies. The in-repo fallbacks exist so the
 # daemon can be exercised from a checkout, but they must NEVER be the paths in
 # sudoers: this tree is writable by the invoking user, and NOPASSWD on a script
@@ -37,6 +50,13 @@ OWL_DIR="${OWL_DIR:-$HOME/owl}"
 OWL="${OWL:-$OWL_DIR/build/daemon/owl}"
 OPENDROP="${OPENDROP:-$OWL_DIR/.venv-opendrop/bin/opendrop}"
 RECV_DIR="${RECV_DIR:-$HOME/Downloads}"
+# Flattens the NSIRD_AirDrop_* wrapper iOS packs every transfer in, and drops
+# the ._ AppleDouble sidecars. Unlike the helpers above this needs no
+# privilege, so the in-repo copy is the normal one to run.
+TIDY="${AIRDROP_TIDY:-$REPO/tools/airdrop-tidy}"
+[ -x "$TIDY" ] || TIDY="/usr/local/bin/airdrop-tidy"
+# Set to 0 to keep exactly what the phone sent, wrapper and sidecars included.
+TIDY_ON="${AIRDROP_TIDY_ON:-1}"
 
 RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/airdropd"
 STATE="$RUNDIR/state.json"
@@ -484,6 +504,16 @@ cleanup() {
   # would rewrite the state file after we set it to off, so the bar would show
   # an error for a daemon that is no longer there.
   [ -n "${HEALTH_PID:-}" ] && kill "$HEALTH_PID" 2>/dev/null
+  # Stop the poll, then tidy once more synchronously: a transfer that landed in
+  # the last couple of seconds has not been swept yet, and the daemon exiting
+  # is exactly when nobody is going to come back for it.
+  [ -n "${TIDY_PID:-}" ] && kill "$TIDY_PID" 2>/dev/null
+  if [ "$TIDY_ON" = 1 ] && [ -x "$TIDY" ]; then
+    # SETTLE=0 is safe here: teardown above has already killed opendrop, so
+    # nothing can be mid-extraction, and the guard would otherwise skip exactly
+    # the last transfer - the one this sweep exists for.
+    AIRDROP_TIDY_SETTLE=0 RECV_DIR="$RECV_DIR" "$TIDY" "$RECV_DIR" >> "$LOG" 2>&1 || true
+  fi
   # After the radio is down, so the station is free to go wherever it likes the
   # moment both bands are allowed again.
   band_lock_release
@@ -1055,6 +1085,20 @@ cmd_run() {
   trap cleanup EXIT
 
   : > "$LOG"
+
+  # One watcher for the whole run rather than one per receive window. In
+  # always-on mode opendrop is a long-lived process that stays up across many
+  # transfers, so tidying when it exits would mean files sitting in their
+  # wrapper directories for hours - and the point of this is that a photo shows
+  # up in RECV_DIR looking like a photo. Polling is the honest mechanism here:
+  # opendrop gives no completion hook, and the alternative (inotify) is another
+  # dependency for something that costs a readdir every couple of seconds.
+  if [ "$TIDY_ON" = 1 ] && [ -x "$TIDY" ]; then
+    mkdir -p "$RECV_DIR"
+    RECV_DIR="$RECV_DIR" "$TIDY" --watch "$RECV_DIR" >> "$LOG" 2>&1 &
+    TIDY_PID=$!
+    log "tidying $RECV_DIR while running"
+  fi
   # Both are requests from a previous run's health watch. Surviving a crash,
   # they would be acted on against a stack that has nothing to do with them.
   rm -f "$RUNDIR/sta_24" "$RUNDIR/want_chan"
