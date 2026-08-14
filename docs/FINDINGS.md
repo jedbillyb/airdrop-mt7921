@@ -3400,3 +3400,42 @@ state, and retries bring-up with backoff instead of exiting.
 4. §47's "wrong-channel watch is untested live" is now partly answered: it
    fires and logs correctly, but under station-first precedence it declines to
    rebuild in the common case, which is intended and mostly untested.
+
+## §49 — iOS never sends a bare file; what lands on disk is a staging directory (2026-08-14)
+
+Three receives that had all "worked" left `~/Downloads` looking like this:
+
+    NSIRD_AirDrop_Hjuudm/  ._IMG_8370.PNG  IMG_8370.PNG
+    NSIRD_AirDrop_W8k6Qi/  ._IMG_8371.PNG  IMG_8371.PNG
+    NSIRD_AirDrop_wvB8nv/  ._IMG_8372.PNG  IMG_8372.PNG
+
+Nothing was wrong with the transfers - all three photos were byte-intact 828x1792
+PNGs. This is simply what an iPhone puts in the cpio. **A single photo is still
+packed inside a directory**, alongside an AppleDouble sidecar carrying the
+resource fork and Finder flags.
+
+`NSIRD` is NSItemProvider ReceiveDirectory, macOS's staging name for an incoming
+item. Two things follow that are worth writing down, because both are the
+opposite of what you would guess:
+
+1. **The suffix is regenerated per transfer**, so it is not a session or device
+   identifier and cannot be used to group a multi-file drop. It carries no
+   information at all on the receiving side.
+2. **The sidecar is not optional and not an error.** It is there for a Finder
+   that is going to read it. On Linux it is a 1.6 KB file that image viewers
+   list next to every photo as something broken.
+
+opendrop extracts the archive faithfully, so it reproduces both. That is correct
+behaviour for a tool that should not guess, but it is not what anyone wants on
+this end, so `tools/airdrop-tidy` undoes the packaging after the fact rather
+than patching the extraction.
+
+**The one non-obvious constraint is when it is safe to run.** `server.py`
+buffers the *entire* archive to disk and only then extracts it, so during a
+transfer the wrapper directory exists and is being filled. Flattening it at the
+wrong moment moves out a partial file and the transfer looks corrupt. There is
+no completion hook to hang off, so the tidy skips any directory that changed
+within the last couple of seconds, and the two callers that run *after* opendrop
+has exited pass `AIRDROP_TIDY_SETTLE=0` because at that point nothing can be
+writing and the guard would only skip the last transfer - the one they exist to
+sweep.

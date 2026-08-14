@@ -37,6 +37,7 @@ trade worth making for a switch that just works with no second step.
 | `airdrop-confirm` | Asks the user, via `swaynag`, whether to accept an incoming file. |
 | `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. |
 | `../waybar/airdrop-status.sh` | waybar module: JSON status + click-to-toggle. |
+| `../tools/airdrop-tidy` | Unprivileged. Flattens the `NSIRD_AirDrop_*` wrapper iOS packs every transfer in and deletes the `._` AppleDouble sidecars, so what lands in `RECV_DIR` is the file that was sent. `airdropd` runs it as a background poll for the whole run. |
 
 ## Security: read this before running it unattended
 
@@ -231,7 +232,26 @@ label is evidence that *the click landed*, not that anything is working. Check
 | `AIRDROP_GO_FOLLOW` | `1` | Whether the wrong-channel watch may rebuild the GO on the peer's channel after `AIRDROP_WRONGCHAN_AFTER` seconds of zero overlap. `0` warns and stays put. Under station-first precedence the common answer is "stay" either way. |
 | `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
 | `AIRDROP_ALWAYS` | `0` | `1` = no BLE, stay advertising until toggled off. What the waybar switch sets. |
+| `RECV_DIR` | `~/Downloads` | Where received files land. Can be set in `~/.config/airdrop/config` instead of the environment — see below. |
+| `AIRDROP_TIDY_ON` | `1` | Flatten the `NSIRD_AirDrop_*` wrapper and drop `._` sidecars as files arrive. `0` keeps the transfer exactly as the phone packed it, which is what you want when the packing itself is what you are debugging. |
+| `AIRDROP_TIDY_POLL` | `2` | Seconds between tidy sweeps. The daemon polls rather than tidying when opendrop exits, because in always-on mode opendrop is long-lived and files would otherwise sit wrapped for hours. |
 | `AIRDROP_REANNOUNCE` | `5` | Seconds between mDNS re-announcements. The iPhone **does not poll** for receivers — it only ever learns we exist by catching an announce burst, so a receiver that announces once is invisible from a few seconds after arming. Handled in-process by `patches/opendrop-mdns-reannounce.patch`, so it no longer costs a restart. |
+
+### Setting these somewhere other than the environment
+
+Everything above is an environment variable, which is awkward here: the two
+things that actually launch `airdropd` are `../waybar/airdrop-status.sh` and a
+sway keybind, and both are tracked files in a public repo. Setting `RECV_DIR`
+that way means committing one machine's paths.
+
+So both `airdropd` and `../airdrop.sh` source `~/.config/airdrop/config` if it
+exists (override the location with `AIRDROP_CONF`). Write it with `:-`
+assignments so a real environment variable still wins over the file:
+
+```sh
+# ~/.config/airdrop/config
+RECV_DIR="${RECV_DIR:-/mnt/shared/airdrop}"
+```
 
 The buildable channel set is `6/36/44/149` and is enforced in three places that
 must agree: `airdropd`'s `GO_CHANNELS`, `airdrop-helper`'s `go-up` and

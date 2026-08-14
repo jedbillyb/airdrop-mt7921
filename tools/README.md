@@ -40,6 +40,45 @@ active vif created *alongside* an already-tuned plain vif comes up on that
 channel at full reception, and `activelate3.sh` showed the pair retunes as a
 unit. Everything in `airdrop.sh` follows from those two results.
 
+## `airdrop-tidy` is not one of these
+
+It sits in this directory but breaks every rule above: it is not a research
+artefact, it answers no question about the radio, and it never touches the
+Wi-Fi card. It is a plain utility that both receivers call, and it is here only
+because there is nowhere better to put a single script.
+
+What it does is undo iOS's packaging. A transfer arrives as a cpio holding a
+staging directory and an AppleDouble sidecar, even when one photo was sent:
+
+```
+NSIRD_AirDrop_wvB8nv/
+  IMG_8370.PNG          the photo
+  ._IMG_8370.PNG        resource fork + Finder flags, ~1.6 KB
+```
+
+`NSIRD` is NSItemProvider ReceiveDirectory and the suffix is regenerated every
+transfer, so it cannot even be used to group a multi-file drop. `airdrop-tidy`
+moves the contents up into `RECV_DIR` and deletes the sidecars.
+
+```sh
+tools/airdrop-tidy [DIR]          # tidy once; DIR defaults to $RECV_DIR
+tools/airdrop-tidy --watch DIR    # tidy every AIRDROP_TIDY_POLL seconds
+```
+
+`airdrop.sh receive` runs it once when its window closes; `airdropd` runs the
+`--watch` form for its whole lifetime, because in always-on mode opendrop is a
+long-lived process and sweeping only on its exit would leave files wrapped for
+hours. `AIRDROP_TIDY_ON=0` disables both.
+
+Three things it deliberately will not do. It only touches directories matching
+`NSIRD_AirDrop_*`. It skips any that changed within `AIRDROP_TIDY_SETTLE`
+seconds, because opendrop buffers the whole archive to disk before extracting,
+so a directory still changing is one that is half-extracted and moving out of it
+would take a partial file. And it never overwrites: a name that already exists
+gets a `-1`, `-2` suffix before the extension, and the wrapper is only ever
+`rmdir`ed, so anything unexpected left inside stops the removal rather than
+being deleted to keep things tidy.
+
 ## A note on the ones that are missing
 
 Several earlier harnesses (`activetest.sh`, `activelate.sh`, `chansweep.sh`,

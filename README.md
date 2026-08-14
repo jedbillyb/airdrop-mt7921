@@ -174,8 +174,8 @@ Files land in `~/Downloads`. Per-run logs and captures go to `./runs/`.
 
 ### What lands on disk
 
-iOS never sends a bare file. Even one photo arrives as a cpio holding a
-staging directory and an AppleDouble sidecar:
+iOS never sends a bare file ([§49](docs/FINDINGS.md)). Even one photo arrives as
+a cpio holding a staging directory and an AppleDouble sidecar:
 
 ```
 NSIRD_AirDrop_wvB8nv/
