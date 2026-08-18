@@ -206,6 +206,15 @@ case "$KREL" in
 esac
 [ -x "$OWL" ]  || { echo "REFUSING: no OWL binary at $OWL"; exit 1; }
 [ -x "$OPENDROP" ] || { echo "REFUSING: no opendrop at $OPENDROP"; exit 1; }
+
+# Computer name shown in the iOS share sheet (and sent as SenderComputerName).
+# Unset, OpenDrop falls back to socket.gethostname() and the phone just shows
+# "void-btw". Set AIRDROP_NAME in the config to change it. Kept as an array so
+# an empty value expands to no arguments rather than an empty one.
+OD_NAME=()
+if [ -n "${AIRDROP_NAME:-}" ]; then
+  OD_NAME=(-n "$AIRDROP_NAME")
+fi
 if [ "$MODE" = "send" ]; then
   [ -n "$SENDFILE" ] || { echo "REFUSING: send needs a file: ./airdrop.sh send <file>"; exit 1; }
   [ -f "$SENDFILE" ] || { echo "REFUSING: no such file: $SENDFILE"; exit 1; }
@@ -784,7 +793,7 @@ if [ "$MODE" != "receive" ] || [ "${FIND:-0}" = "1" ]; then
   # when it is a file rather than a tty, so the receiver line would sit in an
   # 8 KiB buffer until exit - and the poll below, which exists to notice that
   # line, would never see it until it was too late to matter.
-  PYTHONUNBUFFERED=1 "$OPENDROP" -i $AWDL find > "$OUT/find.log" 2>&1 &
+  PYTHONUNBUFFERED=1 "$OPENDROP" "${OD_NAME[@]}" -i $AWDL find > "$OUT/find.log" 2>&1 &
   FIND_PID=$!
   # --pid so tail exits with the browse instead of being orphaned. `kill $!` on a
   # pipeline only kills the LAST stage (the sed), which would leave `tail -f`
@@ -879,7 +888,7 @@ if [ "$MODE" = "receive" ]; then
   # been wrong. The receive direction works, so it is the one place we can read
   # what an Apple sender actually puts on an /Upload rather than theorising. The
   # extra verbosity is worth the ground truth.
-  ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
+  ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" "${OD_NAME[@]}" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
   # iOS packs even a single photo inside an NSIRD_AirDrop_* wrapper alongside an
   # ._ AppleDouble sidecar. Flatten it so what lands in RECV_DIR is the file
   # that was sent. AIRDROP_TIDY_ON=0 keeps the archive exactly as it arrived,
@@ -1023,7 +1032,7 @@ elif [ "$MODE" = "send" ]; then
   #   tshark -r send.pcap -o tls.keylog_file:sslkeys.log -Y http
   sudo tcpdump -i $AWDL -n -s 0 -U -w "$OUT/send.pcap" >/dev/null 2>&1 &
   sleep 1
-  SSLKEYLOGFILE="$OUT/sslkeys.log" "$OPENDROP" -i $AWDL send -r "$RECEIVER" -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
+  SSLKEYLOGFILE="$OUT/sslkeys.log" "$OPENDROP" "${OD_NAME[@]}" -i $AWDL send -r "$RECEIVER" -f "$SENDFILE" 2>&1 | tee "$OUT/send.log"
   sleep 1
   sudo pkill -x tcpdump 2>/dev/null || true
   if [ -s "$OUT/send.pcap" ]; then
