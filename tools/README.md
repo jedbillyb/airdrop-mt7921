@@ -26,6 +26,7 @@ default to `./runs`. They still assume `phy0` and Void's `sv`, unlike
 | `activetest2.sh` | Plain vs active monitor, both verified on the *same* frequency. |
 | `awdltest.sh` | Can active monitor hear AWDL at all? |
 | `beaconwatch.sh` | When the station dies under AirDrop, did the beacons never arrive, arrive and get dropped, or did TX saturate? |
+| `blewake-dbus.py` | Same Continuity advert as `blewake.sh`, registered through bluetoothd instead of `btmgmt`, and re-armed so a combo-chip reset cannot leave it silently down. |
 | `activelate2.sh` | **Can an active vif inherit a channel set before it existed?** Phase F is the discovery. |
 | `activelate3.sh` | **Does the pair hop together?** Yes - one shared channel context. |
 | `bursts.py` | How fast was a transfer, and *why*? Splits the stream into availability windows. |
