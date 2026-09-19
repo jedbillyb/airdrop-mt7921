@@ -58,6 +58,37 @@ fi
 MSG="AirDrop: accept file from ${SENDER}?"
 [ -n "$DETAIL" ] && MSG="$MSG"$'\n'"$DETAIL"
 
+# WHICH RUNG, when the cascade's order is not what you want. The order below is
+# right as a default: it prefers whatever the compositor supplies, because that
+# is the prompt most likely to exist and be visible. But it is a default, not a
+# law. On a desktop where the notification daemon is themed to match everything
+# else, a focus-stealing dialog is a worse experience than the bubble the
+# cascade demotes to rung 3, and there is currently no way to say so.
+#
+# AIRDROP_CONFIRM_UI names one rung and uses only that one:
+#
+#   auto (default)  the cascade in order, unchanged
+#   dialog          the compositor's own dialog (hyprland-dialog)
+#   notify          an actionable notification
+#   swaynag         swaynag
+#
+# An explicit choice FAILS CLOSED rather than falling through: if you asked for
+# a notification and no notification daemon owns the bus, the answer is that we
+# could not ask, not that we quietly used something else. Silently substituting
+# a different prompt for a security question is how you end up clicking Accept
+# on something you did not read.
+CONFIRM_UI="${AIRDROP_CONFIRM_UI:-auto}"
+case "$CONFIRM_UI" in
+  auto|dialog|notify|swaynag) ;;
+  *)
+    log "AIRDROP_CONFIRM_UI=$CONFIRM_UI is not one of auto/dialog/notify/swaynag - using auto"
+    CONFIRM_UI=auto
+    ;;
+esac
+
+# True when this rung is the one to use.
+want_ui() { [ "$CONFIRM_UI" = auto ] || [ "$CONFIRM_UI" = "$1" ]; }
+
 # 1. THE COMPOSITOR'S OWN DIALOG FIRST, when we are on the compositor it
 # belongs to. hyprland-dialog plays exactly the part swaynag plays on sway: it
 # draws its own surface and blocks until answered - but it WRITES THE CHOSEN
@@ -71,7 +102,8 @@ MSG="AirDrop: accept file from ${SENDER}?"
 # installed - and any failure there declines the transfer without ever
 # reaching swaynag, which would have worked. The cascade may only shorten
 # itself when the next rung is genuinely the right one.
-if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] \
+if want_ui dialog \
+   && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] \
    && command -v hyprland-dialog >/dev/null 2>&1; then
   ANSWER=$(timeout "$TIMEOUT" hyprland-dialog \
       --title "AirDrop" --apptitle "AirDrop" \
@@ -91,7 +123,7 @@ fi
 # compositor's own prompt, it draws its own surface, and it was working before
 # this cascade existed. Jumping straight to it skips the notification branch
 # entirely on sway, which is what keeps that setup unchanged.
-if [ -n "${SWAYSOCK:-}" ] && command -v swaynag >/dev/null 2>&1; then
+if want_ui swaynag && [ -n "${SWAYSOCK:-}" ] && command -v swaynag >/dev/null 2>&1; then
   : # fall through to the swaynag implementation at the end of this file
 else
 
@@ -113,7 +145,8 @@ else
 # -A prints only the chosen action's name, nothing but a literal "accept"
 # accepts: timeout, dismissal, a click elsewhere, a daemon that dies
 # mid-prompt, all decline.
-if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
+if want_ui notify \
+   && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
    && command -v notify-send >/dev/null 2>&1 \
    && command -v gdbus >/dev/null 2>&1 \
    && [ "$(gdbus call --session --dest org.freedesktop.DBus \
@@ -146,6 +179,10 @@ fi
 # notification, by the SWAYSOCK check above; everywhere else it is the last
 # rung. Not finding it is no longer the end of the road, it is the end of a
 # cascade.
+if ! want_ui swaynag; then
+  log "AIRDROP_CONFIRM_UI=$CONFIRM_UI could not be used - DECLINING (asked for one prompt, will not substitute another)"
+  exit 1
+fi
 if ! command -v swaynag >/dev/null 2>&1; then
   log "no notification daemon, no hyprland-dialog, no swaynag - DECLINING (cannot ask, so cannot consent)"
   exit 1
