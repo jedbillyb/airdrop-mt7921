@@ -18,7 +18,8 @@ with every earlier patch already applied, so they only apply in this order:
 ```
 ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
 upload-arms ask-confirm mdns-reannounce threaded-server url-items
-zeroconf-update-service salvage-truncated
+zeroconf-update-service salvage-truncated salvage-trim send-multifile
+send-status
 ```
 
 The install loop in the [main README](../README.md) uses exactly that order.
@@ -449,3 +450,23 @@ the fifth file fails immediately rather than after four transfers.
 Verified by reverse-applying against a venv carrying the thirteen patches ahead
 of it. The daemon side of this lives in `daemon/airdropd`, whose `send_one` now
 passes every file in one invocation.
+
+## opendrop-send-status.patch
+
+`opendrop send` exited 0 whatever happened. Every failure path in `send()`
+was a bare `return`, `AirDropCli.__init__` did the work and `main()` returned
+nothing, so a declined transfer, a receiver that was never found and a
+completed upload were indistinguishable to any caller reading `$?`.
+
+That is not a cosmetic difference here. `airdropd` reports send results from
+this status, and reported days of transfers as successful that never left the
+machine; anything else driving the CLI - a wrapper, a notification, a
+progress indicator - was told the same thing.
+
+`send()` now returns 1 on each failure path and 0 after "Uploading has been
+successful", `__init__` keeps it on `self.status`, and `main()` returns that.
+Nothing reads the value internally, so the only behaviour change is the exit
+code the console script propagates.
+
+Last in the series: it is the only patch touching `cli.py`, and generating it
+against the tip keeps that true.

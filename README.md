@@ -118,7 +118,7 @@ cd ~/owl/.venv-opendrop/lib/python*/site-packages
 for p in ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog \
          upload-arms ask-confirm mdns-reannounce threaded-server url-items \
          zeroconf-update-service salvage-truncated salvage-trim \
-         send-multifile; do
+         send-multifile send-status; do
   git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
 done
 ```
