@@ -564,6 +564,8 @@ sleep 1
 #             twice in one session against verbatim's 60% ping loss. Only useful
 #             now as the experiment for how much slot structure Apple requires.
 #   rotate    copy it but rotate into our own clock phase first
+#   intersect the peer's sequence with every slot blanked whose channel we cannot
+#             actually be on. For P2P-GO, where go0's chanctx pins the radio.
 #
 # The point of exposing it is that all three can be measured against the same
 # phone in one session, which is the only way this gets settled:

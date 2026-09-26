@@ -296,7 +296,7 @@ RECV_DIR="${RECV_DIR:-/mnt/shared/airdrop}"
 | `AIRDROP_TIDY_ON` | `1` | flatten the `NSIRD_AirDrop_*` wrapper and drop `._` sidecars; `0` keeps the transfer as sent |
 | `RECV_TIME` | `300` | seconds to stay advertising |
 | `OUT_DIR` | `./runs` | where logs and captures go |
-| `STRATEGY` | `verbatim` | how OWL derives its channel sequence: `verbatim`, `widen`, `rotate`, `pin`. `verbatim` is the default because `pin` breaks TX to iOS 26 ([§25](docs/FINDINGS.md)) |
+| `STRATEGY` | `verbatim` | how OWL derives its channel sequence: `verbatim`, `widen`, `intersect`, `rotate`, `pin`. `verbatim` is the default because `pin` breaks TX to iOS 26 ([§25](docs/FINDINGS.md)) |
 
 ## Open questions
 
@@ -449,6 +449,8 @@ measurements. On the code side:
 - the channel watch no longer reports `unreachable` from an empty log ([#13](https://github.com/jedbillyb/airdrop-mt7921/pull/13))
 - salvaged partial files are trimmed to the bytes that actually arrived ([#14](https://github.com/jedbillyb/airdrop-mt7921/pull/14))
 - several files go in one transfer and one Accept, each announced with its own type ([#12](https://github.com/jedbillyb/airdrop-mt7921/pull/12))
+- OpenDrop's CLI exits non-zero when a send fails ([#17](https://github.com/jedbillyb/airdrop-mt7921/pull/17))
+- the channel watch reads only what owl wrote since the last tick, so a phone that left stops being reported ([#19](https://github.com/jedbillyb/airdrop-mt7921/pull/19))
 
 Their reports ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2),
 [#7](https://github.com/jedbillyb/airdrop-mt7921/issues/7),
