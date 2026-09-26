@@ -129,6 +129,14 @@ GO_FOLLOW="${AIRDROP_GO_FOLLOW:-1}"
 # enough not to chase them, since the response costs a stack rebuild.
 WRONGCHAN_AFTER="${AIRDROP_WRONGCHAN_AFTER:-20}"
 
+# How long a peer report stays meaningful. owl writes NO OVERLAP or the overlap
+# count only while a peer is present, so silence means no phone rather than an
+# unchanged phone: past this, what we last read is dropped instead of being
+# republished. Comfortably longer than the 5s tick and than the gaps owl leaves
+# between reports while a peer IS there, so a quiet moment does not read as a
+# departure.
+PEER_TTL="${AIRDROP_PEER_TTL:-60}"
+
 # Always-on mode: no BLE, no windows. Bring the stack up once and stay
 # advertising until stopped, so the bar toggle is a plain on/off switch and
 # "on" means "you can AirDrop to this machine right now" with no second step.
@@ -865,7 +873,13 @@ serve_forever() {
     # indistinguishable from a working one right up until a transfer fails.
     # A switch that claims to be on when it is not is worse than one that is
     # simply off.
-    ( elapsed=0; no_overlap=0
+    # owl_off is how far into owl's log we have already read, so each tick
+    # sees only what owl appended since the last one. peer_seen is when we last
+    # learned anything about the peer, by OUR clock - see the freshness note in
+    # the channel watch below.
+    ( elapsed=0; no_overlap=0; owl_off=0; peer_seen=0
+      peer_want=""; peer_kept=""; peer_overlap=unknown
+      [ -r "$OWL_LOG" ] && owl_off=$(stat -c %s "$OWL_LOG" 2>/dev/null || echo 0)
       while kill -0 "$OD_PID" 2>/dev/null; do
         sleep 5
         elapsed=$((elapsed + 5))
@@ -938,40 +952,50 @@ serve_forever() {
         # with the channel the peer actually wants; surface it rather than let
         # the bar keep claiming to be on.
         if [ -r "$OWL_LOG" ]; then
-          # Compare the two events by their own timestamps rather than by how
-          # much log has gone past. owl at -vv emits trace at a rate that makes
-          # any fixed byte window meaningless - it can cover a second or a
-          # minute depending on how busy the air is. Whichever line is NEWER is
-          # the current state, and that holds at any log rate.
-          last_none=$(grep -a "NO OVERLAP" "$OWL_LOG" 2>/dev/null | tail -1)
-          last_over=$(grep -a "intersect:" "$OWL_LOG" 2>/dev/null | tail -1)
-          want=$(printf '%s' "$last_none" | grep -oP 'peer wants ch \K[0-9]+')
-          kept=$(printf '%s' "$last_over" | grep -oP 'intersect: \K[0-9]+')
-          # Which of the two is the CURRENT state - compared by owl's own
-          # timestamps, since at -vv no fixed byte window means anything.
+          # ONLY WHAT OWL WROTE SINCE THE LAST TICK. Reading the whole log and
+          # taking the last match of each marker answers "what did owl ever
+          # say", not "what is true now": once the peer goes away owl stops
+          # writing either line, the last NO OVERLAP stands forever, and the bar
+          # reports a phone on another channel hours after the last one was
+          # seen. Measured here: 23:49, last NO OVERLAP 19:48, last peer removed
+          # at 15:25, state published as `unreachable, phone is on ch44`.
           #
-          # DECIDED FROM WHAT WAS FOUND, not from a comparison an empty value
-          # loses by accident. owl logs the overlap count only under the
-          # `intersect` channel-sequence strategy; under `widen`, which is what
-          # this daemon runs, it logs neither line. `last_over` is then empty on
-          # every tick, the test below had a real timestamp on one side and ""
-          # on the other, and "" loses every string comparison - so the NO
-          # OVERLAP branch was taken unconditionally and the bar published
-          # `unreachable` with a hardcoded 0/16 from a log that had said nothing
-          # at all. A rotated log, a fresh one, or an owl that has not spoken
-          # yet all produce the same silent claim.
-          if [ -z "$last_none" ] && [ -z "$last_over" ]; then
-            overlapping=unknown
-          elif [ -z "$last_over" ]; then
-            overlapping=""
-          elif [ -z "$last_none" ]; then
-            overlapping=1
-          elif [ "${last_none%% *}" \> "${last_over%% *}" ]; then
-            overlapping=""
-          else
-            overlapping=1
-          fi
+          # This also retires the timestamp comparison that used to pick between
+          # the two. owl stamps HH:MM:SS with no date, so comparing them as
+          # strings is wrong across midnight and meaningless across days - and
+          # this log is not rotated. Within one append window the later LINE is
+          # the later event, whatever the clock says, so order by line number.
+          owl_size=$(stat -c %s "$OWL_LOG" 2>/dev/null || echo 0)
+          # Truncated or replaced (a reboot clears /run): start over rather than
+          # seek past the end and read nothing for the rest of the session.
+          [ "$owl_size" -lt "$owl_off" ] && owl_off=0
+          owl_new=$(tail -c "+$((owl_off + 1))" "$OWL_LOG" 2>/dev/null)
+          owl_off="$owl_size"
 
+          fresh_none=$(printf '%s\n' "$owl_new" | grep -an "NO OVERLAP" | tail -1)
+          fresh_over=$(printf '%s\n' "$owl_new" | grep -an "intersect:" | tail -1)
+          if [ -n "$fresh_none" ] || [ -n "$fresh_over" ]; then
+            if [ -z "$fresh_over" ]; then
+              peer_overlap=""
+            elif [ -z "$fresh_none" ]; then
+              peer_overlap=1
+            elif [ "${fresh_none%%:*}" -gt "${fresh_over%%:*}" ]; then
+              peer_overlap=""
+            else
+              peer_overlap=1
+            fi
+            [ -n "$fresh_none" ] && peer_want=$(printf '%s' "$fresh_none" | grep -oP 'peer wants ch \K[0-9]+')
+            [ -n "$fresh_over" ] && peer_kept=$(printf '%s' "$fresh_over" | grep -oP 'intersect: \K[0-9]+')
+            peer_seen=$(date +%s)
+          elif [ "$peer_seen" -gt 0 ] \
+               && [ $(( $(date +%s) - peer_seen )) -gt "$PEER_TTL" ]; then
+            # owl has said nothing about any peer for a while. That is the
+            # normal state with no phone around, and it is NOT "the phone is
+            # elsewhere" - there is no phone. Forget what we knew rather than
+            # keep republishing it.
+            peer_overlap=unknown; peer_want=""; peer_kept=""; peer_seen=0
+          fi
+          overlapping="$peer_overlap"; want="$peer_want"; kept="$peer_kept"
           # THE ONE LINE THAT HAS ALL THREE CHANNELS IN IT. Until now the
           # station's channel, the GO's channel and the peer's lived in three
           # different places at three different times - two of them in a
@@ -987,7 +1011,7 @@ serve_forever() {
           if [ "$overlapping" = unknown ]; then
             # Say so rather than pick a side. "0/16" here would be a measurement
             # nobody took.
-            log "CHAN sta=ch${sta_now:-?} go=ch$BUILT_CHAN peer=ch? overlap=? (owl has logged neither line)"
+            log "CHAN sta=ch${sta_now:-?} go=ch$BUILT_CHAN peer=none overlap=- (no peer reported in the last ${PEER_TTL}s)"
           elif [ -n "$overlapping" ]; then
             log "CHAN sta=ch${sta_now:-?} go=ch$BUILT_CHAN peer=ch${want:-?}~stale overlap=${kept:-0}/16"
           else
