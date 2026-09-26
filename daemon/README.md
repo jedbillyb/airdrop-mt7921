@@ -33,7 +33,7 @@ trade worth making for a switch that just works with no second step.
 | file | what it does |
 |---|---|
 | `ble-watch` | Detects Apple Continuity **AirDrop** adverts (company `0x004C`, type `0x05`) by parsing `btmon`. Prints one JSON line per sighting. |
-| `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path, and `ble-adv` / `ble-adv-stop` / `ble-adv-count` for the send path's Continuity advert. |
+| `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path, `ble-adv` / `ble-adv-stop` for the send path's Continuity advert (`ble-adv` claims the lowest free advertising instance and records it, `ble-adv-stop` removes that one only), and `ble-adv-count` as a manual diagnostic - it counts every instance on the controller, whoever owns it. |
 | `airdrop-confirm` | Asks the user whether to accept an incoming file, via the compositor's dialog, a notification or swaynag: `hyprland-dialog` on Hyprland, `swaynag` on sway, otherwise a notification with Accept/Decline actions. `AIRDROP_CONFIRM_UI` pins one of them. Anything but an explicit Accept declines. |
 | `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. Also `send`, below. |
 | `airdrop-send` | Desktop wrapper around `airdropd send`: same thing with `notify-send` progress. What the Thunar right-click runs. |

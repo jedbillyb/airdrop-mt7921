@@ -108,7 +108,8 @@ usage: airdrop-helper <verb> [chan]
   ap-channel    print the channel the managed interface is associated on
   ble-adv <hex> register an Apple Continuity BLE advertisement (see below)
   ble-adv-stop  remove it again
-  ble-adv-count print how many advertising instances are registered
+  ble-adv-count print how many advertising instances the controller holds
+                (all owners, not just ours - manual diagnostic)
 
 Never takes a free-form path or command - <chan> is validated against a fixed
 list, and <hex> against a strict length and character class. See the header
@@ -117,10 +118,67 @@ EOF
   exit 2
 }
 
-# The BLE advertising instance we claim. Fixed rather than caller-supplied for
-# the same reason the channel list is fixed: a caller who can name the instance
-# can clobber an instance registered by something else on the system.
-BLE_INSTANCE=1
+# Where we record the advertising instance we claimed, so teardown removes that
+# one and nothing else. Never caller-supplied, for the same reason the channel
+# list is fixed: a caller who can name the instance can clobber an instance
+# registered by something else on the system.
+BLE_STATE=/run/airdrop-ble-instance
+
+# The controller hands out advertising instances from 1 upward, so another tool
+# advertising on this host usually holds instance 1. Claiming a fixed instance
+# would remove that tool's advert and leave it with no way to know (#15), so we
+# take the lowest instance the controller reports as free instead. Reclaims the
+# one we recorded if it is still registered: that is a leftover of ours from a
+# run that died before teardown, and an advert nobody owns keeps broadcasting
+# indefinitely while showing up in no UI.
+ble_pick_instance() {
+  local info max count used n mine i
+  info=$(timeout 5 btmgmt advinfo 2>/dev/null) || return 1
+  max=$(printf '%s\n' "$info" | grep -oP 'Max instances:\s*\K[0-9]+' | head -1)
+  [ -n "$max" ] && [ "$max" -gt 0 ] || return 1
+
+  # The list follows the "Instances list with N item(s)" line, one id per line.
+  # The exact rendering of those lines is btmgmt's business and has changed
+  # shape before, so read the first integer of each and check what we got
+  # against the count btmgmt itself declared.
+  count=$(printf '%s\n' "$info" | grep -oP 'Instances list with\s*\K[0-9]+' | head -1)
+  count=${count:-0}
+  used=$(printf '%s\n' "$info" | sed -n '/Instances list with/,$p' | tail -n +2 \
+         | grep -oP '^\s*(Instance:\s*)?\K[0-9]+')
+  n=$(printf '%s\n' "$used" | grep -c '[0-9]')
+
+  # If the two disagree we cannot say WHICH instances are taken, and guessing
+  # wrong is how we would remove somebody else's advert (#15). The kernel hands
+  # instances out from 1 upward, so treat the first `count` as taken and look
+  # above them: that gives up a free low slot, which costs nothing, rather than
+  # risking a slot that is not ours.
+  if [ "$n" -ne "$count" ]; then
+    used=$(seq 1 "$count" 2>/dev/null)
+  fi
+
+  # An instance still listed and still named by our record is a leftover of ours
+  # from a run that died before teardown. Reclaim it rather than leak it: an
+  # advert nobody owns keeps broadcasting indefinitely and shows up in no UI.
+  mine=$(cat "$BLE_STATE" 2>/dev/null)
+  case "$mine" in
+    ''|*[!0-9]*) mine= ;;
+  esac
+  if [ -n "$mine" ] && printf '%s\n' "$used" | grep -qx "$mine"; then
+    timeout 10 btmgmt rm-adv "$mine" </dev/null >/dev/null 2>&1 || true
+    printf '%s\n' "$mine"
+    return 0
+  fi
+
+  i=1
+  while [ "$i" -le "$max" ]; do
+    if ! printf '%s\n' "$used" | grep -qx "$i"; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+    i=$(( i + 1 ))
+  done
+  return 1
+}
 
 ap_channel() {
   iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
@@ -474,27 +532,40 @@ EOF
       echo "airdrop-helper: ble-adv data must be an even number of hex digits, max 62" >&2
       exit 1
     fi
-    # Clear a leftover instance before claiming the slot. An advert from a
-    # previous run keeps broadcasting indefinitely and shows up in no UI, so
-    # "add" on an occupied instance failing would be a confusing way to find out.
-    timeout 10 btmgmt rm-adv "$BLE_INSTANCE" </dev/null >/dev/null 2>&1 || true
-    if ! timeout 15 btmgmt add-adv -d "$adv" -g "$BLE_INSTANCE" </dev/null 2>&1 \
-         | grep -q "Instance added"; then
-      echo "airdrop-helper: failed to register advertising instance $BLE_INSTANCE" >&2
+    if ! inst=$(ble_pick_instance); then
+      echo "airdrop-helper: no free advertising instance on the controller" >&2
       exit 1
     fi
-    echo '{"ok":true}'
+    if ! timeout 15 btmgmt add-adv -d "$adv" -g "$inst" </dev/null 2>&1 \
+         | grep -q "Instance added"; then
+      echo "airdrop-helper: failed to register advertising instance $inst" >&2
+      exit 1
+    fi
+    # Recorded only once the add succeeded, so a failed claim never makes
+    # ble-adv-stop remove an instance we do not hold.
+    printf '%s\n' "$inst" > "$BLE_STATE"
+    printf '{"ok":true,"instance":%s}\n' "$inst"
     ;;
 
   ble-adv-stop)
-    timeout 10 btmgmt rm-adv "$BLE_INSTANCE" </dev/null >/dev/null 2>&1 || true
+    # Only ever removes the instance ble-adv recorded. No record means we have
+    # nothing registered, and removing a guessed instance would take down
+    # somebody else's advert (#15).
+    inst=$(cat "$BLE_STATE" 2>/dev/null)
+    case "$inst" in
+      ''|*[!0-9]*) ;;
+      *) timeout 10 btmgmt rm-adv "$inst" </dev/null >/dev/null 2>&1 || true ;;
+    esac
+    rm -f "$BLE_STATE"
     echo '{"ok":true}'
     ;;
 
-  # The registered instance is the test, NOT whether some process is alive
-  # (§36): the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets
-  # the shared controller and the advert dies while its launcher carries on
-  # looking healthy. Callers check this before and after a bring-up.
+  # Total advertising instances registered on the controller. Manual diagnostic
+  # only - nothing in the daemon calls it. It counts every instance without
+  # distinguishing owners (#15), so it cannot answer "is OUR advert up"; that is
+  # what the recorded instance in BLE_STATE is for. Useful by hand to confirm
+  # §36: the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets the
+  # shared controller and kills any advert started beforehand.
   ble-adv-count)
     timeout 5 btmgmt advinfo 2>/dev/null \
       | grep -oP 'Instances list with \K[0-9]+' || echo 0

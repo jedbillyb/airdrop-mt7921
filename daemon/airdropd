@@ -1256,23 +1256,21 @@ SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-25}"
 # slow success rather than a confusing failure.
 SEND_REPORT_TTL="${AIRDROP_SEND_REPORT_TTL:-90}"
 
-# Register the Continuity advert that wakes the phone's AWDL, if one is not
-# already up. The REGISTERED INSTANCE is the test, not a live process (§36):
-# the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets the
-# shared controller and kills any advert started beforehand. Hence this runs
-# AFTER the stack is up, never before.
+# Register the Continuity advert that wakes the phone's AWDL. This runs AFTER
+# the stack is up, never before: the mt7921 is a combo Wi-Fi/BT part, so
+# bringing the radio up resets the shared controller (§36).
+#
+# Always registers rather than branching on ble-adv-count: the controller's
+# instance count does not distinguish ours from other callers (#15), so a count
+# above zero was never evidence that OUR advert was up. ble-adv now claims the
+# lowest free instance and records it, so registering cannot displace another
+# tool's advert and teardown only removes the one we took.
 #
 # Non-fatal throughout. §22 could not establish that the advert does anything -
 # the one experiment was confounded by a phone whose AWDL was already awake -
 # so failing the send because the advert did not register would be refusing to
 # try on the strength of a mechanism we have never actually measured.
 send_ble_wake() {
-  local n
-  n=$(sudo -n "$HELPER" ble-adv-count 2>/dev/null || echo 0)
-  if [ "${n:-0}" != "0" ]; then
-    log "send: BLE advert already registered ($n instance)"
-    return 0
-  fi
   # All-zero contact hashes. §22 quotes Stute et al: a receiver wakes if a
   # contact hash matches OR if it is discoverable by Everyone, and Everyone is
   # the mode this whole path assumes. Real hashes would only matter for a
