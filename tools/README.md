@@ -13,8 +13,10 @@ reads counters: it needs no privilege, touches nothing, and is meant to be left
 running *while* one of the others does the disruptive part.
 
 Set `IFACE=` if your card is not `wlp2s0`, and `OUT_DIR=` to move the logs; they
-default to `./runs`. They still assume `phy0` and Void's `sv`, unlike
+default to `./runs`. Most still assume `phy0` and Void's `sv`, unlike
 `airdrop.sh` - these were written for one machine and are published as they ran.
+`hoptest2.sh` and `chanswitch.sh` are the exceptions: they detect `sv` or
+`systemctl`, and `chanswitch.sh` finds the phy from `IFACE`.
 
 | script | question it answers |
 |---|---|
@@ -29,6 +31,9 @@ default to `./runs`. They still assume `phy0` and Void's `sv`, unlike
 | `blewake-dbus.py` | Same Continuity advert as `blewake.sh`, registered through bluetoothd instead of `btmgmt`, because after a layer 1 sweep `btmgmt add-adv` fails to register at all, and when it does register the phone does not react. Re-arms on a timer as a safeguard. |
 | `activelate2.sh` | **Can an active vif inherit a channel set before it existed?** Phase F is the discovery. |
 | `activelate3.sh` | **Does the pair hop together?** Yes - one shared channel context. |
+| `txbisect.sh` | Which OWL commit killed unicast TX to the phone? Ping-tests several builds against one setup (FINDINGS §23). |
+| `txarms.sh` | Which half of `-S pin` killed TX: the radio no longer retuning, or the sequence we advertise? (FINDINGS §24-§25) |
+| `chanswitch.sh` | How long does a channel switch cost OWL's event loop, and how often does each `-S` strategy switch? Needs an Apple device nearby, not a phone. |
 | `bursts.py` | How fast was a transfer, and *why*? Splits the stream into availability windows. |
 | `slotmap.py` | Which slots does each peer actually transmit in, and how many does it offer us? |
 | `blewake.sh` | Emits the Apple Continuity BLE advertisement that wakes a receiver's AWDL. |
@@ -39,12 +44,17 @@ the Bluetooth controller. `slotmap.py --log` is the first thing to run on any
 disappointing transfer - if it says the peer never offered more than 2 of 16
 slots, there was nothing to win and the run proves nothing (FINDINGS §21).
 
-The last two are the important ones. `activelate2.sh` phase F found that an
+`activelate2.sh` and `activelate3.sh` are the important ones. Phase F of `activelate2.sh` found that an
 active vif created *alongside* an already-tuned plain vif comes up on that
 channel at full reception, and `activelate3.sh` showed the pair retunes as a
 unit. Everything in `airdrop.sh` follows from those two results.
 
-## `airdrop-tidy` is not one of these
+## Not harnesses: `airdrop-tidy` and `install-thunar-action.sh`
+
+`install-thunar-action.sh` adds (or with `--remove`, removes) the **Send via
+AirDrop** right-click entry in Thunar; see [daemon/README.md](../daemon/README.md#sending).
+
+### `airdrop-tidy`
 
 It sits in this directory but breaks every rule above: it is not a research
 artefact, it answers no question about the radio, and it never touches the

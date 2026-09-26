@@ -36,6 +36,7 @@ trade worth making for a switch that just works with no second step.
 | `airdrop-helper` | The **only** privileged entry point. `up` / `down` / `status` / `ap-channel` / `wifi-reset`, plus `go-up` / `go-down` / `owl-start` / `owl-stop` / `avahi-down` / `avahi-up` for the P2P-GO path, and `ble-adv` / `ble-adv-stop` / `ble-adv-count` for the send path's Continuity advert. |
 | `airdrop-confirm` | Asks the user whether to accept an incoming file, via the compositor's dialog, a notification or swaynag: `hyprland-dialog` on Hyprland, `swaynag` on sway, otherwise a notification with Accept/Decline actions. `AIRDROP_CONFIRM_UI` pins one of them. Anything but an explicit Accept declines. |
 | `airdropd` | Orchestrator. BLE mode: trigger → stack up → advertise → confirm → tear down. Always-on mode: stack up → advertise → confirm, staying up until stopped, with a health watch over it. Also `send`, below. |
+| `airdrop-url` | Opens a link received over AirDrop, once accepted. `http`/`https` only; `AIRDROP_BROWSER` picks the browser (default `firefox`). |
 | `airdrop-send` | Desktop wrapper around `airdropd send`: same thing with `notify-send` progress. What the Thunar right-click runs. |
 | `thunar-action.xml` | The right-click menu entry, installed by `../tools/install-thunar-action.sh`. |
 | `../waybar/airdrop-status.sh` | waybar module: JSON status + click-to-toggle. |
@@ -301,6 +302,10 @@ label is evidence that *the click landed*, not that anything is working. Check
 | `AIRDROP_SEND_FIND_TIME` | `25` | `send` only. Ceiling on the discovery browse, not a duration — it stops the moment a receiver appears, so all this buys is how long a *failure* takes. Shorter than `airdrop.sh`'s 45 s because a right-click that hangs for a minute is worse than one that says "not found". |
 | `AIRDROP_SEND_REPORT_TTL` | `90` | `send` only. Reuse a discovery report younger than this instead of browsing again. Set `0` to always browse. |
 | `AIRDROP_RECEIVER` | *(first in report)* | `send` only. An explicit ID or hostname. Never pass an index — it is positional, and with AirDrop on Everyone every Apple device in range is a candidate, so index 0 silently redirects the transfer. |
+| `AIRDROP_PEER_TTL` | `60` | Seconds a peer report from owl stays meaningful. Past it with nothing new, the channel watch treats the phone as gone (`peer=none`) instead of republishing its last channel. |
+| `AIRDROP_URL_HOOK` | `airdrop-url` | What a received link is handed to. |
+| `AIRDROP_BROWSER` | `firefox` | Browser `airdrop-url` opens links in. |
+| `AIRDROP_OWL_LOG` | `/run/airdrop-owl.log` | Where owl's log goes; the channel watch reads it. |
 
 ### Setting these somewhere other than the environment
 
@@ -528,8 +533,9 @@ the phone in every run.
 One minute before the 2026-09-18 send, the same phone on the same network was
 not found with only the daemon's own `btmgmt` advert. On that card
 `btmgmt add-adv` either fails to register after `airdrop.sh`'s layer 1 or
-registers and goes unseen. Until #8 lands, treat the daemon's advert as
-unproven for sending.
+registers and goes unseen. #8 is merged as `tools/blewake-dbus.py`, but the
+daemon still registers its own advert through `btmgmt`, so treat the daemon's
+advert as unproven for sending and run `tools/blewake-dbus.py` alongside.
 
 **Not yet run against a phone on the MT7921 here.** Checked 2026-08-11 is
 everything that does not need one: argument and permission

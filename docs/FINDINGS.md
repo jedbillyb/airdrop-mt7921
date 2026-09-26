@@ -1,5 +1,13 @@
 # AWDL sync on a MediaTek MT7921 (Filogic 330) with OWL — findings
 
+> **Current status (2026-09-26).** This is a dated log, so the status lines just
+> below are from July and are long superseded. AirDrop now works end to end in
+> both directions on the MT7921 (receive §15, send §37). Wi-Fi + AirDrop together
+> runs via P2P-GO (§46), though a transfer through it has only completed on an
+> MT7922 so far (§47 got to 99.1% here). For where things stand today, read the main
+> [README](../README.md#status) and [daemon/README.md](../daemon/README.md#known-good-and-not-yet-proven).
+> Work since §50, much of it on an MT7922, is tracked in the repo's issues and PRs.
+
 Status: **link-layer sync with a real Apple device works and is reproducible.**
 Peer discovery, channel-sequence parsing, and master election are all confirmed.
 One open problem remains (peer ages out after ~4 s); it is characterised at the

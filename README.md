@@ -54,13 +54,14 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 | Receive throughput | 45-67 kB/s with `-S verbatim`, varying run to run with the sequence the peer advertises - ~22 kB per availability window ([§18](docs/FINDINGS.md)) |
 | Send throughput | not yet measured - the proving run sent a 68-byte file; needs a real file + `tools/bursts.py` |
 | Wi-Fi at the same time | **works**, via P2P-GO ([§46](docs/FINDINGS.md)); costs ~200-400 ms uplink latency while up |
-| Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.18.33 |
+| Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.18.33; MT7922 (`14c3:0616`) on Hyprland by a contributor ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2)) |
 
 **Two paths, and they are at different stages.** The standalone `airdrop.sh` is
 the proven one: a full 2.56 MB photo, byte-exact and PIL-verified, in 40 s at
 ~67 kB/s. It takes the card exclusively, so you have no internet while it runs.
 The `daemon/airdropd` waybar switch keeps your Wi-Fi up and has carried a real
-transfer to **99.1%**, but has not yet been seen to complete one - see
+transfer to **99.1%**, but has not yet been seen to complete one on the MT7921
+(it has on an MT7922, receive and send) - see
 [`daemon/README.md`](daemon/README.md#limitations) for exactly what is and is
 not proven there.
 
@@ -124,7 +125,7 @@ done
 ```
 
 The patches are a series: each one is made against the result of the ones
-before it, so apply all fifteen, in exactly this order, to a clean OpenDrop
+before it, so apply all sixteen, in exactly this order, to a clean OpenDrop
 0.13.0. `url-items` in particular will not apply without the three daemon
 patches ahead of it. If a `git apply` fails, rebuild the venv rather than
 retrying on a half-patched tree.
@@ -143,7 +144,11 @@ phone to answer, `find-report` hands the receiver to `send`, `tls-keylog` makes
 failures decryptable, and `upload-arms` carries the `TransferID` fix that
 delivers the file). `ask-confirm`, `mdns-reannounce` and `threaded-server` are
 what the always-on daemon needs (the accept prompt, staying visible, and not
-wedging on iOS keep-alive; see [daemon/README.md](daemon/README.md)). Void has
+wedging on iOS keep-alive; see [daemon/README.md](daemon/README.md)).
+`zeroconf-update-service` stops a re-announcing device from killing discovery,
+`salvage-truncated` and `salvage-trim` keep what arrived of a transfer that was
+cut off, `send-multifile` sends several files as one transfer and one Accept,
+and `send-status` makes `opendrop send` exit non-zero when a send fails. Void has
 no `patch(1)`; `git apply` is what the patches are verified against.
 
 **3. Run it.**
@@ -191,9 +196,11 @@ iPhone through `airdropd send`, attached to the always-on stack, with Wi-Fi up
 the whole time and nothing taking the card exclusively
 ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2),
 [#9](https://github.com/jedbillyb/airdrop-mt7921/pull/9)). Every one of those
-sends had the bluetoothd advert proposed in
-[#8](https://github.com/jedbillyb/airdrop-mt7921/pull/8) running alongside; a
-run with only the daemon's own `btmgmt` advert did not find the phone.
+sends had the bluetoothd advert from
+[#8](https://github.com/jedbillyb/airdrop-mt7921/pull/8) (`tools/blewake-dbus.py`)
+running alongside; a run with only the daemon's own `btmgmt` advert did not find
+the phone. The daemon still uses `btmgmt`, so start `tools/blewake-dbus.py`
+yourself for a send.
 
 On the MT7921, sending has only ever completed through `airdrop.sh send` in
 exclusive mode (`ACTIVE=1`, Wi-Fi dropped for the run). If the right-click
@@ -294,9 +301,17 @@ RECV_DIR="${RECV_DIR:-/mnt/shared/airdrop}"
 | `OWL_DIR` | `~/owl` | your patched OWL checkout |
 | `RECV_DIR` | `~/Downloads` | where received files are extracted |
 | `AIRDROP_TIDY_ON` | `1` | flatten the `NSIRD_AirDrop_*` wrapper and drop `._` sidecars; `0` keeps the transfer as sent |
-| `RECV_TIME` | `300` | seconds to stay advertising |
+| `RECV_TIME` | `90` | seconds to stay advertising |
 | `OUT_DIR` | `./runs` | where logs and captures go |
+| `AIRDROP_NAME` | hostname | name the phone shows for this machine |
+| `AIRDROP_CONF` | `~/.config/airdrop/config` | config file to source |
+| `ACTIVE` | `0` | `1` = add the active vif beside the plain one (ACKs + hopping). Use it for transfers |
+| `KEEP_WIFI` | `0` | `1` = keep the association and borrow the AP's channel; see [below](#keeping-your-internet-keep_wifi1) |
+| `FIND_TIME` | `45` | send/discover: ceiling on the browse, not a duration |
+| `RECEIVER` | first found | send: receiver ID or name, see [Which phone am I sending to?](#which-phone-am-i-sending-to) |
+| `OWL`, `OPENDROP` | under `OWL_DIR` | explicit paths to the owl binary and the opendrop CLI |
 | `STRATEGY` | `verbatim` | how OWL derives its channel sequence: `verbatim`, `widen`, `intersect`, `rotate`, `pin`. `verbatim` is the default because `pin` breaks TX to iOS 26 ([§25](docs/FINDINGS.md)) |
+| `WIDEN_MAX` | owl's own (4) | with `STRATEGY=widen`, how many empty slots it may fill (`-W`) |
 
 ## Open questions
 
@@ -381,7 +396,8 @@ shown to survive a real Wi-Fi reassociation.
 This mechanism **is now ported into `daemon/airdropd`** as an opt-in mode
 (`AIRDROP_DUALCHAN=1`), and it is what the waybar switch actually runs. It has
 since carried a real transfer to 99.1% with the association up throughout, so
-"untested" no longer describes it - but it has not been seen to complete one,
+"untested" no longer describes it - but it has not been seen to complete one on
+the MT7921 (an MT7922 has completed both receives and sends through it),
 and the remaining faults are listed honestly in
 [`daemon/README.md`](daemon/README.md#limitations). It is **not** wired into the
 plain `KEEP_WIFI=1` / `airdrop.sh` path, only the daemon.

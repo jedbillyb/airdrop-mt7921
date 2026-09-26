@@ -1,5 +1,10 @@
 # AWDL / OWL on MT7921 - project notes
 
+> **Frozen lab notebook, last entry 2026-07-31.** The status below is from that
+> date. For the current state see the main [README](../README.md#status); the
+> numbered log continues in [FINDINGS.md](FINDINGS.md). Scripts named here
+> without a path are in `tools/`.
+
 ## Status: WORKS - synced with an iPhone, and 9bac866 is validated (2026-07-30)
 Peer discovery, channel-sequence parsing, master election AND the
 follow-the-peer-sequence fix all confirmed against a live iPhone on the MT7921.
