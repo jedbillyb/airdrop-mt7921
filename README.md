@@ -467,6 +467,7 @@ measurements. On the code side:
 - several files go in one transfer and one Accept, each announced with its own type ([#12](https://github.com/jedbillyb/airdrop-mt7921/pull/12))
 - OpenDrop's CLI exits non-zero when a send fails ([#17](https://github.com/jedbillyb/airdrop-mt7921/pull/17))
 - the channel watch reads only what owl wrote since the last tick, so a phone that left stops being reported ([#19](https://github.com/jedbillyb/airdrop-mt7921/pull/19))
+- the always-on health watch checks every vif the armed state needs (the ACK vif and, under dual-channel, `go0`), not just `awdl0`, and names the one that went ([#18](https://github.com/jedbillyb/airdrop-mt7921/pull/18))
 
 Their reports ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2),
 [#7](https://github.com/jedbillyb/airdrop-mt7921/issues/7),
