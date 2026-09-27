@@ -171,6 +171,12 @@ chan_supported() {
 # into GO_CHAN, and from then on every bring-up reused that one number and the
 # station was never consulted again.
 BUILT_CHAN=""
+# The vif owl was told to ACK on, recorded here for the same reason BUILT_CHAN
+# is: stack_up's copy is `local`, so the health watch in serve_forever - a
+# different function, running long after stack_up returned - read an unset name
+# and fell back to mon0 on every tick. mon0 exists in both modes, so there was
+# no false alarm, just no coverage of the vif that actually carries the ACKs.
+BUILT_ACKVIF=""
 # The managed (station) vif. Cached at script scope so the health watch can read
 # the station's channel every tick without repeating the lookup, and invalidated
 # by sta_channel() whenever a read comes back empty - the name is stable in
@@ -629,8 +635,9 @@ stack_up() {
     # crosses as an argument because `sudo -n` without -E drops the
     # environment, so AIRDROP_OWL_STRATEGY alone cannot reach it.
     owlstrategy=$(head -c 16 "${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/strategy" 2>/dev/null | tr -dc 'a-z')
-    owlargs=(owl-start "$chan" "${ackvif:-mon0}" "$owlstrategy")
-    log "go0 up on ch $chan (P2P-GO mode, owl on ${ackvif:-mon0})"
+    BUILT_ACKVIF="${ackvif:-mon0}"
+    owlargs=(owl-start "$chan" "$BUILT_ACKVIF" "$owlstrategy")
+    log "go0 up on ch $chan (P2P-GO mode, owl on $BUILT_ACKVIF)"
   else
     if ! up=$(sudo -n "$HELPER" up 2>&1); then
       log "helper up FAILED: $up"
@@ -639,6 +646,11 @@ stack_up() {
     fi
     chan=$(printf '%s' "$up" | grep -oP '"chan":\K[0-9]+')
     owlstrategy=$(head -c 16 "${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/strategy" 2>/dev/null | tr -dc 'a-z')
+    # Single-channel mode: the helper's `up` creates the monitor pair and owl is
+    # given no vif argument, so there is no reported ACK vif to record. mon1 is
+    # created here too and losing it is the same silent failure, so watch it by
+    # name rather than leave the slot empty.
+    BUILT_ACKVIF=mon1
     owlargs=(owl-start "${chan:-36}" "" "$owlstrategy")
     log "stack up on ch ${chan:-?}"
   fi
@@ -927,9 +939,36 @@ serve_forever() {
           break
         fi
 
-        if ! ip link show awdl0 >/dev/null 2>&1 || ! pgrep -x airdrop-owl >/dev/null; then
-          set_state error "stack died (awdl0 or owl gone) - toggle off and on"
-          log "HEALTH: awdl0 or owl vanished while armed"
+        # EVERY VIF THE ARMED STATE DEPENDS ON, not just awdl0. Bring-up
+        # creates awdl0, the ack vif and - under DUALCHAN - go0, and all three
+        # have to be there for a transfer to happen: owl injects on the ack
+        # vif, and go0 is what holds the radio on the channel we advertise.
+        # The check only looked at awdl0 and owl, so losing either of the
+        # other two left the state at `armed` with nothing to say otherwise.
+        #
+        # This is a coverage gap rather than a reported incident: the vifs are
+        # required at bring-up and never re-checked afterwards.
+        #
+        # go0 is checked only under DUALCHAN. Note DUALCHAN is "0" when off,
+        # which is not empty, so ${DUALCHAN:+go0} would demand go0 in
+        # single-channel mode, where it never exists.
+        missing=""
+        _need_go=""
+        [ "$DUALCHAN" = 1 ] && _need_go=go0
+        for _vif in awdl0 "${BUILT_ACKVIF:-mon0}" $_need_go; do
+          [ -n "$_vif" ] || continue
+          ip link show "$_vif" >/dev/null 2>&1 || missing="$missing $_vif"
+        done
+        if [ -n "$missing" ] || ! pgrep -x airdrop-owl >/dev/null; then
+          # Naming the vif matters: "the stack died" sends the reader to owl,
+          # and three of the four ways to get here have nothing to do with owl.
+          if [ -n "$missing" ]; then
+            set_state error "radio gone (missing:$missing) - toggle off and on"
+            log "HEALTH: interface(s) vanished while armed:$missing"
+          else
+            set_state error "stack died (owl gone) - toggle off and on"
+            log "HEALTH: owl vanished while armed"
+          fi
           break
         fi
         # Re-announcing lives INSIDE opendrop now (patches/opendrop-mdns-
