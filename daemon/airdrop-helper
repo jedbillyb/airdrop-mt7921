@@ -127,10 +127,7 @@ BLE_STATE=/run/airdrop-ble-instance
 # The controller hands out advertising instances from 1 upward, so another tool
 # advertising on this host usually holds instance 1. Claiming a fixed instance
 # would remove that tool's advert and leave it with no way to know (#15), so we
-# take the lowest instance the controller reports as free instead. Reclaims the
-# one we recorded if it is still registered: that is a leftover of ours from a
-# run that died before teardown, and an advert nobody owns keeps broadcasting
-# indefinitely while showing up in no UI.
+# take the lowest instance the controller reports as free instead.
 ble_pick_instance() {
   local info max count used n i
   info=$(timeout 5 btmgmt advinfo 2>/dev/null) || return 1
@@ -157,17 +154,29 @@ ble_pick_instance() {
   fi
 
   # NO RECLAIM OF A RECORDED INSTANCE. An earlier version treated "recorded in
-  # BLE_STATE and currently listed" as proof the advert was ours and removed it
-  # first. A listed instance number proves nothing: the record outlives the
-  # advert it describes. A send registers instance 1 and dies before teardown;
-  # the next Wi-Fi bring-up resets the shared controller (§36) and drops every
-  # advert, ours included, while /run keeps the record; another tool registers
-  # and gets 1, the lowest free one; our next ble-adv finds 1 both listed and
-  # recorded, and removes somebody else's advert. That is #15 again, from the
-  # code meant to fix it.
+  # BLE_STATE and currently listed" as proof the advert was ours, and removed it
+  # before claiming the slot. A listed instance number proves nothing, because
+  # the record outlives the advert it describes: a send registers instance 1 and
+  # dies before teardown; a controller power cycle - bluetoothd restarting, an
+  # rfkill toggle, a suspend - drops every advert including ours while /run
+  # keeps the record; another tool registers and is given 1, the lowest free
+  # one; the next ble-adv finds 1 both listed and recorded, and takes down an
+  # advert belonging to someone else. That is #15 again, from the code written
+  # to fix it.
   #
-  # Nothing is leaked by dropping it. The advert the reclaim existed to clean up
-  # does not survive the next controller reset, and every bring-up causes one.
+  # DROPPING THE RECLAIM LEAKS, and the leak is not collected by a bring-up.
+  # Measured on the MT7922: an instance left registered survives teardown and a
+  # full stack bring-up, and clears only on a controller power cycle - §36 is
+  # about the Wi-Fi radio disturbing the shared part, and it does not take the
+  # advertising instance table with it. The controller reports 20 instances;
+  # past that ble-adv fails cleanly with "no free advertising instance" and the
+  # send carries on without a wake advert, send_ble_wake being non-fatal.
+  # Reaching it takes 20 sends that each died before send_cleanup with no power
+  # cycle in between, which is always-on mode only.
+  #
+  # Leaking a slot is the smaller failure. Collecting the leak would mean power
+  # cycling the controller, which drops every other tool's advert - exactly what
+  # this code exists to stop doing.
   i=1
   while [ "$i" -le "$max" ]; do
     if ! printf '%s\n' "$used" | grep -qx "$i"; then
@@ -552,8 +561,8 @@ EOF
     # somebody else's advert (#15).
     #
     # Residual exposure, stated rather than papered over: if the controller is
-    # reset between ble-adv and here, our advert is already gone and another
-    # tool may hold that number by now. Nothing readable from btmgmt proves an
+    # power cycled between ble-adv and here, our advert is already gone and
+    # another tool may hold that number by now. Nothing readable from btmgmt proves an
     # instance is ours, so this cannot be closed the way the reclaim was - only
     # kept short. ble-adv to ble-adv-stop is one send; the reclaim's window was
     # every run since the last one that died.
