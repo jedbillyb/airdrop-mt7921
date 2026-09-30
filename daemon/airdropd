@@ -1295,23 +1295,22 @@ SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-25}"
 # slow success rather than a confusing failure.
 SEND_REPORT_TTL="${AIRDROP_SEND_REPORT_TTL:-90}"
 
-# Register the Continuity advert that wakes the phone's AWDL, if one is not
-# already up. The REGISTERED INSTANCE is the test, not a live process (§36):
-# the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets the
-# shared controller and kills any advert started beforehand. Hence this runs
-# AFTER the stack is up, never before.
+# Register the Continuity advert that wakes the phone's AWDL. This runs AFTER
+# the stack is up, never before (§36): the mt7921 is a combo Wi-Fi/BT part, so
+# bringing the radio up can reset the shared controller and kill an advert
+# started beforehand.
+#
+# Always register, never skip on an existing count (#15). `btmgmt advinfo`
+# counts every advertising instance on the controller, whoever owns it, so a
+# nonzero count cannot mean "ours is up". `ble-adv` is idempotent (rm-adv then
+# add-adv on our instance), so re-registering our own advert costs one btmgmt
+# round trip. SEND_ADV_OURS is the only record of whether we own the slot.
 #
 # Non-fatal throughout. §22 could not establish that the advert does anything -
 # the one experiment was confounded by a phone whose AWDL was already awake -
 # so failing the send because the advert did not register would be refusing to
 # try on the strength of a mechanism we have never actually measured.
 send_ble_wake() {
-  local n
-  n=$(sudo -n "$HELPER" ble-adv-count 2>/dev/null || echo 0)
-  if [ "${n:-0}" != "0" ]; then
-    log "send: BLE advert already registered ($n instance)"
-    return 0
-  fi
   # All-zero contact hashes. §22 quotes Stute et al: a receiver wakes if a
   # contact hash matches OR if it is discoverable by Everyone, and Everyone is
   # the mode this whole path assumes. Real hashes would only matter for a

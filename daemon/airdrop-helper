@@ -108,7 +108,7 @@ usage: airdrop-helper <verb> [chan]
   ap-channel    print the channel the managed interface is associated on
   ble-adv <hex> register an Apple Continuity BLE advertisement (see below)
   ble-adv-stop  remove it again
-  ble-adv-count print how many advertising instances are registered
+  ble-adv-count print how many advertising instances the controller holds (any owner)
 
 Never takes a free-form path or command - <chan> is validated against a fixed
 list, and <hex> against a strict length and character class. See the header
@@ -491,10 +491,11 @@ EOF
     echo '{"ok":true}'
     ;;
 
-  # The registered instance is the test, NOT whether some process is alive
-  # (§36): the mt7921 is a combo Wi-Fi/BT part, so bringing the radio up resets
-  # the shared controller and the advert dies while its launcher carries on
-  # looking healthy. Callers check this before and after a bring-up.
+  # How many advertising instances the controller holds, from ANY owner. It is
+  # not an ownership check (#15): advinfo lists no instance ids here, and an id
+  # would not prove ownership anyway. Its one honest use is the §36 sanity
+  # check after a bring-up: the mt7921 is a combo Wi-Fi/BT part, so a zero then
+  # means the controller reset took every advert with it, ours included.
   ble-adv-count)
     timeout 5 btmgmt advinfo 2>/dev/null \
       | grep -oP 'Instances list with \K[0-9]+' || echo 0
