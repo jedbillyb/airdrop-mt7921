@@ -8,9 +8,11 @@ them, and because two of them are what this whole project rests on.
 
 Every script here takes the Wi-Fi card exclusively and restores networking on
 exit via a bash trap **and** a `setsid`-detached watchdog, so your networking
-comes back even on `kill -9`. The one exception is `beaconwatch.sh`, which only
-reads counters: it needs no privilege, touches nothing, and is meant to be left
-running *while* one of the others does the disruptive part.
+comes back even on `kill -9`. The exceptions are `beaconwatch.sh` and
+`queuewatch.sh`, which only read counters: they touch nothing and are meant to
+be left running *while* one of the others does the disruptive part.
+`beaconwatch.sh` needs no privilege at all; `queuewatch.sh` needs root, because
+the mt76 debugfs directory it reads is `0700`.
 
 Set `IFACE=` if your card is not `wlp2s0`, and `OUT_DIR=` to move the logs; they
 default to `./runs`. Most still assume `phy0` and Void's `sv`, unlike
@@ -28,6 +30,7 @@ default to `./runs`. Most still assume `phy0` and Void's `sv`, unlike
 | `activetest2.sh` | Plain vs active monitor, both verified on the *same* frequency. |
 | `awdltest.sh` | Can active monitor hear AWDL at all? |
 | `beaconwatch.sh` | When the station dies under AirDrop, did the beacons never arrive, arrive and get dropped, or did TX saturate? |
+| `queuewatch.sh` | Same collapse, one layer down: is the host still feeding the chip, or is the chip holding frames it never attempts? Samples mt76's `xmit-queues` and `acq` next to the station counters. |
 | `blewake-dbus.py` | Same Continuity advert as `blewake.sh`, registered through bluetoothd instead of `btmgmt`, because after a layer 1 sweep `btmgmt add-adv` fails to register at all, and when it does register the phone does not react. Re-arms on a timer as a safeguard. |
 | `activelate2.sh` | **Can an active vif inherit a channel set before it existed?** Phase F is the discovery. |
 | `activelate3.sh` | **Does the pair hop together?** Yes - one shared channel context. |
