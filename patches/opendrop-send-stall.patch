@@ -1,0 +1,64 @@
+--- a/opendrop/client.py
++++ b/opendrop/client.py
+@@ -225,7 +225,7 @@ class AirDropClient:
+                 self.http_conn.putheader(key, val)
+             self.http_conn.endheaders()
+             payload = body if isinstance(body, bytes) else body.read()
+-            self.http_conn.send(
++            self._send_watched(
+                 b"%x\r\n" % len(payload) + payload + b"\r\n0\r\n\r\n"
+             )
+         else:
+@@ -646,6 +646,52 @@ class AirDropClient:
+         }
+         return headers
+ 
++    # How long a single slice may wait for room in the send buffer. Room only
++    # appears when the receiver ACKs, so this is "no progress for this long",
++    # not a bound on the transfer: a 45 MB video at 147 kB/s takes five minutes
++    # and never waits on one slice for more than a fraction of a second.
++    SEND_SLICE = 64 * 1024
++
++    def _send_watched(self, data):
++        """Write DATA, giving up once the receiver stops acknowledging it.
++
++        The connection is opened with no timeout, which is right for the reads:
++        the /Ask response waits on a person deciding on the phone, and bounding
++        it would cut them off. It is wrong for the upload write. When the phone
++        stops ACKing mid-transfer the send buffer fills, sendall() blocks, and
++        nothing gives up until TCP's own retransmission limit does - many
++        minutes, during which the sender reports nothing at all. Measured:
++        971 233 of 6 351 692 bytes acknowledged, then no ACK for over five
++        minutes with the RTO at its 120 s ceiling, and the process still
++        waiting until it was killed by hand.
++
++        So the timeout covers the write only, slice by slice, and is restored
++        before the response is read. The resulting socket.timeout is an
++        OSError, which the upload arm loop already treats as a failed arm.
++        """
++        stall = float(os.environ.get("AIRDROP_STALL_TIMEOUT", "30"))
++        sock = self.http_conn.sock
++        prev = sock.gettimeout()
++        sock.settimeout(stall)
++        try:
++            view = memoryview(data)
++            for off in range(0, len(view), self.SEND_SLICE):
++                try:
++                    self.http_conn.send(view[off:off + self.SEND_SLICE])
++                except socket.timeout:
++                    logger.warning(
++                        f"Upload stalled: no progress for {stall:.0f}s after "
++                        f"{off} of {len(view)} bytes - the receiver stopped "
++                        "acknowledging"
++                    )
++                    raise
++        finally:
++            # The socket may already be closed by the failure path above it.
++            try:
++                sock.settimeout(prev)
++            except OSError:
++                pass
++
+ 
+ class HTTPSConnectionAWDL(HTTPSConnection):
+     """

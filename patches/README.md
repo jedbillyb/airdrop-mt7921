@@ -19,11 +19,11 @@ with every earlier patch already applied, so they only apply in this order:
 ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
 upload-arms ask-confirm mdns-reannounce threaded-server url-items
 zeroconf-update-service salvage-truncated salvage-trim send-multifile
-send-status
+send-status send-stall
 ```
 
 The install loop in the [main README](../README.md) uses exactly that order.
-Verified 2026-09-15: all thirteen apply with plain `git apply` to a clean
+Verified 2026-10-03: all seventeen apply with plain `git apply` to a clean
 `opendrop==0.13.0` from PyPI, and the result compiles. Before 2026-09-14
 `recv-window` and `threaded-server` only applied with reduced context, and
 `mdns-reannounce` did not apply at all (one hunk had turned a blank context
@@ -470,3 +470,35 @@ code the console script propagates.
 
 Last in the series: it is the only patch touching `cli.py`, and generating it
 against the tip keeps that true.
+
+## opendrop-send-stall.patch
+
+A send whose receiver stopped acknowledging never gave up. The upload
+connection is opened with no timeout, so once the phone stops ACKing the send
+buffer fills, `sendall()` blocks, and nothing ends it until TCP's own
+retransmission limit does - many minutes, during which the sender reports
+nothing at all. Measured on an MT7922: 971 233 of 6 351 692 bytes
+acknowledged, then no ACK for over five minutes with the RTO at its 120 s
+ceiling, and `opendrop send` still waiting until it was killed by hand.
+
+A blanket timeout would be wrong. The reads must stay unbounded: the `/Ask`
+response waits on a person deciding on the phone. So only the upload WRITE is
+bounded, and by progress rather than by total time - the payload goes out in
+64 KiB slices, each allowed `AIRDROP_STALL_TIMEOUT` seconds (default 30, the
+same knob the receive side uses) to find room in the send buffer. Room only
+appears when the receiver ACKs, so this means "no progress for that long", and
+a 45 MB video at 147 kB/s never waits on one slice for more than a fraction of
+a second. The timeout is restored before the response is read.
+
+The resulting `socket.timeout` is an `OSError`, which the upload arm loop
+already treats as a failed arm, so the send fails the ordinary way: the arm is
+abandoned, `send()` returns 1, and with `send-status` the exit code says so.
+
+Verified against a receiver that accepts the connection and then stops reading,
+which is what the phone did: abandoned after exactly the configured stall, the
+socket timeout restored to `None`. A receiver that reads normally took 20 MB
+without tripping it.
+
+Only the raw-framed path is covered, since it is the one the default arm uses.
+The response read after a complete upload stays unbounded: if the phone dies
+after receiving every byte, that wait is still TCP's to end.
