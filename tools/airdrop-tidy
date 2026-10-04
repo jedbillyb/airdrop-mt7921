@@ -98,7 +98,7 @@ tidy_once() {
 
 # Move everything out of wrapper D into DIR, then remove D if that emptied it.
 unwrap() {
-  local d="$1" dir="$2" f moved
+  local d="$1" dir="$2" f p moved
   [ -d "$d" ] || return 0
   settled "$d" || return 0
 
