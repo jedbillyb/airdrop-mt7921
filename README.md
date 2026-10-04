@@ -119,7 +119,7 @@ cd ~/owl/.venv-opendrop/lib/python*/site-packages
 for p in ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog \
          upload-arms ask-confirm mdns-reannounce threaded-server url-items \
          zeroconf-update-service salvage-truncated salvage-trim \
-         send-multifile send-status; do
+         send-multifile send-status send-stall; do
   git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
 done
 ```
@@ -148,7 +148,9 @@ wedging on iOS keep-alive; see [daemon/README.md](daemon/README.md)).
 `zeroconf-update-service` stops a re-announcing device from killing discovery,
 `salvage-truncated` and `salvage-trim` keep what arrived of a transfer that was
 cut off, `send-multifile` sends several files as one transfer and one Accept,
-and `send-status` makes `opendrop send` exit non-zero when a send fails. Void has
+`send-status` makes `opendrop send` exit non-zero when a send fails, and
+`send-stall` makes it give up when the phone stops acknowledging mid-upload
+instead of waiting on TCP for many minutes. Void has
 no `patch(1)`; `git apply` is what the patches are verified against.
 
 **3. Run it.**

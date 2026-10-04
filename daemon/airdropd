@@ -1627,7 +1627,11 @@ cmd_send() {
   # named. Only past one, since "1 file in one transfer" is noise.
   [ "$count" -gt 1 ] && what="$what ($count files in one transfer)"
 
+  # THE OUTCOME GOES IN THE LOG AS WELL as to the caller. It used to reach
+  # stderr only, which the notch reads and nothing keeps: a send that failed
+  # left a log ending on "re-browsing" and no line saying how it ended, or why.
   if send_one "$rcv" "${files[@]}"; then
+    log "send: sent: $what"
     echo "sent: $what"
   elif [ "$browsed" = 0 ]; then
     # THE SELF-CORRECTION the reused report is only safe because of. The one
@@ -1636,14 +1640,23 @@ cmd_send() {
     # once and try again. Only when we did not already browse: a failure after
     # a fresh browse is a real failure and retrying it just doubles the wait.
     log "send: failed on a reused report - re-browsing"
-    if send_browse && rcv=$(send_receiver) && [ -n "$rcv" ] \
-       && send_one "$rcv" "${files[@]}"; then
+    # The two ways the retry can fail mean different things and are logged
+    # apart: a phone that no longer answers discovery has gone quiet, while one
+    # that answers and then fails the transfer again is the transfer failing.
+    if ! send_browse || ! rcv=$(send_receiver) || [ -z "$rcv" ]; then
+      log "send: FAILED: $what - the phone was not found again on re-browse"
+      echo "FAILED: $what" >&2
+      rc=1
+    elif send_one "$rcv" "${files[@]}"; then
+      log "send: sent: $what (on the retry)"
       echo "sent: $what"
     else
+      log "send: FAILED: $what - the retry failed as well"
       echo "FAILED: $what" >&2
       rc=1
     fi
   else
+    log "send: FAILED: $what"
     echo "FAILED: $what" >&2
     rc=1
   fi
