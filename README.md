@@ -115,7 +115,8 @@ tools/install-thunar-action.sh                                      # --remove u
 
 Select files, right-click, **Send via AirDrop**; progress comes as
 notifications. Proven on an MT7922 (with `tools/blewake-dbus.py` running
-alongside); on the MT7921 only `airdrop.sh send` has completed a send so far.
+alongside); on the MT7921 only `airdrop.sh send` has completed a send so far, so if the
+right-click finds nobody, try `ACTIVE=1 ./airdrop.sh send <file>` first.
 
 ## Settings
 
@@ -141,6 +142,8 @@ alongside); on the MT7921 only `airdrop.sh send` has completed a send so far.
 | `RECEIVER` | first found | send target, by name or ID |
 | `FIND_TIME` | `45` | send/discover: give up after this long |
 | `STRATEGY` | `verbatim` | owl channel strategy; `pin` breaks iOS 26 |
+| `WIDEN_MAX` | owl's own (4) | with `STRATEGY=widen`, how many empty slots it may fill |
+| `AIRDROP_CONF` | `~/.config/airdrop/config` | which config file to read |
 | `IFACE`, `OWL_DIR`, `OWL`, `OPENDROP`, `OUT_DIR` | detected | paths and interface |
 
 The switch's own settings (timeouts, channels, prompts):
@@ -228,11 +231,28 @@ tools/              diagnostic scripts, one question each
 
 ## Credit
 
-[Alban Peralta](https://github.com/Peralban) is co-developer: everything this
-project knows about the MT7922 comes from their hardware and measurements, and
-they wrote much of the sending path, the Bluetooth advert through bluetoothd,
-multi-file sends, partial-file salvage, the accept-prompt picker and many daemon
-fixes ([their PRs](https://github.com/jedbillyb/airdrop-mt7921/pulls?q=author%3APeralban)).
+**[Alban Peralta](https://github.com/Peralban)**, co-developer. Everything
+this project knows about the MT7922 comes from their hardware and their
+measurements. On the code side:
+
+- portability fixes and two OpenDrop patches, from an MT7922 on Hyprland ([#1](https://github.com/jedbillyb/airdrop-mt7921/pull/1))
+- `tools/beaconwatch.sh`, which tells you why the station died ([#5](https://github.com/jedbillyb/airdrop-mt7921/pull/5))
+- configurable paths and service manager in `tools/` ([#6](https://github.com/jedbillyb/airdrop-mt7921/pull/6))
+- `tools/blewake-dbus.py`, the Continuity advert through bluetoothd ([#8](https://github.com/jedbillyb/airdrop-mt7921/pull/8))
+- the send path no longer discovers itself ([#9](https://github.com/jedbillyb/airdrop-mt7921/pull/9))
+- `AIRDROP_CONFIRM_UI`, to pick how the accept prompt appears ([#10](https://github.com/jedbillyb/airdrop-mt7921/pull/10))
+- the channel watch no longer reports `unreachable` from an empty log ([#13](https://github.com/jedbillyb/airdrop-mt7921/pull/13))
+- salvaged partial files are trimmed to the bytes that actually arrived ([#14](https://github.com/jedbillyb/airdrop-mt7921/pull/14))
+- several files go in one transfer and one Accept, each announced with its own type ([#12](https://github.com/jedbillyb/airdrop-mt7921/pull/12))
+- OpenDrop's CLI exits non-zero when a send fails ([#17](https://github.com/jedbillyb/airdrop-mt7921/pull/17))
+- the channel watch reads only what owl wrote since the last tick, so a phone that left stops being reported ([#19](https://github.com/jedbillyb/airdrop-mt7921/pull/19))
+- the always-on health watch checks every vif the armed state needs (the ACK vif and, under dual-channel, `go0`), not just `awdl0`, and names the one that went ([#18](https://github.com/jedbillyb/airdrop-mt7921/pull/18))
+
+Their reports ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2),
+[#7](https://github.com/jedbillyb/airdrop-mt7921/issues/7),
+[#15](https://github.com/jedbillyb/airdrop-mt7921/issues/15)) gave the
+project its first always-on receive and its first daemon send on an MT7922,
+and turned up real bugs in the daemon.
 
 Built on [seemoo-lab/owl](https://github.com/seemoo-lab/owl),
 [seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop) and the
