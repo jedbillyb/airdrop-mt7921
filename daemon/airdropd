@@ -71,6 +71,13 @@ fi
 OWL="${OWL:-$OWL_DIR/build/daemon/owl}"
 OPENDROP="${OPENDROP:-$OWL_DIR/.venv-opendrop/bin/opendrop}"
 RECV_DIR="${RECV_DIR:-$HOME/Downloads}"
+# Name shown in the iOS share sheet and sent as SenderComputerName, from
+# AIRDROP_NAME in the config. airdrop.sh has always passed it; this daemon did
+# not, so the bar toggle and Thunar's "Send via AirDrop" showed the hostname
+# while airdrop.sh showed the configured name. An array so that an unset name
+# expands to no arguments rather than an empty one.
+OD_NAME=()
+[ -n "${AIRDROP_NAME:-}" ] && OD_NAME=(-n "$AIRDROP_NAME")
 # Flattens the NSIRD_AirDrop_* wrapper iOS packs every transfer in, and drops
 # the ._ AppleDouble sidecars. Unlike the helpers above this needs no
 # privilege, so the in-repo copy is the normal one to run.
@@ -813,7 +820,7 @@ serve_window() {
   # opendrop accepts silently, which is precisely what must not happen when
   # this is running unattended.
   ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" AIRDROP_URL_HOOK="$URL_HOOK" \
-      timeout "$WINDOW" "$OPENDROP" -i awdl0 receive ) >> "$LOG" 2>&1 &
+      timeout "$WINDOW" "$OPENDROP" "${OD_NAME[@]}" -i awdl0 receive ) >> "$LOG" 2>&1 &
   OD_PID=$!
   wait "$OD_PID" 2>/dev/null
   OD_PID=""
@@ -856,7 +863,7 @@ serve_forever() {
     ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" AIRDROP_URL_HOOK="$URL_HOOK" \
         PYTHONUNBUFFERED=1 \
         OPENDROP_ANNOUNCE_INTERVAL="$REANNOUNCE" \
-        "$OPENDROP" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
+        "$OPENDROP" "${OD_NAME[@]}" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
     OD_PID=$!
 
     # A receive process with no listening socket is a failed bring-up, not a
@@ -1475,7 +1482,7 @@ send_one() {
   # AIRDROP_SEND_DEBUG dumps opendrop's request plists under ~/.opendrop/debug,
   # which is the only way to see what went into an /Ask after the fact. Off by
   # default: the dump is per-request and would otherwise grow without bound.
-  "$OPENDROP" ${AIRDROP_SEND_DEBUG:+-d} -i awdl0 send -r "$rcv" "${args[@]}" >> "$LOG" 2>&1
+  "$OPENDROP" "${OD_NAME[@]}" ${AIRDROP_SEND_DEBUG:+-d} -i awdl0 send -r "$rcv" "${args[@]}" >> "$LOG" 2>&1
 }
 
 # Everything the user needs to do on the phone, in one place. Printed on the

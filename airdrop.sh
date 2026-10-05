@@ -308,6 +308,12 @@ RESTORED=0
 restore() {
   [ "$RESTORED" = "1" ] && return 0
   RESTORED=1
+  # Ignore further Ctrl-C until the radio is back. A second Ctrl-C used to
+  # re-enter the INT trap, find RESTORED=1, and exit 130 halfway through the
+  # teardown - leaving mon0/mon1 up and the station never brought back, so
+  # Wi-Fi had to be fixed by hand. Mashing Ctrl-C is the normal reaction to
+  # a slow stop, so restore has to survive it.
+  trap '' INT TERM
   echo ""
   echo "--- restoring ---"
   [ -n "${POLL_PID:-}" ] && kill "$POLL_PID" 2>/dev/null
@@ -907,7 +913,7 @@ if [ "$MODE" = "receive" ]; then
   # been wrong. The receive direction works, so it is the one place we can read
   # what an Apple sender actually puts on an /Upload rather than theorising. The
   # extra verbosity is worth the ground truth.
-  ( cd "$RECV_DIR" && timeout $RECV_TIME "$OPENDROP" "${OD_NAME[@]}" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
+  ( cd "$RECV_DIR" && timeout --foreground $RECV_TIME "$OPENDROP" "${OD_NAME[@]}" -d -i $AWDL receive ) 2>&1 | tee "$OUT/receive.log"
   # iOS packs even a single photo inside an NSIRD_AirDrop_* wrapper alongside an
   # ._ AppleDouble sidecar. Flatten it so what lands in RECV_DIR is the file
   # that was sent. AIRDROP_TIDY_ON=0 keeps the archive exactly as it arrived,
