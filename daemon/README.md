@@ -135,7 +135,7 @@ sudo -n /usr/local/bin/airdrop-helper status
 
 **3. Patch OpenDrop.** The daemon's three patches (`ask-confirm` for the
 confirmation prompt, `mdns-reannounce`, `threaded-server`) are part of the
-single eleven-patch loop in the [main README](../README.md), step 2. Use that
+single patch loop in [docs/REFERENCE.md](../docs/REFERENCE.md#manual-install-what-installsh-does). Use that
 loop on a clean OpenDrop 0.13.0. Do not apply `ask-confirm` on its own: the
 patches are a series, and applying one out of order leaves the later ones
 unable to apply.
@@ -345,7 +345,7 @@ AIRDROP_REG="${AIRDROP_REG:-NZ}"   # your country
 | `AIRDROP_GO_CHAN` | `auto` | Which channel `go0` sits on in P2P-GO mode. `auto` runs the full precedence below; an explicit value must be one of `6/36/44/149`. Never rewritten at runtime — the channel currently built is tracked separately, and conflating the two is what once turned `auto` into a constant after the first correction. |
 | `AIRDROP_GO_FOLLOW` | `1` | Whether the wrong-channel watch may rebuild the GO on the peer's channel after `AIRDROP_WRONGCHAN_AFTER` seconds of zero overlap. `0` warns and stays put. Under station-first precedence the common answer is "stay" either way. |
 | `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
-| `AIRDROP_MODE` | `shared` | `exclusive` = the switch takes the whole card: Wi-Fi goes down while it is on, and comes back by itself after a transfer. See [Exclusive mode](#exclusive-mode-airdrop_modeexclusive). Overrides `AIRDROP_ALWAYS` and `AIRDROP_DUALCHAN`. |
+| `AIRDROP_MODE` | `shared` | `exclusive` = the switch takes the whole card: Wi-Fi goes down while it is on, and comes back by itself after a transfer. See [Exclusive mode](#exclusive-mode-airdrop_modeexclusive--wi-fi-off-while-on-works-anywhere). Overrides `AIRDROP_ALWAYS` and `AIRDROP_DUALCHAN`. |
 | `AIRDROP_EXCL_CHAN` | `149` | Exclusive mode: where owl starts listening. It follows the phone's own sequence from there. |
 | `AIRDROP_EXCL_GRACE` | `60` | Exclusive mode: seconds to stay on after a transfer finishes, so a second photo does not need the switch again. A new transfer restarts it. |
 | `AIRDROP_EXCL_IDLE` | `180` | Exclusive mode: seconds to stay on if nothing arrives at all, so a forgotten switch does not hold the Wi-Fi for long. |
