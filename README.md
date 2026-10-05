@@ -5,7 +5,7 @@ MediaTek MT7921 or MT7922 Wi-Fi. No USB adapter, no Apple ID.
 
 ## Status
 
-| | |
+| | Status |
 |---|---|
 | Receive from an iPhone | works: waybar switch or `airdrop.sh` |
 | Send to an iPhone | works with `airdrop.sh send`; right-click send proven on MT7922 |
@@ -123,7 +123,7 @@ right-click finds nobody, try `ACTIVE=1 ./airdrop.sh send <file>` first.
 `~/.config/airdrop/config` is read by both `airdrop.sh` and the switch. Use
 `VAR="${VAR:-value}"` so the environment still wins.
 
-| setting | default | |
+| Setting | Default | What it does |
 |---|---|---|
 | `AIRDROP_MODE` | `exclusive` | which [mode](#modes) the switch uses |
 | `AIRDROP_REG` | detected | your two-letter country; needed once Wi-Fi is down |
@@ -132,7 +132,7 @@ right-click finds nobody, try `ACTIVE=1 ./airdrop.sh send <file>` first.
 
 `airdrop.sh` only:
 
-| setting | default | |
+| Setting | Default | What it does |
 |---|---|---|
 | `ACTIVE` | `0` | `1` adds the ACK interface; needed for any transfer |
 | `REG` | `NZ` | regulatory country; set yours |
@@ -260,5 +260,6 @@ Built on [seemoo-lab/owl](https://github.com/seemoo-lab/owl),
 
 ## Licence
 
-GPLv3, matching OWL. Independent project, not affiliated with Apple, OWL or
-OpenDrop. No warranty.
+[GPLv3](LICENSE), matching OWL.
+
+*Independent project, not affiliated with Apple, OWL or OpenDrop. No warranty.*
