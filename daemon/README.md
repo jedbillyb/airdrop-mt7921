@@ -70,6 +70,9 @@ An unaskable question is not consent.
 
 ## Install
 
+**`./install.sh` in the repo root does all of this**, and should be re-run
+after every `git pull`. The steps below are what it does, for reference.
+
 Two things need root. Everything else runs as you.
 
 **1. The privileged helper.** A wrapper, not an allowlist of commands —
@@ -353,7 +356,7 @@ AIRDROP_REG="${AIRDROP_REG:-NZ}"   # your country
 | `RECV_DIR` | `~/Downloads` | Where received files land. Can be set in `~/.config/airdrop/config` instead of the environment — see below. |
 | `AIRDROP_TIDY_ON` | `1` | Flatten the `NSIRD_AirDrop_*` wrapper and drop `._` sidecars as files arrive. `0` keeps the transfer exactly as the phone packed it, which is what you want when the packing itself is what you are debugging. |
 | `AIRDROP_TIDY_POLL` | `2` | Seconds between tidy sweeps. The daemon polls rather than tidying when opendrop exits, because in always-on mode opendrop is long-lived and files would otherwise sit wrapped for hours. |
-| `AIRDROP_REANNOUNCE` | `5` | Seconds between mDNS re-announcements. The iPhone **does not poll** for receivers — it only ever learns we exist by catching an announce burst, so a receiver that announces once is invisible from a few seconds after arming. Handled in-process by `patches/opendrop-mdns-reannounce.patch`, so it no longer costs a restart. |
+| `AIRDROP_REANNOUNCE` | `5` (`2` in exclusive mode) | Seconds between mDNS re-announcements. The iPhone **does not poll** for receivers — it only ever learns we exist by catching an announce burst, so a receiver that announces once is invisible from a few seconds after arming. Handled in-process by `patches/opendrop-mdns-reannounce.patch`, so it no longer costs a restart. |
 | `AIRDROP_SEND_FIND_TIME` | `25` | `send` only. Ceiling on the discovery browse, not a duration — it stops the moment a receiver appears, so all this buys is how long a *failure* takes. Shorter than `airdrop.sh`'s 45 s because a right-click that hangs for a minute is worse than one that says "not found". |
 | `AIRDROP_SEND_REPORT_TTL` | `90` | `send` only. Reuse a discovery report younger than this instead of browsing again. Set `0` to always browse. |
 | `AIRDROP_RECEIVER` | *(first in report)* | `send` only. An explicit ID or hostname. Never pass an index — it is positional, and with AirDrop on Everyone every Apple device in range is a candidate, so index 0 silently redirects the transfer. |
