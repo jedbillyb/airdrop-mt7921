@@ -53,11 +53,16 @@ before finding it, are in [docs/FINDINGS.md](docs/FINDINGS.md) §13-§14.
 | Sending to an iPhone | **works** (iOS 26, `POST /Upload -> 200`, file delivered - see [FINDINGS §37](docs/FINDINGS.md)) |
 | Receive throughput | 45-67 kB/s with `-S verbatim`, varying run to run with the sequence the peer advertises - ~22 kB per availability window ([§18](docs/FINDINGS.md)) |
 | Send throughput | not yet measured - the proving run sent a 68-byte file; needs a real file + `tools/bursts.py` |
-| Wi-Fi at the same time | **works**, via P2P-GO ([§46](docs/FINDINGS.md)); costs ~200-400 ms uplink latency while up |
+| Waybar switch, exclusive mode | **works** (MT7921, 2026-10-06): phone finds the laptop in ~9 s, ~40 kB/s, progress on the bar, Wi-Fi restored by itself afterwards. Works whatever network the phone is on |
+| Wi-Fi at the same time | **works**, via P2P-GO ([§46](docs/FINDINGS.md)); costs ~200-400 ms uplink latency while up, and only finds the phone when it shares the laptop's channel |
 | Hardware tested | MT7921 (Filogic 330), Void Linux, kernel 6.18.33; MT7922 (`14c3:0616`) on Hyprland by a contributor ([#2](https://github.com/jedbillyb/airdrop-mt7921/issues/2)) |
 
-**Two paths, and they are at different stages.** The standalone `airdrop.sh` is
-the proven one: a full 2.56 MB photo, byte-exact and PIL-verified, in 40 s at
+**The easy path is the waybar switch in exclusive mode** (what `install.sh`
+sets up): click it, share from the phone, and it drops your Wi-Fi for the
+transfer and gives it back by itself about a minute later. See
+[`daemon/README.md`](daemon/README.md#exclusive-mode-airdrop_modeexclusive--wi-fi-off-while-on-works-anywhere).
+
+**The older paths.** The standalone `airdrop.sh` is the original proven one: a full 2.56 MB photo, byte-exact and PIL-verified, in 40 s at
 ~67 kB/s. It takes the card exclusively, so you have no internet while it runs.
 The `daemon/airdropd` waybar switch keeps your Wi-Fi up and has carried a real
 transfer to **99.1%**, but has not yet been seen to complete one on the MT7921
@@ -92,6 +97,29 @@ announces `TransferID={'id': UUID}` in its `/Ask` body and repeats the same id o
 
 ## Setup
 
+### Quick install
+
+```sh
+git clone https://github.com/jedbillyb/airdrop-mt7921.git
+cd airdrop-mt7921
+./install.sh
+```
+
+It builds owl, builds and patches the OpenDrop venv, installs the root-owned
+helper, adds a narrow passwordless-sudo rule (it shows you the rule and asks
+first), writes `~/.config/airdrop/config`, and links the waybar module. Then
+add the `custom/airdrop` block it prints to your waybar config, set
+`AIRDROP_REG` to your country if it asks, and click the switch.
+
+**Run `./install.sh` again after every `git pull`.** Three pieces (the owl
+build, the patched venv, the root-owned copies) are copies, and a pull updates
+none of them. Re-running is cheap and only rebuilds what changed.
+
+On the phone: AirDrop set to **Everyone for 10 Minutes**, then share to this
+machine. Leave the bar alone while it reads `drop NN%`.
+
+### Manual install (what install.sh does)
+
 **1. Build the patched OWL.** Upstream OWL will sync but will not give you good
 throughput; my fork adds the two mt7921 workarounds and the channel-sequence
 fix:
@@ -116,12 +144,17 @@ why:
 python -m venv ~/owl/.venv-opendrop
 ~/owl/.venv-opendrop/bin/pip install opendrop==0.13.0
 cd ~/owl/.venv-opendrop/lib/python*/site-packages
+# GIT_DIR must point nowhere: this directory is INSIDE the owl checkout, and
+# `git apply` inside a repo silently skips every path here (exit 0, nothing
+# patched). install.sh checks that the patches actually landed.
+export GIT_DIR=/nonexistent
 for p in ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog \
          upload-arms ask-confirm mdns-reannounce threaded-server url-items \
          zeroconf-update-service salvage-truncated salvage-trim \
          send-multifile send-status send-stall; do
   git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
 done
+unset GIT_DIR
 ```
 
 The patches are a series: each one is made against the result of the ones
@@ -439,8 +472,9 @@ retracted conclusions in `docs/FINDINGS.md` come from trusting `iw`.
 ## Repo layout
 
 ```
-airdrop.sh          the tool - exclusive card, proven, no internet while it runs
-daemon/             airdropd: the always-on waybar switch, keeps your Wi-Fi up
+install.sh          install and update everything; re-run after each git pull
+airdrop.sh          the original tool - exclusive card, no internet while it runs
+daemon/             airdropd: the waybar switch (exclusive or Wi-Fi-sharing mode)
 waybar/             the bar module (JSON status + click-to-toggle)
 patches/            OpenDrop fixes for iOS 26
 docs/FINDINGS.md    the full investigation, including what I got wrong
