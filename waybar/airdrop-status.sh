@@ -91,6 +91,17 @@ case "$state" in
   # daemon never writes this - the state stays "armed", which is the truth,
   # because that send is receiving the whole time as well.
   sending) text="drop on"; class="sending" ;;
+  # Exclusive mode. Past two labels on purpose: there a transfer takes a minute
+  # or two with nothing on the phone to say it is moving, and switching off
+  # then costs the photo - it read as paused on the first real run. The
+  # percentage is the raw upload against the sender's TotalBytes.
+  receiving)
+    pct=$(printf '%s' "$STATE_JSON" | grep -oP '"detail":"\K[0-9]+')
+    text="drop ${pct:-0}%"; class="armed" ;;
+  # The switch is off but the Wi-Fi is still reconnecting. Reads as neither on
+  # nor off, because it is neither: the radio is ours no longer and the
+  # network is not back yet.
+  restoring) text="wifi…"; class="switching" ;;
   error)  text="drop off"; class="error"  ;;
   *)      text="drop off"; class="error"  ;;
 esac
