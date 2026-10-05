@@ -304,6 +304,22 @@ It switches itself off, which brings the Wi-Fi back:
 - `AIRDROP_EXCL_IDLE` (180 s) after arming if nothing arrives,
 - or immediately when the switch is clicked.
 
+While it is on, the bar says what is happening, because a transfer here takes
+a minute or two at ~40 kB/s and the phone shows almost nothing meanwhile (the
+first real run was switched off at 61%, looking paused):
+
+| bar | meaning |
+|---|---|
+| `drop on` | armed, Wi-Fi off, waiting for the phone |
+| `drop 61%` | a photo is arriving - leave it on |
+| `wifi…` | switched off, Wi-Fi still reconnecting |
+| `drop off` | off, and the Wi-Fi is connected again |
+
+Switching off does not trust that starting NetworkManager brings the Wi-Fi
+back: it waits for the device to report connected, re-runs the restore at 8 s
+if NetworkManager is not answering, and asks it to connect at 12 s and 28 s. A
+stop on 2026-10-06 needed a manual reconnect before this existed.
+
 Measured on the MT7921, no phone: armed 4 s after the click; auto-off at the
 idle limit and a manual stop both had the station reconnected within 7 s.
 Needs the helper's `excl-up`/`excl-down` verbs, so reinstall the root-owned

@@ -579,11 +579,47 @@ teardown() {
   log "stack down"
 }
 
+# Exclusive mode only: after excl-down, do not take "NetworkManager was started"
+# as "the Wi-Fi is back". Wait for the device to actually be connected, and push
+# it if it is not. On 2026-10-06 the restore after a manual stop did not come
+# back by itself and had to be done by hand, while three earlier stops had
+# reconnected within 7s - so the restore has to check its own work.
+wifi_wait_back() {
+  local dev="" i st
+  for i in $(seq 45); do
+    [ -n "$dev" ] || dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+    st=""
+    [ -n "$dev" ] && st=$(nmcli -t -f GENERAL.STATE device show "$dev" 2>/dev/null | cut -d: -f2 | cut -d' ' -f1)
+    if [ "$st" = 100 ]; then
+      log "exclusive: Wi-Fi back on $dev after ${i}s"
+      return 0
+    fi
+    case "$i" in
+      # NetworkManager not answering at all: run the restore again, which
+      # (re)starts it. Harmless if it is merely slow.
+      8)  [ -z "$st" ] && { log "exclusive: NetworkManager not answering - restoring again"; sudo -n "$HELPER" excl-down >/dev/null 2>&1; } ;;
+      # Up but not reconnecting on its own: ask it to.
+      12|28) [ -n "$dev" ] && { log "exclusive: $dev is '${st:-?}' - asking NetworkManager to connect"; timeout 20 nmcli device connect "$dev" >/dev/null 2>&1 & } ;;
+    esac
+    sleep 1
+  done
+  log "exclusive: Wi-Fi still not connected after 45s (device '${dev:-none}', state '${st:-?}')"
+  set_state error "Wi-Fi did not come back - check nmcli"
+  return 1
+}
+
+CLEANED=0
 cleanup() {
+  # Runs from the INT/TERM trap AND the EXIT trap that follows it; once is
+  # enough, and in exclusive mode a second excl-down would restart
+  # NetworkManager while it is already reconnecting.
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
   # Nothing may interrupt this. A second stop signal arriving mid-teardown used
   # to be able to end the process with the card half torn down - in exclusive
   # mode that is "Wi-Fi gone until you fix it by hand".
   trap '' INT TERM
+  [ "$EXCL" = 1 ] && set_state restoring "bringing the Wi-Fi back"
   teardown
   [ -n "${BLE_PID:-}" ] && kill "$BLE_PID" 2>/dev/null
   # The health watcher outlives opendrop if we exit mid-window; left running it
@@ -603,6 +639,9 @@ cleanup() {
   # After the radio is down, so the station is free to go wherever it likes the
   # moment both bands are allowed again.
   band_lock_release
+  if [ "$EXCL" = 1 ]; then
+    wifi_wait_back || { log "airdropd exiting"; return 0; }
+  fi
   set_state off
   log "airdropd exiting"
 }
@@ -908,7 +947,7 @@ serve_exclusive() {
 
   mkdir -p "$RECV_DIR"
   export AIRDROP_CONFIRM_TIMEOUT="${AIRDROP_CONFIRM_TIMEOUT:-15}"
-  local off size chunk now start last busy=0 got=0
+  local off size chunk now start last busy=0 got=0 total=0 t raw rsz pct shown=""
   off=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
   ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" AIRDROP_URL_HOOK="$URL_HOOK" \
       PYTHONUNBUFFERED=1 \
@@ -937,12 +976,32 @@ serve_exclusive() {
       case "$chunk" in
         *"POST request at /Ask"*|*"Receiving file(s)"*) busy=1; last=$now ;;
       esac
+      t=$(printf '%s' "$chunk" | grep -a -oP 'TotalBytes: \K[0-9]+' | tail -1)
+      # Marks when this upload began, so progress reads only the raw file
+      # created by it and never a leftover airdrop-received-* from before.
+      [ -n "$t" ] && { total=$t; shown=""; touch "$RUNDIR/upload.mark"; }
       case "$chunk" in
         *"File(s) received"*)
-          busy=0; got=$((got + 1)); last=$now
+          busy=0; got=$((got + 1)); last=$now; total=0; shown=""
           log "exclusive: transfer $got finished - switching off in ${EXCL_GRACE}s unless another starts"
           set_state armed "received $got - Wi-Fi back in ${EXCL_GRACE}s" ;;
       esac
+    fi
+    # Progress on the bar. A transfer at ~40 kB/s takes a minute or two and the
+    # phone shows next to nothing meanwhile, so without this it looks paused
+    # and gets switched off at 60%. opendrop writes the raw upload to
+    # airdrop-received-*.dvzip as it arrives; for photos the blocks are stored,
+    # not compressed, so its size against TotalBytes is close to the truth.
+    if [ "$busy" = 1 ] && [ "$total" -gt 0 ]; then
+      raw=$(find "$RECV_DIR" -maxdepth 1 -name 'airdrop-received-*' -newer "$RUNDIR/upload.mark" 2>/dev/null | head -1)
+      rsz=$(stat -c %s "$raw" 2>/dev/null || echo 0)
+      pct=$(( rsz * 100 / total )); [ "$pct" -gt 99 ] && pct=99
+      if [ "$pct" != "$shown" ]; then
+        set_state receiving "$pct"
+        shown=$pct
+        # Growth counts as activity, so a long transfer never trips BUSY_MAX.
+        last=$now
+      fi
     fi
     if [ "$busy" = 1 ] && [ $((now - last)) -ge "$EXCL_BUSY_MAX" ]; then
       log "exclusive: a transfer started ${EXCL_BUSY_MAX}s ago and never finished - no longer waiting on it"
