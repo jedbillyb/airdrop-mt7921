@@ -135,7 +135,7 @@ sudo -n /usr/local/bin/airdrop-helper status
 
 **3. Patch OpenDrop.** The daemon's three patches (`ask-confirm` for the
 confirmation prompt, `mdns-reannounce`, `threaded-server`) are part of the
-single patch loop in [docs/REFERENCE.md](../docs/REFERENCE.md#manual-install-what-installsh-does). Use that
+single patch loop in the [main README](../README.md#install) (Manual install). Use that
 loop on a clean OpenDrop 0.13.0. Do not apply `ask-confirm` on its own: the
 patches are a series, and applying one out of order leaves the later ones
 unable to apply.
