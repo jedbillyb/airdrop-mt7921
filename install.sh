@@ -86,7 +86,8 @@ VENV="$OWL_DIR/.venv-opendrop"
 # changed (a pull touched a patch) = rebuild from scratch, because the patches
 # are a series and do not apply on top of an older patched tree.
 want=$( { echo "$OPENDROP_VERSION $(python3 -V 2>&1)"
-          for p in "${PATCHES[@]}"; do sha256sum "$REPO/patches/opendrop-$p.patch"; done
+          # Contents only (stdin), so moving the checkout does not force a rebuild.
+          for p in "${PATCHES[@]}"; do sha256sum < "$REPO/patches/opendrop-$p.patch"; done
         } | sha256sum | cut -c1-16)
 have=$(cat "$VENV/.airdrop-patches" 2>/dev/null || true)
 if [ "$want" = "$have" ] && [ -x "$VENV/bin/opendrop" ]; then
