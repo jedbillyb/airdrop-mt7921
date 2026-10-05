@@ -152,6 +152,44 @@ PEER_TTL="${AIRDROP_PEER_TTL:-60}"
 # association, which is a trade worth making for a switch that just works.
 ALWAYS="${AIRDROP_ALWAYS:-0}"
 
+# AIRDROP_MODE=exclusive: the switch takes the whole card instead of sharing it
+# with the station. Wi-Fi is DOWN while it is on, and it switches itself off
+# EXCL_GRACE seconds after the last transfer (or EXCL_IDLE seconds after
+# arming if nothing arrives), which brings the Wi-Fi back.
+#
+# Why it exists: the shared (P2P-GO) mode is held on ONE channel to keep the
+# station alive, and the phone only visits any one channel in a few of its 16
+# AWDL slots - which one depends on the phone's own Wi-Fi band, i.e. on the
+# network it happens to be on. Measured 2026-10-05: the same iPhone advertised
+# 2,0,149,... (its Wi-Fi on 2.4GHz), 36,36,149,... (on 5GHz) and 6,0,149,...
+# (Wi-Fi off) in one evening, so no fixed channel finds it everywhere. With the
+# card to itself owl follows the phone's sequence verbatim, wherever it goes -
+# the path airdrop.sh has received complete files on. Default stays "shared".
+MODE="${AIRDROP_MODE:-shared}"
+EXCL=0
+if [ "$MODE" = exclusive ]; then
+  EXCL=1
+  ALWAYS=1
+  DUALCHAN=0
+fi
+# Where owl starts listening. 149 is in the phone's sequence in every state
+# seen; owl leaves it as soon as it syncs to the phone.
+EXCL_CHAN="${AIRDROP_EXCL_CHAN:-149}"
+# Two-letter regulatory country to pin once wpa_supplicant (and with it the
+# AP's country IE) is gone. Empty = use the current one if it is a plain
+# two-letter code. Without either, the kernel falls back to the world domain,
+# where ch149 is no-IR and every injected frame is silently refused.
+EXCL_REG="${AIRDROP_REG:-}"
+# Seconds to stay up after a transfer finishes, so a second photo does not
+# need the switch again. Any new transfer restarts it.
+EXCL_GRACE="${AIRDROP_EXCL_GRACE:-60}"
+# Seconds to stay up when nothing arrives at all. The switch costs the Wi-Fi,
+# so forgetting it must not cost it for long.
+EXCL_IDLE="${AIRDROP_EXCL_IDLE:-180}"
+# A transfer that has started but never reports finishing (a declined prompt,
+# a link, a phone walking away) stops counting as busy after this long.
+EXCL_BUSY_MAX="${AIRDROP_EXCL_BUSY_MAX:-120}"
+
 # How often opendrop re-sends its mDNS announcement while armed. The iPhone
 # does not poll for AirDrop receivers; it only picks us up from an announce
 # burst, so a receiver that announces once is invisible for all but the first
@@ -531,7 +569,9 @@ teardown() {
   avahi_restore
   sudo -n "$HELPER" owl-stop >/dev/null 2>&1
   [ -n "${OD_PID:-}" ] && kill "$OD_PID" 2>/dev/null
-  if [ "$DUALCHAN" = 1 ]; then
+  if [ "$EXCL" = 1 ]; then
+    sudo -n "$HELPER" excl-down >/dev/null 2>&1
+  elif [ "$DUALCHAN" = 1 ]; then
     sudo -n "$HELPER" go-down >/dev/null 2>&1
   else
     sudo -n "$HELPER" down >/dev/null 2>&1
@@ -540,6 +580,10 @@ teardown() {
 }
 
 cleanup() {
+  # Nothing may interrupt this. A second stop signal arriving mid-teardown used
+  # to be able to end the process with the card half torn down - in exclusive
+  # mode that is "Wi-Fi gone until you fix it by hand".
+  trap '' INT TERM
   teardown
   [ -n "${BLE_PID:-}" ] && kill "$BLE_PID" 2>/dev/null
   # The health watcher outlives opendrop if we exit mid-window; left running it
@@ -645,6 +689,23 @@ stack_up() {
     BUILT_ACKVIF="${ackvif:-mon0}"
     owlargs=(owl-start "$chan" "$BUILT_ACKVIF" "$owlstrategy")
     log "go0 up on ch $chan (P2P-GO mode, owl on $BUILT_ACKVIF)"
+  elif [ "$EXCL" = 1 ]; then
+    if ! up=$(sudo -n "$HELPER" excl-up "$EXCL_CHAN" "$EXCL_REG" 2>&1); then
+      log "helper excl-up FAILED: $up"
+      set_state error "could not take the Wi-Fi card - see the log"
+      sudo -n "$HELPER" excl-down >/dev/null 2>&1
+      return 1
+    fi
+    chan="$EXCL_CHAN"
+    # mon1 is the `flags active` vif that ACKs; without it a transfer cannot
+    # complete, but receiving the sheet and the prompt still can, so fall back
+    # to mon0 rather than refuse.
+    if printf '%s' "$up" | grep -q '"active":true'; then BUILT_ACKVIF=mon1; else BUILT_ACKVIF=mon0; fi
+    # verbatim, NOT the helper's intersect default: intersect is for a radio
+    # pinned to one channel. Here owl CAN hop, so it should claim exactly the
+    # phone's own sequence and follow it.
+    owlargs=(owl-start "$chan" "$BUILT_ACKVIF" verbatim)
+    log "exclusive: Wi-Fi down, owl starts on ch $chan and follows the phone ($up)"
   else
     if ! up=$(sudo -n "$HELPER" up 2>&1); then
       log "helper up FAILED: $up"
@@ -835,6 +896,72 @@ serve_window() {
 # timed window that just ended the window, but here it would silently turn a
 # bar that still reads "on" into one that no longer receives anything. The
 # radio stack stays up across the restart - only the HTTPS server is respawned.
+# Exclusive mode: one session. Take the card, advertise, and return - which
+# exits the daemon and restores the Wi-Fi through cleanup - once the transfers
+# are over. Deliberately much simpler than serve_forever: there is no station
+# to protect, so none of its channel policy, wrong-channel watch or station
+# health checks apply.
+serve_exclusive() {
+  set_state waking "taking the Wi-Fi card"
+  avahi_stop
+  stack_up || return 1
+
+  mkdir -p "$RECV_DIR"
+  export AIRDROP_CONFIRM_TIMEOUT="${AIRDROP_CONFIRM_TIMEOUT:-15}"
+  local off size chunk now start last busy=0 got=0
+  off=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  ( cd "$RECV_DIR" && AIRDROP_CONFIRM="$CONFIRM" AIRDROP_URL_HOOK="$URL_HOOK" \
+      PYTHONUNBUFFERED=1 \
+      OPENDROP_ANNOUNCE_INTERVAL="$REANNOUNCE" \
+      "$OPENDROP" "${OD_NAME[@]}" -d -i awdl0 receive ) >> "$LOG" 2>&1 &
+  OD_PID=$!
+  if ! wait_for_listener "$OD_PID"; then
+    log "FAILED BRING-UP: opendrop never opened a listening socket"
+    set_state error "receiver never started listening - see the log"
+    return 1
+  fi
+
+  start=$(date +%s); last=$start
+  set_state armed "Wi-Fi off; back on after ${EXCL_GRACE}s idle post-transfer"
+  log "exclusive: armed - off ${EXCL_GRACE}s after a transfer, or after ${EXCL_IDLE}s if none"
+
+  while kill -0 "$OD_PID" 2>/dev/null; do
+    sleep 1
+    now=$(date +%s)
+    # Follow opendrop's own log rather than adding a hook to it: these lines
+    # are its existing INFO/DEBUG output, so this needs no new patch.
+    size=$(stat -c %s "$LOG" 2>/dev/null || echo "$off")
+    if [ "$size" -gt "$off" ]; then
+      chunk=$(tail -c "+$((off + 1))" "$LOG" 2>/dev/null | head -c "$((size - off))")
+      off=$size
+      case "$chunk" in
+        *"POST request at /Ask"*|*"Receiving file(s)"*) busy=1; last=$now ;;
+      esac
+      case "$chunk" in
+        *"File(s) received"*)
+          busy=0; got=$((got + 1)); last=$now
+          log "exclusive: transfer $got finished - switching off in ${EXCL_GRACE}s unless another starts"
+          set_state armed "received $got - Wi-Fi back in ${EXCL_GRACE}s" ;;
+      esac
+    fi
+    if [ "$busy" = 1 ] && [ $((now - last)) -ge "$EXCL_BUSY_MAX" ]; then
+      log "exclusive: a transfer started ${EXCL_BUSY_MAX}s ago and never finished - no longer waiting on it"
+      busy=0; last=$now
+    fi
+    [ "$busy" = 1 ] && continue
+    if [ "$got" -gt 0 ] && [ $((now - last)) -ge "$EXCL_GRACE" ]; then
+      log "exclusive: ${EXCL_GRACE}s since the last transfer - switching off"
+      return 0
+    fi
+    if [ "$got" = 0 ] && [ $((now - start)) -ge "$EXCL_IDLE" ]; then
+      log "exclusive: nothing arrived in ${EXCL_IDLE}s - switching off"
+      return 0
+    fi
+  done
+  log "exclusive: opendrop exited unexpectedly - switching off"
+  return 1
+}
+
 serve_forever() {
   log "always-on mode - bringing stack up"
   set_state waking "switch"
@@ -1230,6 +1357,12 @@ cmd_run() {
   # if this run needs the lock again it will take it again a moment later, and
   # taking it is idempotent.
   band_lock_release
+
+  if [ "$EXCL" = 1 ]; then
+    log "airdropd started in exclusive mode (Wi-Fi off while on)"
+    serve_exclusive
+    return $?
+  fi
 
   if [ "$ALWAYS" = 1 ]; then
     log "airdropd started in always-on mode (dualchan=$DUALCHAN)"

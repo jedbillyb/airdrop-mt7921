@@ -281,6 +281,39 @@ label is evidence that *the click landed*, not that anything is working. Check
 
 `.unreachable` still has no CSS rule and falls through to the default colour.
 
+### Exclusive mode (`AIRDROP_MODE=exclusive`) — Wi-Fi off while on, works anywhere
+
+The shared modes keep the Wi-Fi up by holding AWDL on **one** channel, and the
+phone only visits any one channel in a few of its 16 slots. Which channel
+depends on the phone's own Wi-Fi band, so on an arbitrary network there is no
+channel that reliably finds it. One iPhone, one evening (2026-10-05):
+
+    2,0,149,0,0,149,2,2,6,...      its Wi-Fi on the 2.4 GHz band
+    36,36,149,0,0,0,0,36,6,...     its Wi-Fi on the 5 GHz band
+    6,0,149,0,0,0,0,0,6,...        its Wi-Fi off
+
+Exclusive mode stops trying. Switching on takes the whole card - NetworkManager
+and `wpa_supplicant` are stopped, the station goes down - builds the §14
+monitor pair on `AIRDROP_EXCL_CHAN`, and runs owl `-S verbatim`, so it follows
+the phone's sequence wherever it goes. This is `airdrop.sh`'s receive path
+behind the helper, i.e. the one that has delivered complete files.
+
+It switches itself off, which brings the Wi-Fi back:
+
+- `AIRDROP_EXCL_GRACE` (60 s) after the last transfer finishes,
+- `AIRDROP_EXCL_IDLE` (180 s) after arming if nothing arrives,
+- or immediately when the switch is clicked.
+
+Measured on the MT7921, no phone: armed 4 s after the click; auto-off at the
+idle limit and a manual stop both had the station reconnected within 7 s.
+Needs the helper's `excl-up`/`excl-down` verbs, so reinstall the root-owned
+helper after pulling. Set it in `~/.config/airdrop/config`:
+
+```sh
+AIRDROP_MODE="${AIRDROP_MODE:-exclusive}"
+AIRDROP_REG="${AIRDROP_REG:-NZ}"   # your country
+```
+
 ## Tuning
 
 | env | default | why |
@@ -293,6 +326,12 @@ label is evidence that *the click landed*, not that anything is working. Check
 | `AIRDROP_GO_CHAN` | `auto` | Which channel `go0` sits on in P2P-GO mode. `auto` runs the full precedence below; an explicit value must be one of `6/36/44/149`. Never rewritten at runtime — the channel currently built is tracked separately, and conflating the two is what once turned `auto` into a constant after the first correction. |
 | `AIRDROP_GO_FOLLOW` | `1` | Whether the wrong-channel watch may rebuild the GO on the peer's channel after `AIRDROP_WRONGCHAN_AFTER` seconds of zero overlap. `0` warns and stays put. Under station-first precedence the common answer is "stay" either way. |
 | `AIRDROP_WRONGCHAN_AFTER` | `20` | Seconds of continuous zero overlap before the wrong-channel watch acts. |
+| `AIRDROP_MODE` | `shared` | `exclusive` = the switch takes the whole card: Wi-Fi goes down while it is on, and comes back by itself after a transfer. See [Exclusive mode](#exclusive-mode-airdrop_modeexclusive). Overrides `AIRDROP_ALWAYS` and `AIRDROP_DUALCHAN`. |
+| `AIRDROP_EXCL_CHAN` | `149` | Exclusive mode: where owl starts listening. It follows the phone's own sequence from there. |
+| `AIRDROP_EXCL_GRACE` | `60` | Exclusive mode: seconds to stay on after a transfer finishes, so a second photo does not need the switch again. A new transfer restarts it. |
+| `AIRDROP_EXCL_IDLE` | `180` | Exclusive mode: seconds to stay on if nothing arrives at all, so a forgotten switch does not hold the Wi-Fi for long. |
+| `AIRDROP_EXCL_BUSY_MAX` | `120` | Exclusive mode: a transfer that started (an `/Ask`) but never reports finishing stops holding the switch on after this long. |
+| `AIRDROP_REG` | *(current)* | Exclusive mode: two-letter regulatory country to pin once `wpa_supplicant` is gone. Needed where the AP-derived domain has no code to re-set (e.g. `98`); without one the world domain makes ch149 no-IR and every frame is silently refused. |
 | `AIRDROP_ALWAYS` | `0` | `1` = no BLE, stay advertising until toggled off. What the waybar switch sets. |
 | `AIRDROP_SEND_DEBUG` | unset | Set to anything to pass `-d` to opendrop on the send path, dumping each request plist under `~/.opendrop/debug`. The only way to see what went into an `/Ask` after the fact. Off by default because the dump is per-request and grows without bound. |
 | `RECV_DIR` | `~/Downloads` | Where received files land. Can be set in `~/.config/airdrop/config` instead of the environment — see below. |

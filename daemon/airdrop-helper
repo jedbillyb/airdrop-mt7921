@@ -472,6 +472,85 @@ EOF
     echo '{"ok":true}'
     ;;
 
+  # --- exclusive mode -------------------------------------------------------
+  #
+  # Take the whole card for AirDrop: the station is torn down for the duration
+  # and brought back by excl-down. This is airdrop.sh's proven receive path
+  # (layer 1 without KEEP_WIFI) behind the NOPASSWD boundary, so the bar can
+  # use it. It costs the Wi-Fi while it is up, and in return works whatever
+  # band or channel the phone's own Wi-Fi is on - which the P2P-GO path cannot
+  # promise, because it is held on one channel to keep the station alive.
+  excl-up)
+    chan="${2:-149}"
+    case "$chan" in
+      6|36|44|149) ;;
+      *) echo "airdrop-helper: excl-up cannot use ch$chan (6/36/44/149)" >&2; exit 1 ;;
+    esac
+    case "$chan" in 6) mhz=2437 ;; 36) mhz=5180 ;; 44) mhz=5220 ;; 149) mhz=5745 ;; esac
+    mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+    # The regulatory country comes from the AP's country IE while associated.
+    # Killing wpa_supplicant drops it back to the world domain, where 149 is
+    # no-IR - every injected frame would then be refused silently. Read it
+    # BEFORE the teardown and pin it, as airdrop.sh does with REG.
+    # The caller may name the country (AIRDROP_REG, $3) - needed wherever the
+    # AP-derived domain is an intersection like "98", which has no two-letter
+    # code to re-set. Validated to exactly two capitals either way, so the
+    # argument cannot reach iw as anything else.
+    reg="${3:-}"
+    case "$reg" in [A-Z][A-Z]) ;; *) reg="" ;; esac
+    if [ -z "$reg" ]; then
+      reg=$(iw reg get 2>/dev/null | awk '/^country/{sub(":","",$2); print $2; exit}')
+      case "$reg" in [A-Z][A-Z]) ;; *) reg="" ;; esac
+    fi
+    if [ -d /var/service/NetworkManager ] && command -v sv >/dev/null 2>&1; then
+      sv down NetworkManager >/dev/null 2>&1
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl stop NetworkManager >/dev/null 2>&1
+    fi
+    pkill -x wpa_supplicant 2>/dev/null; pkill -x dhcpcd 2>/dev/null
+    sleep 1
+    [ -n "$reg" ] && iw reg set "$reg"
+    [ -n "$IFACE" ] && ip link set "$IFACE" down 2>/dev/null
+    iw dev $MONA del 2>/dev/null
+    iw dev $MON del 2>/dev/null
+    iw phy "$PHY" interface add $MON type monitor || exit 1
+    ip link set $MON up || exit 1
+    echo 0 > "$MT76/runtime-pm" 2>/dev/null
+    echo 0 > "$MT76/deep-sleep" 2>/dev/null
+    # THE PAIR (FINDINGS §14): mon0 must exist AND be tuned before the active
+    # vif is created, or the active vif is stuck on 5180.
+    iw dev $MON set freq "$mhz" || exit 1
+    if iw phy "$PHY" interface add $MONA type monitor flags active 2>/dev/null; then
+      ip link set $MONA up 2>/dev/null
+      echo 0 > "$MT76/runtime-pm" 2>/dev/null
+      echo 0 > "$MT76/deep-sleep" 2>/dev/null
+    fi
+    printf '{"iface":"%s","reg":"%s","active":%s,"chan":%s}\n' \
+      "$IFACE" "${reg:-?}" \
+      "$(ip link show $MONA >/dev/null 2>&1 && echo true || echo false)" "$chan"
+    ;;
+
+  excl-down)
+    pkill -x airdrop-owl 2>/dev/null
+    for v in $MONA $MON; do
+      ip link set "$v" down 2>/dev/null
+      iw dev "$v" del 2>/dev/null
+    done
+    echo 1 > "$MT76/runtime-pm" 2>/dev/null
+    echo 1 > "$MT76/deep-sleep" 2>/dev/null
+    rfkill unblock wifi 2>/dev/null
+    if [ -n "$IFACE" ]; then
+      iw dev "$IFACE" set type managed 2>/dev/null
+      ip link set "$IFACE" up 2>/dev/null
+    fi
+    if [ -d /var/service/NetworkManager ] && command -v sv >/dev/null 2>&1; then
+      sv up NetworkManager >/dev/null 2>&1
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl start NetworkManager >/dev/null 2>&1
+    fi
+    echo '{"ok":true}'
+    ;;
+
   down)
     pkill -x airdrop-owl 2>/dev/null
     ip link set $MONA down 2>/dev/null
