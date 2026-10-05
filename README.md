@@ -74,8 +74,23 @@ Everything else: [daemon/README.md](daemon/README.md#tuning) for the switch,
 - **exclusive** (default): the switch takes the whole Wi-Fi card while it is
   on. It finds the phone on any network, and gives the card back afterwards.
 - **shared**: keeps your Wi-Fi up, but can only find the phone when both are on
-  the same channel, which depends on the network. Remove `AIRDROP_MODE` from
-  the config to use it. Details in [daemon/README.md](daemon/README.md).
+  the same channel, which depends on the network. It also needs a patched
+  `hostapd` that `install.sh` does not build. Setup in
+  [daemon/README.md](daemon/README.md).
+
+## Troubleshooting
+
+- **Phone doesn't show the laptop.** Check AirDrop is still on Everyone: iOS
+  turns it back off after 10 minutes without telling you. Then give it up to a
+  minute with the share sheet open.
+- **The switch flips straight back to drop off.** Run
+  `daemon/airdropd run` in a terminal; the error prints there.
+- **Something broke after a `git pull`.** Run `./install.sh` again.
+- **No internet after using it.** It normally comes back by itself within
+  about 30 s. If not: `sudo sv up NetworkManager` (runit) or
+  `sudo systemctl start NetworkManager`.
+- Logs: `$XDG_RUNTIME_DIR/airdropd/airdropd.log`. More in
+  [daemon/README.md](daemon/README.md#first-three-things-to-check-when-my-phone-cant-see-me).
 
 ## How it works
 
