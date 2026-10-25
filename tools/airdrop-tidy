@@ -33,6 +33,21 @@
 # same way, and whatever it holds - the still, and the video if there is one -
 # lands in DIR.
 #
+# AND SOMETIMES THE PHONE'S OWN PATHS. Photos shared from the Photos app, where
+# iOS converts them first (HEIC to JPEG, or the rendered version of an edited
+# photo), have arrived with the sandbox paths the phone staged them under:
+#
+#   Containers/Data/PluginKitPlugin/<UUID>/tmp/NSIRD_AirDrop_x/IMG_2233.jpg
+#   Containers/Data/PluginKitPlugin/<UUID>/tmp/NSIRD_AirDrop_y/IMG_2224.pvt/FullSizeRender.jpg
+#   Media/PhotoData/OutgoingTemp/PHMediaFormatConversionRequest-<UUID>/IMG_1830.jpg
+#
+# Seen from an iPhone 14 Pro Max, three photos in one transfer, beside transfers
+# from the same phone that used the short form above. The second shape has no
+# NSIRD_AirDrop_ wrapper at all, so looking for those deeper would not catch it.
+# Both prefixes are recognised as they are and nothing else is: whatever the
+# wrappers inside them hold lands in DIR, and the skeleton is removed only where
+# that left it empty.
+#
 # SAFETY. Only directories matching NSIRD_AirDrop_* or *.pvt are touched, and
 # only after they have been quiet for SETTLE seconds - opendrop buffers the
 # whole archive to disk before extracting, so a directory that is still
@@ -85,6 +100,25 @@ tidy_once() {
   find "$dir" -maxdepth 1 -type f \( -name '._*' -o -name '.DS_Store' \) \
     -delete 2>/dev/null
 
+  # The phone's staging paths first, recognised by their full prefix only. A
+  # folder a user sends that happens to be called Media or Containers is not
+  # touched unless it reproduces the whole iOS path below it. First, because
+  # their skeleton occupies those names in DIR: a folder called Media sent in
+  # the same transfer would otherwise collide with it and land as Media-1,
+  # though the name is free once the skeleton is gone.
+  for t in "$dir"/Containers/Data/PluginKitPlugin/*/tmp; do
+    [ -d "$t" ] || continue
+    for d in "$t"/NSIRD_AirDrop_*; do
+      unwrap "$d" "$dir"
+    done
+  done
+  # Format conversion: the files sit directly in the request directory, with
+  # no NSIRD_AirDrop_ wrapper, so the request directory is the wrapper.
+  for d in "$dir"/Media/PhotoData/OutgoingTemp/*; do
+    unwrap "$d" "$dir"
+  done
+  prune_staging "$dir"
+
   for d in "$dir"/NSIRD_AirDrop_*; do
     unwrap "$d" "$dir"
   done
@@ -94,6 +128,24 @@ tidy_once() {
   for d in "$dir"/*.pvt; do
     unwrap "$d" "$dir"
   done
+}
+
+# Remove what is left of the iOS staging paths once their wrappers are out.
+# rmdir only, bottom-up: a level that still holds anything stays, so a
+# transfer still being written, or a real folder of the user's that shares a
+# name with a level, is never removed.
+prune_staging() {
+  local dir="$1" t
+  for t in "$dir"/Containers/Data/PluginKitPlugin/*/tmp; do
+    [ -d "$t" ] || continue
+    find "$t" -maxdepth 1 -type f \( -name '._*' -o -name '.DS_Store' \) -delete 2>/dev/null
+    rmdir "$t" "${t%/tmp}" 2>/dev/null
+  done
+  rmdir "$dir/Containers/Data/PluginKitPlugin" "$dir/Containers/Data" \
+        "$dir/Containers" 2>/dev/null
+  rmdir "$dir/Media/PhotoData/OutgoingTemp" "$dir/Media/PhotoData" \
+        "$dir/Media" 2>/dev/null
+  return 0
 }
 
 # Move everything out of wrapper D into DIR, then remove D if that emptied it.
