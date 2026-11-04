@@ -346,7 +346,9 @@ fi
 eval "$AVAHI_STOP"
 [ -n "$AVAHI_WAS" ] && echo "  avahi-daemon stopped for this run (restored on exit)"
 if [ "$KEEP_WIFI" != "1" ]; then
-  sudo pkill -x wpa_supplicant 2>/dev/null; sudo pkill -x dhcpcd 2>/dev/null; sleep 1
+  # dhcpcd -x on the Wi-Fi interface only - a bare pkill also kills the wired
+  # Ethernet's dhcpcd, which nothing restarts, so its IPv4 lease later expires.
+  sudo pkill -x wpa_supplicant 2>/dev/null; sudo dhcpcd -x "$IFACE" >/dev/null 2>&1; sleep 1
   # Skipped under KEEP_WIFI: a regulatory change while associated is at best
   # overridden by the AP's own country IE and at worst disrupts the link, and we
   # are not choosing the channel in that mode anyway.

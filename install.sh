@@ -127,7 +127,11 @@ install_root "$OWL_BIN"                    /usr/local/bin/airdrop-owl
 step "Passwordless sudo for the helper (waybar has no terminal to ask in)"
 RULES="$USER ALL=(root) NOPASSWD: /usr/local/bin/airdrop-helper
 $USER ALL=(root) NOPASSWD: /usr/local/bin/airdrop-ble-watch"
-if sudo -n /usr/local/bin/airdrop-helper status >/dev/null 2>&1; then
+# Compare the installed file rather than asking `sudo -n` whether it works: by
+# now the root-copies step above has cached a sudo password, so `sudo -n` passes
+# whether the rule exists or not, and the step used to print "already allowed"
+# without writing anything.
+if printf '%s\n' "$RULES" | sudo cmp -s - /etc/sudoers.d/zz-airdrop; then
   ok "already allowed"
 else
   echo "    This adds /etc/sudoers.d/zz-airdrop:"
@@ -145,6 +149,9 @@ else
   sudo install -o root -g root -m 440 "$TMP" /etc/sudoers.d/zz-airdrop
   rm -f "$TMP"
   sudo visudo -c >/dev/null || die "sudo config invalid after install - remove /etc/sudoers.d/zz-airdrop"
+  # Drop the cached password first, or this check passes on the cache alone.
+  # Nothing below needs sudo.
+  sudo -k
   sudo -n /usr/local/bin/airdrop-helper status >/dev/null 2>&1 || die "rule installed but sudo -n still asks"
   ok "added"
 fi

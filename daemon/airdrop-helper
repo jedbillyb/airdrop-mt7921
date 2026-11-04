@@ -516,7 +516,11 @@ EOF
     elif command -v systemctl >/dev/null 2>&1; then
       systemctl stop NetworkManager >/dev/null 2>&1
     fi
-    pkill -x wpa_supplicant 2>/dev/null; pkill -x dhcpcd 2>/dev/null
+    pkill -x wpa_supplicant 2>/dev/null
+    # Only release the Wi-Fi interface's DHCP. A bare `pkill -x dhcpcd` also
+    # kills the dhcpcd that ifupdown runs for wired Ethernet, nothing restarts
+    # it on excl-down, and IPv4 silently vanishes when that lease expires.
+    [ -n "$IFACE" ] && dhcpcd -x "$IFACE" >/dev/null 2>&1
     sleep 1
     [ -n "$reg" ] && iw reg set "$reg"
     [ -n "$IFACE" ] && ip link set "$IFACE" down 2>/dev/null
