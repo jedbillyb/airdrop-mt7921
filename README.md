@@ -121,6 +121,7 @@ right-click finds nobody, try `ACTIVE=1 ./airdrop.sh send <file>` first.
 | `AIRDROP_MODE` | `exclusive` | which [mode](#modes) the switch uses |
 | `AIRDROP_REG` | detected | your two-letter country; needed once Wi-Fi is down |
 | `AIRDROP_NAME` | hostname | name the phone shows (no apostrophes) |
+| `AIRDROP_RECEIVER` | first found | right-click send target, by ID or name (case and apostrophes ignored) |
 | `RECV_DIR` | `~/Downloads` | where received files go |
 
 `airdrop.sh` only:

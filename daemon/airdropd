@@ -1490,7 +1490,10 @@ SEND_REPORT="${AIRDROP_SEND_REPORT:-$HOME/.opendrop/discover.last.json}"
 # not); nothing has ever turned up late. Shorter than airdrop.sh's 45 s because
 # this one is user-facing and a right-click that hangs for a minute is worse
 # than one that says "not found" and lets you re-arm the phone.
-SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-25}"
+# 2026-10-09: 25 s was too short on the MT7921 even after send_link_warm - the
+# phone's `Found` line landed while the browse was already being shut down, so
+# a send that had found the phone reported "not found". Same 45 s as airdrop.sh.
+SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-45}"
 # Reuse a discovery report younger than this instead of browsing again. THE
 # WHOLE POINT of the quick-send path: a second file to the same phone should
 # not pay for a second browse. Stale reports have burned this project before
@@ -1499,6 +1502,18 @@ SEND_FIND_TIME="${AIRDROP_SEND_FIND_TIME:-25}"
 # caller re-browses and tries once more, which turns a stale report into a
 # slow success rather than a confusing failure.
 SEND_REPORT_TTL="${AIRDROP_SEND_REPORT_TTL:-90}"
+# How long to wait for the phone to start answering IP over awdl0 before the
+# browse. Measured on the MT7921 (2026-10-09): AWDL sync and mDNS come up in
+# seconds, but the phone drops every unicast frame from us for a further
+# 10-40 s - ping 100%, then 100%, then 0%; a TCP SYN retransmitted ten times
+# over 36 s before the SYN-ACK. A browse or /Ask sent into that window either
+# times out or hangs, which is exactly what the right-click did. Waiting for a
+# clean ping first is what airdrop.sh's layer 2.5 does, and why it works.
+SEND_WARM_TIME="${AIRDROP_SEND_WARM_TIME:-60}"
+# Upper bound on one opendrop send. It had none, so a lost /Ask or a stalled
+# upload hung the right-click forever with nothing on screen. Covers the time
+# to tap Accept plus the transfer at a pessimistic 20 kB/s.
+SEND_ASK_TIME="${AIRDROP_SEND_ASK_TIME:-90}"
 
 # Register the Continuity advert that wakes the phone's AWDL. This runs AFTER
 # the stack is up, never before: the mt7921 is a combo Wi-Fi/BT part, so
@@ -1589,8 +1604,24 @@ send_peers() {
     "$SEND_REPORT" 2>/dev/null
 }
 
+# AIRDROP_RECEIVER matches an ID exactly, or a NAME ignoring case and
+# apostrophes - iOS names use U+2019 ("Jed’s iPhone"), which nobody types into
+# a config file. Without it the first device found wins, and on 2026-10-09 that
+# was a neighbour's iMac rather than the phone the user was holding.
+send_name_key() { tr '[:upper:]' '[:lower:]' | sed "s/[’'‘\`]//g"; }
+
 send_receiver() {
-  if [ -n "${AIRDROP_RECEIVER:-}" ]; then printf '%s' "$AIRDROP_RECEIVER"; return 0; fi
+  if [ -n "${AIRDROP_RECEIVER:-}" ]; then
+    local want; want=$(printf '%s' "$AIRDROP_RECEIVER" | send_name_key)
+    send_peers | jq -r '.[] | "\(.id)\t\(.name)"' 2>/dev/null \
+      | while IFS=$'\t' read -r id nm; do
+          if [ "$id" = "$AIRDROP_RECEIVER" ] \
+             || [ "$(printf '%s' "$nm" | send_name_key)" = "$want" ]; then
+            printf '%s' "$id"; break
+          fi
+        done
+    return 0
+  fi
   send_peers | jq -r '.[0].id // empty' 2>/dev/null
 }
 
@@ -1623,12 +1654,16 @@ send_browse() {
     kill -0 "$pid" 2>/dev/null || break
     # A `Found` line naming this host is our own receiver, not a peer: keep
     # browsing rather than declaring success on ourselves.
-    if awk -v me="$(uname -n)" '
-           /^[[:space:]]*[0-9]+\)|Found/ {
+    # With AIRDROP_RECEIVER set, only THAT device ends the browse - otherwise
+    # whichever Mac nearby answers first cuts it short before the phone does.
+    if send_name_key < "$flog" | awk -v me="$(uname -n | send_name_key)" \
+           -v want="$(printf '%s' "${AIRDROP_RECEIVER:-}" | send_name_key)" '
+           /^[[:space:]]*[0-9]+\)|found/ {
              line = $0; sub(/.*name[[:space:]]+/, "", line)
-             if (line != me) found = 1
+             id = $0; sub(/.*id[[:space:]]+/, "", id); sub(/[[:space:]].*/, "", id)
+             if (line != me && (want == "" || line == want || id == want)) found = 1
            }
-           END { exit !found }' "$flog" 2>/dev/null; then
+           END { exit !found }' 2>/dev/null; then
       found=1
       # A beat, so a second receiver one line later is not cut off.
       sleep 2
@@ -1644,6 +1679,13 @@ send_browse() {
   done
   kill -9 "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  # A receiver can still be printed after SIGINT, while zeroconf drains. It is
+  # in the report just the same, so count it rather than failing a send that
+  # found the phone.
+  if [ "$found" = 0 ] && [ -n "$(send_peers | jq -r '.[0].id // empty' 2>/dev/null)" ] \
+     && [ "$(stat -c %Y "$SEND_REPORT" 2>/dev/null || echo 0)" -gt "$mtime" ]; then
+    found=1
+  fi
 
   # Distinguish "the phone is not advertising" from "our browse never got off
   # the ground". They need opposite responses, and the second one is a real
@@ -1669,6 +1711,33 @@ Try again with the AirDrop toggle OFF, which gives the send its own stack."
   return 0
 }
 
+# Wait until the phone answers IP over awdl0. $1 is an address to ping; with
+# none, every link-local neighbour on awdl0 (the phone is one of them - the
+# browse has not run yet, so we cannot know which). Succeeds on the first ping
+# reply. Non-fatal: on timeout we log and try anyway, because a link that
+# comes good mid-browse still works.
+send_link_warm() {
+  local want="${1:-}" end addrs a me
+  end=$(( $(date +%s) + SEND_WARM_TIME ))
+  me=$(send_self_addrs | paste -sd'|' -)
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if [ -n "$want" ]; then addrs="$want"
+    else
+      addrs=$(ip -6 neigh show dev awdl0 2>/dev/null | awk '/^fe80:/{print $1}' \
+                | grep -vxE "${me:-^$}")
+    fi
+    for a in $addrs; do
+      if ping -6 -c 1 -W 1 -I awdl0 "$a" >/dev/null 2>&1; then
+        log "send: link up - $a answered after $(( SEND_WARM_TIME - (end - $(date +%s)) ))s"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+  log "send: no ping reply over awdl0 in ${SEND_WARM_TIME}s - trying anyway"
+  return 1
+}
+
 # ONE TRANSFER, however many files. opendrop's `-f` is repeatable and the
 # protocol carries the lot in a single /Ask, so the phone asks once instead of
 # once per file. This used to loop, because `-f` took exactly one file.
@@ -1680,7 +1749,16 @@ send_one() {
   # AIRDROP_SEND_DEBUG dumps opendrop's request plists under ~/.opendrop/debug,
   # which is the only way to see what went into an /Ask after the fact. Off by
   # default: the dump is per-request and would otherwise grow without bound.
-  "$OPENDROP" "${OD_NAME[@]}" ${AIRDROP_SEND_DEBUG:+-d} -i awdl0 send -r "$rcv" "${args[@]}" >> "$LOG" 2>&1
+  # Bounded by SEND_ASK_TIME plus the transfer at 20 kB/s. SIGINT so opendrop's
+  # finally: blocks run.
+  local bytes limit
+  bytes=$(stat -c %s "$@" 2>/dev/null | awk '{t+=$1} END {print t+0}')
+  limit=$(( SEND_ASK_TIME + bytes / 20000 ))
+  timeout -s INT -k 5 "$limit" \
+    "$OPENDROP" "${OD_NAME[@]}" ${AIRDROP_SEND_DEBUG:+-d} -i awdl0 send -r "$rcv" "${args[@]}" >> "$LOG" 2>&1
+  local rc=$?
+  [ "$rc" = 124 ] || [ "$rc" = 130 ] && log "send: gave up after ${limit}s with no answer from the phone"
+  return $rc
 }
 
 # Everything the user needs to do on the phone, in one place. Printed on the
@@ -1799,6 +1877,8 @@ cmd_send() {
   fi
 
   send_ble_wake
+  echo "waking the link"
+  send_link_warm
 
   # Fresh report? Skip the browse entirely - this is what makes a second file
   # to the same phone nearly instant.
@@ -1820,6 +1900,9 @@ cmd_send() {
     return 1
   fi
   name=$(send_receiver_name "$rcv")
+  # The browse proves the phone answered once; ping its own address again so
+  # the /Ask does not go out into a link that has just dropped.
+  send_link_warm "$(jq -r --arg id "$rcv" '.[] | select(.id == $id) | .address' "$SEND_REPORT" 2>/dev/null | head -1)"
   echo "sending to ${name:-$rcv}"
 
   local what count

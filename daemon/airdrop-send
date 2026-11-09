@@ -73,7 +73,8 @@ trap 'rm -f "$OUTPUT"' EXIT
 "$AIRDROPD" send "$@" 2>&1 | while IFS= read -r line; do
   printf '%s\n' "$line" >> "$OUTPUT"
   case "$line" in
-    "sending to "*) note normal "${line#sending to }: sending…" ;;
+    "waking the link") note normal "Finding your phone…" ;;
+    "sending to "*) note normal "Tap Accept on ${line#sending to }" ;;
     "sent: "*)      note normal "Sent ${line#sent: }" ;;
   esac
 done
