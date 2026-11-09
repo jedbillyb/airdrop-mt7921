@@ -26,7 +26,7 @@
 #     IMG_3264.pvt/
 #       IMG_3264.JPG
 #
-# Seen from an iPhone 14 Pro Max on iOS 16.5: three photos in one transfer,
+# Seen from an iPhone 17: three photos in one transfer,
 # each bundle holding only the JPG. Unwrapping the outer level alone moved each
 # bundle up whole and left the user one directory per photo. A `.pvt` is a
 # container Apple chose rather than a folder anyone sent, so it is unwrapped the
@@ -41,7 +41,7 @@
 #   Containers/Data/PluginKitPlugin/<UUID>/tmp/NSIRD_AirDrop_y/IMG_2224.pvt/FullSizeRender.jpg
 #   Media/PhotoData/OutgoingTemp/PHMediaFormatConversionRequest-<UUID>/IMG_1830.jpg
 #
-# Seen from an iPhone 14 Pro Max, three photos in one transfer, beside transfers
+# Seen from an iPhone 17, three photos in one transfer, beside transfers
 # from the same phone that used the short form above. The second shape has no
 # NSIRD_AirDrop_ wrapper at all, so looking for those deeper would not catch it.
 # Both prefixes are recognised as they are and nothing else is: whatever the
@@ -106,18 +106,7 @@ tidy_once() {
   # their skeleton occupies those names in DIR: a folder called Media sent in
   # the same transfer would otherwise collide with it and land as Media-1,
   # though the name is free once the skeleton is gone.
-  for t in "$dir"/Containers/Data/PluginKitPlugin/*/tmp; do
-    [ -d "$t" ] || continue
-    for d in "$t"/NSIRD_AirDrop_*; do
-      unwrap "$d" "$dir"
-    done
-  done
-  # Format conversion: the files sit directly in the request directory, with
-  # no NSIRD_AirDrop_ wrapper, so the request directory is the wrapper.
-  for d in "$dir"/Media/PhotoData/OutgoingTemp/*; do
-    unwrap "$d" "$dir"
-  done
-  prune_staging "$dir"
+  unwrap_staging "$dir" "$dir"
 
   for d in "$dir"/NSIRD_AirDrop_*; do
     unwrap "$d" "$dir"
@@ -128,6 +117,31 @@ tidy_once() {
   for d in "$dir"/*.pvt; do
     unwrap "$d" "$dir"
   done
+}
+
+# Unwrap the iOS staging paths found under ROOT into DIR, then remove what is
+# left of their skeleton under ROOT. ROOT is DIR itself for an archive that
+# arrived without a wrapper; since OpenDrop extracts every transfer into its
+# own NSIRD_AirDrop_opendrop-* wrapper, ROOT is usually that wrapper, and this
+# runs from unwrap() while it is being opened.
+#
+# KNOWN=1 when ROOT has just been proven settled, which makes the wrappers
+# below it settled too: they are not re-checked, because the caller may have
+# touched their mtimes since.
+unwrap_staging() {
+  local root="$1" dir="$2" known="${3:-0}" t d
+  for t in "$root"/Containers/Data/PluginKitPlugin/*/tmp; do
+    [ -d "$t" ] || continue
+    for d in "$t"/NSIRD_AirDrop_*; do
+      unwrap "$d" "$dir" "$known"
+    done
+  done
+  # Format conversion: the files sit directly in the request directory, with
+  # no NSIRD_AirDrop_ wrapper, so the request directory is the wrapper.
+  for d in "$root"/Media/PhotoData/OutgoingTemp/*; do
+    unwrap "$d" "$dir" "$known"
+  done
+  prune_staging "$root"
 }
 
 # Remove what is left of the iOS staging paths once their wrappers are out.
@@ -150,9 +164,18 @@ prune_staging() {
 
 # Move everything out of wrapper D into DIR, then remove D if that emptied it.
 unwrap() {
-  local d="$1" dir="$2" f p moved
+  local d="$1" dir="$2" known="${3:-0}" f p moved
   [ -d "$d" ] || return 0
-  settled "$d" || return 0
+  [ "$known" = 1 ] || settled "$d" || return 0
+
+  # The iOS staging paths INSIDE this wrapper, straight into DIR. Moving them
+  # up whole first and catching them on a later pass failed two ways: a
+  # Media/ already in DIR turned the incoming one into Media-1, which no
+  # longer matches the staging prefix, so the photos stayed buried; and the
+  # sidecar sweep below touches the mtimes of the directories under it, so
+  # even in place they read as still being written. Done here, before that
+  # sweep, while this wrapper is the thing just proven settled.
+  unwrap_staging "$d" "$dir" 1
 
   # Recursive: a sent folder carries its own sidecars all the way down.
   find "$d" \( -name '._*' -o -name '.DS_Store' \) -delete 2>/dev/null
